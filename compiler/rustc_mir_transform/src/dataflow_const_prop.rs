@@ -1,11 +1,14 @@
+use std::fmt::Formatter;
+
 use rustc_const_eval::interpret::{ConstValue, ImmTy, Immediate, InterpCx, Scalar};
 use rustc_data_structures::fx::FxHashMap;
 use rustc_index::vec::IndexVec;
 use rustc_middle::mir::visit::{MutVisitor, Visitor};
 use rustc_middle::mir::*;
 use rustc_middle::ty::{self, ScalarInt, Ty, TyCtxt};
+use rustc_mir_dataflow::fmt::DebugWithContext;
 use rustc_mir_dataflow::value_analysis::{
-    Map, ProjElem, State, StateExt, StateWrapper, ValueAnalysis, ValueIndex, ValueOrPlace,
+    Map, ProjElem, State, StateExt, ValueAnalysis, ValueAnalysisWrapper, ValueIndex, ValueOrPlace,
     ValueOrPlaceOrRef,
 };
 use rustc_mir_dataflow::{lattice::FlatSet, Analysis, ResultsVisitor, SwitchIntEdgeEffects};
@@ -255,7 +258,7 @@ enum Const<'tcx> {
 }
 
 impl<'tcx> std::fmt::Debug for Const<'tcx> {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+    fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match *self {
             Self::Scalar(scalar, ty) => {
                 std::fmt::Display::fmt(&ConstantKind::Val(ConstValue::Scalar(scalar.into()), ty), f)
@@ -368,7 +371,7 @@ impl<'tcx, 'map> CollectAndPatch<'tcx, 'map> {
 }
 
 impl<'mir, 'tcx, 'map> ResultsVisitor<'mir, 'tcx> for CollectAndPatch<'tcx, 'map> {
-    type FlowState = StateWrapper<ConstState<'tcx>>;
+    type FlowState = ConstState<'tcx>;
 
     fn visit_statement_before_primary_effect(
         &mut self,
@@ -378,7 +381,7 @@ impl<'mir, 'tcx, 'map> ResultsVisitor<'mir, 'tcx> for CollectAndPatch<'tcx, 'map
     ) {
         match &statement.kind {
             StatementKind::Assign(box (_, rvalue)) => {
-                OperandCollector { state: &state.0, visitor: self }.visit_rvalue(rvalue, location);
+                OperandCollector { state: &state, visitor: self }.visit_rvalue(rvalue, location);
             }
             _ => (),
         }
@@ -391,7 +394,7 @@ impl<'mir, 'tcx, 'map> ResultsVisitor<'mir, 'tcx> for CollectAndPatch<'tcx, 'map
         location: Location,
     ) {
         match statement.kind {
-            StatementKind::Assign(box (place, _)) => match state.0.get(place.as_ref(), self.map) {
+            StatementKind::Assign(box (place, _)) => match state.get(place.as_ref(), self.map) {
                 FlatSet::Top => (),
                 FlatSet::Elem(value) => {
                     self.assignments.insert(location, value);
@@ -410,7 +413,7 @@ impl<'mir, 'tcx, 'map> ResultsVisitor<'mir, 'tcx> for CollectAndPatch<'tcx, 'map
         terminator: &'mir Terminator<'tcx>,
         location: Location,
     ) {
-        OperandCollector { state: &state.0, visitor: self }.visit_terminator(terminator, location);
+        OperandCollector { state: &state, visitor: self }.visit_terminator(terminator, location);
     }
 }
 
@@ -465,6 +468,29 @@ impl<'tcx, 'map, 'a> Visitor<'tcx> for OperandCollector<'tcx, 'map, 'a> {
             }
             _ => (),
         }
+    }
+}
+
+impl<'tcx> DebugWithContext<ValueAnalysisWrapper<ConstAnalysis<'tcx>>> for ConstState<'tcx> {
+    fn fmt_with(
+        &self,
+        ctxt: &ValueAnalysisWrapper<ConstAnalysis<'tcx>>,
+        f: &mut Formatter<'_>,
+    ) -> std::fmt::Result {
+        if self.reachable {
+            self.values.fmt_with(&ctxt.0.map, f)
+        } else {
+            writeln!(f, "unreachable")
+        }
+    }
+
+    fn fmt_diff_with(
+        &self,
+        old: &Self,
+        ctxt: &ValueAnalysisWrapper<ConstAnalysis<'tcx>>,
+        f: &mut Formatter<'_>,
+    ) -> std::fmt::Result {
+        self.values.fmt_diff_with(&old.values, &ctxt.0.map, f)
     }
 }
 

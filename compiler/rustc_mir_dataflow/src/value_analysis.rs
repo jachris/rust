@@ -59,7 +59,6 @@ use rustc_middle::mir::*;
 use rustc_middle::ty::{self, Ty, TyCtxt};
 use rustc_target::abi::VariantIdx;
 
-use crate::framework::SwitchIntTarget;
 use crate::{
     fmt::DebugWithContext, lattice::FlatSet, Analysis, AnalysisDomain, CallReturnPlaces,
     JoinSemiLattice, SwitchIntEdgeEffects,
@@ -359,17 +358,8 @@ pub trait ValueAnalysis<'tcx> {
 
 pub struct ValueAnalysisWrapper<T>(pub T);
 
-#[derive(Debug, PartialEq, Eq, Clone)]
-pub struct StateWrapper<S>(pub S);
-
-impl<S: State> JoinSemiLattice for StateWrapper<S> {
-    fn join(&mut self, other: &Self) -> bool {
-        self.0.join(&other.0)
-    }
-}
-
 impl<'tcx, T: ValueAnalysis<'tcx>> AnalysisDomain<'tcx> for ValueAnalysisWrapper<T> {
-    type Domain = StateWrapper<T::State>;
+    type Domain = T::State;
 
     type Direction = crate::Forward;
 
@@ -378,11 +368,11 @@ impl<'tcx, T: ValueAnalysis<'tcx>> AnalysisDomain<'tcx> for ValueAnalysisWrapper
     fn bottom_value(&self, body: &Body<'tcx>) -> Self::Domain {
         let result = self.0.bottom_value(body);
         assert!(result.values().len() == self.0.map().value_count);
-        StateWrapper(result)
+        result
     }
 
     fn initialize_start_block(&self, body: &Body<'tcx>, state: &mut Self::Domain) {
-        self.0.initialize_start_block(body, &mut state.0)
+        self.0.initialize_start_block(body, state)
     }
 }
 
@@ -396,7 +386,7 @@ where
         statement: &Statement<'tcx>,
         _location: Location,
     ) {
-        self.0.handle_statement(statement, &mut state.0);
+        self.0.handle_statement(statement, state);
     }
 
     fn apply_terminator_effect(
@@ -405,7 +395,7 @@ where
         terminator: &Terminator<'tcx>,
         _location: Location,
     ) {
-        self.0.handle_terminator(terminator, &mut state.0);
+        self.0.handle_terminator(terminator, state);
     }
 
     fn apply_call_return_effect(
@@ -414,7 +404,7 @@ where
         _block: BasicBlock,
         return_places: crate::CallReturnPlaces<'_, 'tcx>,
     ) {
-        self.0.handle_call_return(return_places, &mut state.0)
+        self.0.handle_call_return(return_places, state)
     }
 
     fn apply_switch_int_edge_effects(
@@ -423,18 +413,7 @@ where
         discr: &Operand<'tcx>,
         apply_edge_effects: &mut impl SwitchIntEdgeEffects<Self::Domain>,
     ) {
-        self.0.handle_switch_int(discr, &mut SwitchIntEdgeEffectsWrapper(apply_edge_effects))
-    }
-}
-
-struct SwitchIntEdgeEffectsWrapper<E>(E);
-
-impl<S, E> SwitchIntEdgeEffects<S> for SwitchIntEdgeEffectsWrapper<&mut E>
-where
-    E: SwitchIntEdgeEffects<StateWrapper<S>>,
-{
-    fn apply(&mut self, mut apply_edge_effect: impl FnMut(&mut S, SwitchIntTarget)) {
-        self.0.apply(|state, target| apply_edge_effect(&mut state.0, target));
+        self.0.handle_switch_int(discr, apply_edge_effects)
     }
 }
 
@@ -769,22 +748,15 @@ fn debug_with_context<V: Debug + Eq>(
     Ok(())
 }
 
-impl<'tcx, T> DebugWithContext<ValueAnalysisWrapper<T>> for StateWrapper<T::State>
+impl<V> DebugWithContext<Map> for IndexVec<ValueIndex, V>
 where
-    T: ValueAnalysis<'tcx>,
-    T::State: Debug + Eq,
-    <T::State as State>::Value: Debug + Eq,
+    V: Debug + Eq,
 {
-    fn fmt_with(&self, ctxt: &ValueAnalysisWrapper<T>, f: &mut Formatter<'_>) -> std::fmt::Result {
-        debug_with_context(self.0.values(), None, ctxt.0.map(), f)
+    fn fmt_with(&self, ctxt: &Map, f: &mut Formatter<'_>) -> std::fmt::Result {
+        debug_with_context(self, None, ctxt, f)
     }
 
-    fn fmt_diff_with(
-        &self,
-        old: &Self,
-        ctxt: &ValueAnalysisWrapper<T>,
-        f: &mut Formatter<'_>,
-    ) -> std::fmt::Result {
-        debug_with_context(self.0.values(), Some(old.0.values()), ctxt.0.map(), f)
+    fn fmt_diff_with(&self, old: &Self, ctxt: &Map, f: &mut Formatter<'_>) -> std::fmt::Result {
+        debug_with_context(self, Some(old), ctxt, f)
     }
 }
