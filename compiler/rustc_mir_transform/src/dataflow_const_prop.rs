@@ -1,11 +1,14 @@
 use rustc_const_eval::interpret::{ConstValue, ImmTy, Immediate, InterpCx, Scalar};
 use rustc_data_structures::fx::FxHashMap;
+use rustc_index::vec::IndexVec;
 use rustc_middle::mir::visit::{MutVisitor, Visitor};
 use rustc_middle::mir::*;
 use rustc_middle::ty::{self, ScalarInt, Ty, TyCtxt};
 use rustc_mir_dataflow::value_analysis::{
-    Map, ProjElem, State, ValueAnalysis, ValueOrPlace, ValueOrPlaceOrRef,
+    Map, ProjElem, State, StateExt, StateWrapper, ValueAnalysis, ValueIndex, ValueOrPlace,
+    ValueOrPlaceOrRef,
 };
+use rustc_mir_dataflow::JoinSemiLattice;
 use rustc_mir_dataflow::{lattice::FlatSet, Analysis, ResultsVisitor, SwitchIntEdgeEffects};
 use rustc_span::DUMMY_SP;
 
@@ -42,21 +45,62 @@ struct ConstAnalysis<'tcx> {
     param_env: ty::ParamEnv<'tcx>,
 }
 
+type Value<'tcx> = FlatSet<Const<'tcx>>;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ConstState<'tcx> {
+    values: IndexVec<ValueIndex, Value<'tcx>>,
+    reachable: bool,
+}
+
+impl<'tcx> JoinSemiLattice for ConstState<'tcx> {
+    fn join(&mut self, other: &Self) -> bool {
+        self.reachable.join(&other.reachable) | self.values.join(&other.values)
+    }
+}
+
+impl<'tcx> State for ConstState<'tcx> {
+    type Value = Value<'tcx>;
+
+    fn yeet(&self) -> &IndexVec<ValueIndex, Self::Value> {
+        &self.values
+    }
+
+    fn yeet_mut(&mut self) -> &mut IndexVec<ValueIndex, Self::Value> {
+        &mut self.values
+    }
+}
+
 impl<'tcx> ValueAnalysis<'tcx> for ConstAnalysis<'tcx> {
-    type Value = FlatSet<Const<'tcx>>;
+    type State = ConstState<'tcx>;
 
     const NAME: &'static str = "ConstAnalysis";
+
+    fn bottom_value(&self, _body: &Body<'tcx>) -> Self::State {
+        Self::State {
+            reachable: false,
+            values: IndexVec::from_elem_n(Value::Bottom, self.map.value_count()),
+        }
+    }
+
+    fn initialize_start_block(&self, body: &Body<'tcx>, state: &mut Self::State) {
+        state.reachable = true;
+        for arg in body.args_iter() {
+            state.flood(PlaceRef { local: arg, projection: &[] }, &self.map);
+        }
+    }
 
     fn map(&self) -> &Map {
         &self.map
     }
 
-    fn handle_assign(
-        &self,
-        target: Place<'tcx>,
-        rvalue: &Rvalue<'tcx>,
-        state: &mut State<Self::Value>,
-    ) {
+    fn handle_statement(&self, statement: &Statement<'tcx>, state: &mut Self::State) {
+        if state.reachable {
+            self.super_statement(statement, state);
+        }
+    }
+
+    fn handle_assign(&self, target: Place<'tcx>, rvalue: &Rvalue<'tcx>, state: &mut Self::State) {
         match rvalue {
             Rvalue::CheckedBinaryOp(op, box (left, right)) => {
                 let target = self.map().find(target.as_ref());
@@ -95,8 +139,8 @@ impl<'tcx> ValueAnalysis<'tcx> for ConstAnalysis<'tcx> {
     fn handle_rvalue(
         &self,
         rvalue: &Rvalue<'tcx>,
-        state: &mut State<Self::Value>,
-    ) -> ValueOrPlaceOrRef<Self::Value> {
+        state: &mut Self::State,
+    ) -> ValueOrPlaceOrRef<Value<'tcx>> {
         match rvalue {
             Rvalue::Cast(CastKind::Misc, operand, ty) => {
                 let operand = self.eval_operand(operand, state);
@@ -127,11 +171,7 @@ impl<'tcx> ValueAnalysis<'tcx> for ConstAnalysis<'tcx> {
         }
     }
 
-    fn handle_constant(
-        &self,
-        constant: &Constant<'tcx>,
-        _state: &mut State<Self::Value>,
-    ) -> Self::Value {
+    fn handle_constant(&self, constant: &Constant<'tcx>, _state: &mut Self::State) -> Value<'tcx> {
         constant
             .literal
             .eval(self.tcx, self.param_env)
@@ -144,14 +184,17 @@ impl<'tcx> ValueAnalysis<'tcx> for ConstAnalysis<'tcx> {
     fn handle_switch_int(
         &self,
         discr: &Operand<'tcx>,
-        apply_edge_effects: &mut impl SwitchIntEdgeEffects<State<Self::Value>>,
+        apply_edge_effects: &mut impl SwitchIntEdgeEffects<Self::State>,
     ) {
         // FIXME: The dataflow framework only provides the state if we call `apply()`, which makes
         // this more inefficient than it has to be.
-        // FIXME: Perhaps we rather need a proper unreachability flag for every block.
         let mut discr_value = None;
         let mut handled = false;
         apply_edge_effects.apply(|state, target| {
+            if !state.reachable {
+                return;
+            }
+
             let discr_value = match discr_value {
                 Some(value) => value,
                 None => {
@@ -181,7 +224,8 @@ impl<'tcx> ValueAnalysis<'tcx> for ConstAnalysis<'tcx> {
                 // Branch is taken. Has no effect on state.
                 handled = true;
             } else {
-                // Branch is not taken, we can flood everything with bottom.
+                // Branch is not taken.
+                state.reachable = false;
                 state.flood_all_with(FlatSet::Bottom);
             }
         })
@@ -216,11 +260,11 @@ impl<'tcx> ConstAnalysis<'tcx> {
 
     fn binary_op(
         &self,
-        state: &mut State<FlatSet<Const<'tcx>>>,
+        state: &mut <Self as ValueAnalysis<'tcx>>::State,
         op: BinOp,
         left: &Operand<'tcx>,
         right: &Operand<'tcx>,
-    ) -> (FlatSet<Const<'tcx>>, FlatSet<Const<'tcx>>) {
+    ) -> (Value<'tcx>, Value<'tcx>) {
         let left = self.eval_operand(left, state);
         let right = self.eval_operand(right, state);
         match (left, right) {
@@ -249,7 +293,7 @@ impl<'tcx> ConstAnalysis<'tcx> {
     fn eval_operand(
         &self,
         op: &Operand<'tcx>,
-        state: &mut State<FlatSet<Const<'tcx>>>,
+        state: &mut <Self as ValueAnalysis<'tcx>>::State,
     ) -> FlatSet<ImmTy<'tcx>> {
         let value = match self.handle_operand(op, state) {
             ValueOrPlace::Value(value) => value,
@@ -308,7 +352,7 @@ impl<'tcx, 'map> CollectAndPatch<'tcx, 'map> {
 }
 
 impl<'mir, 'tcx, 'map> ResultsVisitor<'mir, 'tcx> for CollectAndPatch<'tcx, 'map> {
-    type FlowState = State<FlatSet<Const<'tcx>>>;
+    type FlowState = StateWrapper<ConstState<'tcx>>;
 
     fn visit_statement_before_primary_effect(
         &mut self,
@@ -318,7 +362,7 @@ impl<'mir, 'tcx, 'map> ResultsVisitor<'mir, 'tcx> for CollectAndPatch<'tcx, 'map
     ) {
         match &statement.kind {
             StatementKind::Assign(box (_, rvalue)) => {
-                OperandCollector { state, visitor: self }.visit_rvalue(rvalue, location);
+                OperandCollector { state: &state.0, visitor: self }.visit_rvalue(rvalue, location);
             }
             _ => (),
         }
@@ -331,7 +375,7 @@ impl<'mir, 'tcx, 'map> ResultsVisitor<'mir, 'tcx> for CollectAndPatch<'tcx, 'map
         location: Location,
     ) {
         match statement.kind {
-            StatementKind::Assign(box (place, _)) => match state.get(place.as_ref(), self.map) {
+            StatementKind::Assign(box (place, _)) => match state.0.get(place.as_ref(), self.map) {
                 FlatSet::Top => (),
                 FlatSet::Elem(value) => {
                     self.assignments.insert(location, value);
@@ -350,7 +394,7 @@ impl<'mir, 'tcx, 'map> ResultsVisitor<'mir, 'tcx> for CollectAndPatch<'tcx, 'map
         terminator: &'mir Terminator<'tcx>,
         location: Location,
     ) {
-        OperandCollector { state, visitor: self }.visit_terminator(terminator, location);
+        OperandCollector { state: &state.0, visitor: self }.visit_terminator(terminator, location);
     }
 }
 
@@ -385,7 +429,7 @@ impl<'tcx, 'map> MutVisitor<'tcx> for CollectAndPatch<'tcx, 'map> {
 }
 
 struct OperandCollector<'tcx, 'map, 'a> {
-    state: &'a State<FlatSet<Const<'tcx>>>,
+    state: &'a ConstState<'tcx>,
     visitor: &'a mut CollectAndPatch<'tcx, 'map>,
 }
 

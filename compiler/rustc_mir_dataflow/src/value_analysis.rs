@@ -59,24 +59,135 @@ use rustc_middle::mir::*;
 use rustc_middle::ty::{self, Ty, TyCtxt};
 use rustc_target::abi::VariantIdx;
 
+use crate::framework::SwitchIntTarget;
 use crate::{
     fmt::DebugWithContext, lattice::FlatSet, Analysis, AnalysisDomain, CallReturnPlaces,
     JoinSemiLattice, SwitchIntEdgeEffects,
 };
 
+pub trait State: Clone + JoinSemiLattice + Eq {
+    type Value: Clone + HasTop;
+
+    fn yeet(&self) -> &IndexVec<ValueIndex, Self::Value>;
+
+    fn yeet_mut(&mut self) -> &mut IndexVec<ValueIndex, Self::Value>;
+}
+
+pub trait StateExt: State {
+    fn flood_all(&mut self) {
+        self.flood_all_with(Self::Value::top())
+    }
+
+    fn flood_all_with(&mut self, value: Self::Value) {
+        self.yeet_mut().raw.fill(value);
+    }
+
+    fn flood_with(&mut self, place: PlaceRef<'_>, map: &Map, value: Self::Value) {
+        if let Some(root) = map.find(place) {
+            self.flood_idx_with(root, map, value);
+        }
+    }
+
+    fn flood(&mut self, place: PlaceRef<'_>, map: &Map) {
+        self.flood_with(place, map, Self::Value::top())
+    }
+
+    fn flood_idx_with(&mut self, place: PlaceIndex, map: &Map, value: Self::Value) {
+        map.preorder_invoke(place, &mut |place| {
+            if let Some(vi) = map.places[place].value_index {
+                self.yeet_mut()[vi] = value.clone();
+            }
+        });
+    }
+
+    fn flood_idx(&mut self, place: PlaceIndex, map: &Map) {
+        self.flood_idx_with(place, map, Self::Value::top())
+    }
+
+    fn assign_place_idx(&mut self, target: PlaceIndex, source: PlaceIndex, map: &Map) {
+        if let Some(target_value) = map.places[target].value_index {
+            if let Some(source_value) = map.places[source].value_index {
+                self.yeet_mut()[target_value] = self.yeet()[source_value].clone();
+            } else {
+                self.yeet_mut()[target_value] = Self::Value::top();
+            }
+        }
+        for target_child in map.children(target) {
+            // Try to find corresponding child in source.
+            let projection = map.places[target_child].proj_elem.unwrap();
+            if let Some(source_child) = map.projections.get(&(source, projection)) {
+                self.assign_place_idx(target_child, *source_child, map);
+            } else {
+                self.flood_idx(target_child, map);
+            }
+        }
+    }
+
+    fn assign(&mut self, target: PlaceRef<'_>, result: ValueOrPlaceOrRef<Self::Value>, map: &Map) {
+        if let Some(target) = map.find(target) {
+            self.assign_idx(target, result, map);
+        } else {
+            // We don't track this place nor any projections, assignment can be ignored.
+        }
+    }
+
+    fn assign_idx(
+        &mut self,
+        target: PlaceIndex,
+        result: ValueOrPlaceOrRef<Self::Value>,
+        map: &Map,
+    ) {
+        match result {
+            ValueOrPlaceOrRef::Value(value) => {
+                // First flood the target place in case we also track any projections (although
+                // this scenario is currently not well-supported by the API).
+                self.flood_idx(target, map);
+                if let Some(value_index) = map.places[target].value_index {
+                    self.yeet_mut()[value_index] = value;
+                }
+            }
+            ValueOrPlaceOrRef::Place(source) => self.assign_place_idx(target, source, map),
+            ValueOrPlaceOrRef::Ref(source) => {
+                if let Some(value_index) = map.places[target].value_index {
+                    self.yeet_mut()[value_index] = Self::Value::top();
+                }
+                if let Some(target_deref) = map.apply_elem(target, ProjElem::Deref) {
+                    self.assign_place_idx(target_deref, source, map);
+                }
+            }
+            ValueOrPlaceOrRef::Unknown => {
+                self.flood_idx(target, map);
+            }
+        }
+    }
+
+    fn get(&self, place: PlaceRef<'_>, map: &Map) -> Self::Value {
+        map.find(place).map(|place| self.get_idx(place, map)).unwrap_or(Self::Value::top())
+    }
+
+    fn get_idx(&self, place: PlaceIndex, map: &Map) -> Self::Value {
+        map.places[place].value_index.map(|v| self.yeet()[v].clone()).unwrap_or(Self::Value::top())
+    }
+}
+
+impl<S: State> StateExt for S {}
+
 pub trait ValueAnalysis<'tcx> {
-    /// For each place of interest, the analysis tracks a value of the given type.
-    type Value: Clone + JoinSemiLattice + HasBottom + HasTop;
+    type State: State;
 
     const NAME: &'static str;
 
     fn map(&self) -> &Map;
 
-    fn handle_statement(&self, statement: &Statement<'tcx>, state: &mut State<Self::Value>) {
+    fn bottom_value(&self, body: &Body<'tcx>) -> Self::State;
+
+    fn initialize_start_block(&self, body: &Body<'tcx>, state: &mut Self::State);
+
+    fn handle_statement(&self, statement: &Statement<'tcx>, state: &mut Self::State) {
         self.super_statement(statement, state)
     }
 
-    fn super_statement(&self, statement: &Statement<'tcx>, state: &mut State<Self::Value>) {
+    fn super_statement(&self, statement: &Statement<'tcx>, state: &mut Self::State) {
         match &statement.kind {
             StatementKind::Assign(box (place, rvalue)) => {
                 self.handle_assign(*place, rvalue, state);
@@ -100,21 +211,11 @@ pub trait ValueAnalysis<'tcx> {
         }
     }
 
-    fn handle_assign(
-        &self,
-        target: Place<'tcx>,
-        rvalue: &Rvalue<'tcx>,
-        state: &mut State<Self::Value>,
-    ) {
+    fn handle_assign(&self, target: Place<'tcx>, rvalue: &Rvalue<'tcx>, state: &mut Self::State) {
         self.super_assign(target, rvalue, state)
     }
 
-    fn super_assign(
-        &self,
-        target: Place<'tcx>,
-        rvalue: &Rvalue<'tcx>,
-        state: &mut State<Self::Value>,
-    ) {
+    fn super_assign(&self, target: Place<'tcx>, rvalue: &Rvalue<'tcx>, state: &mut Self::State) {
         let result = self.handle_rvalue(rvalue, state);
         state.assign(target.as_ref(), result, self.map());
     }
@@ -122,16 +223,16 @@ pub trait ValueAnalysis<'tcx> {
     fn handle_rvalue(
         &self,
         rvalue: &Rvalue<'tcx>,
-        state: &mut State<Self::Value>,
-    ) -> ValueOrPlaceOrRef<Self::Value> {
+        state: &mut Self::State,
+    ) -> ValueOrPlaceOrRef<<Self::State as State>::Value> {
         self.super_rvalue(rvalue, state)
     }
 
     fn super_rvalue(
         &self,
         rvalue: &Rvalue<'tcx>,
-        state: &mut State<Self::Value>,
-    ) -> ValueOrPlaceOrRef<Self::Value> {
+        state: &mut Self::State,
+    ) -> ValueOrPlaceOrRef<<Self::State as State>::Value> {
         match rvalue {
             Rvalue::Use(operand) => self.handle_operand(operand, state).into(),
             Rvalue::Ref(_, BorrowKind::Shared, place) => self
@@ -153,16 +254,16 @@ pub trait ValueAnalysis<'tcx> {
     fn handle_operand(
         &self,
         operand: &Operand<'tcx>,
-        state: &mut State<Self::Value>,
-    ) -> ValueOrPlace<Self::Value> {
+        state: &mut Self::State,
+    ) -> ValueOrPlace<<Self::State as State>::Value> {
         self.super_operand(operand, state)
     }
 
     fn super_operand(
         &self,
         operand: &Operand<'tcx>,
-        state: &mut State<Self::Value>,
-    ) -> ValueOrPlace<Self::Value> {
+        state: &mut Self::State,
+    ) -> ValueOrPlace<<Self::State as State>::Value> {
         match operand {
             Operand::Constant(box constant) => {
                 ValueOrPlace::Value(self.handle_constant(constant, state))
@@ -180,24 +281,24 @@ pub trait ValueAnalysis<'tcx> {
     fn handle_constant(
         &self,
         constant: &Constant<'tcx>,
-        state: &mut State<Self::Value>,
-    ) -> Self::Value {
+        state: &mut Self::State,
+    ) -> <Self::State as State>::Value {
         self.super_constant(constant, state)
     }
 
     fn super_constant(
         &self,
         _constant: &Constant<'tcx>,
-        _state: &mut State<Self::Value>,
-    ) -> Self::Value {
-        Self::Value::top()
+        _state: &mut Self::State,
+    ) -> <Self::State as State>::Value {
+        <Self::State as State>::Value::top()
     }
 
-    fn handle_terminator(&self, terminator: &Terminator<'tcx>, state: &mut State<Self::Value>) {
+    fn handle_terminator(&self, terminator: &Terminator<'tcx>, state: &mut Self::State) {
         self.super_terminator(terminator, state)
     }
 
-    fn super_terminator(&self, terminator: &Terminator<'tcx>, _state: &mut State<Self::Value>) {
+    fn super_terminator(&self, terminator: &Terminator<'tcx>, _state: &mut Self::State) {
         match &terminator.kind {
             TerminatorKind::Call { .. } | TerminatorKind::InlineAsm { .. } => {
                 // Effect is applied by `handle_call_return`.
@@ -215,7 +316,7 @@ pub trait ValueAnalysis<'tcx> {
     fn handle_call_return(
         &self,
         return_places: CallReturnPlaces<'_, 'tcx>,
-        state: &mut State<Self::Value>,
+        state: &mut Self::State,
     ) {
         self.super_call_return(return_places, state)
     }
@@ -223,7 +324,7 @@ pub trait ValueAnalysis<'tcx> {
     fn super_call_return(
         &self,
         return_places: CallReturnPlaces<'_, 'tcx>,
-        state: &mut State<Self::Value>,
+        state: &mut Self::State,
     ) {
         return_places.for_each(|place| {
             state.flood(place.as_ref(), self.map());
@@ -233,7 +334,7 @@ pub trait ValueAnalysis<'tcx> {
     fn handle_switch_int(
         &self,
         discr: &Operand<'tcx>,
-        apply_edge_effects: &mut impl SwitchIntEdgeEffects<State<Self::Value>>,
+        apply_edge_effects: &mut impl SwitchIntEdgeEffects<Self::State>,
     ) {
         self.super_switch_int(discr, apply_edge_effects)
     }
@@ -241,7 +342,7 @@ pub trait ValueAnalysis<'tcx> {
     fn super_switch_int(
         &self,
         _discr: &Operand<'tcx>,
-        _apply_edge_effects: &mut impl SwitchIntEdgeEffects<State<Self::Value>>,
+        _apply_edge_effects: &mut impl SwitchIntEdgeEffects<Self::State>,
     ) {
     }
 
@@ -255,21 +356,30 @@ pub trait ValueAnalysis<'tcx> {
 
 pub struct ValueAnalysisWrapper<T>(pub T);
 
+#[derive(Debug, PartialEq, Eq, Clone)]
+pub struct StateWrapper<S>(pub S);
+
+impl<S: State> JoinSemiLattice for StateWrapper<S> {
+    fn join(&mut self, other: &Self) -> bool {
+        self.0.join(&other.0)
+    }
+}
+
 impl<'tcx, T: ValueAnalysis<'tcx>> AnalysisDomain<'tcx> for ValueAnalysisWrapper<T> {
-    type Domain = State<T::Value>;
+    type Domain = StateWrapper<T::State>;
 
     type Direction = crate::Forward;
 
     const NAME: &'static str = T::NAME;
 
-    fn bottom_value(&self, _body: &Body<'tcx>) -> Self::Domain {
-        State(IndexVec::from_elem_n(T::Value::bottom(), self.0.map().value_count))
+    fn bottom_value(&self, body: &Body<'tcx>) -> Self::Domain {
+        let result = self.0.bottom_value(body);
+        assert!(result.yeet().len() == self.0.map().value_count);
+        StateWrapper(result)
     }
 
     fn initialize_start_block(&self, body: &Body<'tcx>, state: &mut Self::Domain) {
-        for arg in body.args_iter() {
-            state.flood(PlaceRef { local: arg, projection: &[] }, self.0.map());
-        }
+        self.0.initialize_start_block(body, &mut state.0)
     }
 }
 
@@ -283,7 +393,7 @@ where
         statement: &Statement<'tcx>,
         _location: Location,
     ) {
-        self.0.handle_statement(statement, state);
+        self.0.handle_statement(statement, &mut state.0);
     }
 
     fn apply_terminator_effect(
@@ -292,7 +402,7 @@ where
         terminator: &Terminator<'tcx>,
         _location: Location,
     ) {
-        self.0.handle_terminator(terminator, state);
+        self.0.handle_terminator(terminator, &mut state.0);
     }
 
     fn apply_call_return_effect(
@@ -301,7 +411,7 @@ where
         _block: BasicBlock,
         return_places: crate::CallReturnPlaces<'_, 'tcx>,
     ) {
-        self.0.handle_call_return(return_places, state)
+        self.0.handle_call_return(return_places, &mut state.0)
     }
 
     fn apply_switch_int_edge_effects(
@@ -310,7 +420,18 @@ where
         discr: &Operand<'tcx>,
         apply_edge_effects: &mut impl SwitchIntEdgeEffects<Self::Domain>,
     ) {
-        self.0.handle_switch_int(discr, apply_edge_effects)
+        self.0.handle_switch_int(discr, &mut SwitchIntEdgeEffectsWrapper(apply_edge_effects))
+    }
+}
+
+struct SwitchIntEdgeEffectsWrapper<E>(E);
+
+impl<S, E> SwitchIntEdgeEffects<S> for SwitchIntEdgeEffectsWrapper<&mut E>
+where
+    E: SwitchIntEdgeEffects<StateWrapper<S>>,
+{
+    fn apply(&mut self, mut apply_edge_effect: impl FnMut(&mut S, SwitchIntTarget)) {
+        self.0.apply(|state, target| apply_edge_effect(&mut state.0, target));
     }
 }
 
@@ -319,109 +440,8 @@ rustc_index::newtype_index!(
 );
 
 rustc_index::newtype_index!(
-    struct ValueIndex {}
+    pub struct ValueIndex {}
 );
-
-#[derive(PartialEq, Eq, Clone, Debug)]
-pub struct State<V>(IndexVec<ValueIndex, V>);
-
-impl<V: Clone + HasTop> State<V> {
-    pub fn flood_all(&mut self) {
-        self.flood_all_with(V::top())
-    }
-
-    pub fn flood_all_with(&mut self, value: V) {
-        self.0.raw.fill(value);
-    }
-
-    pub fn flood_with(&mut self, place: PlaceRef<'_>, map: &Map, value: V) {
-        if let Some(root) = map.find(place) {
-            self.flood_idx_with(root, map, value);
-        }
-    }
-
-    pub fn flood(&mut self, place: PlaceRef<'_>, map: &Map) {
-        self.flood_with(place, map, V::top())
-    }
-
-    pub fn flood_idx_with(&mut self, place: PlaceIndex, map: &Map, value: V) {
-        map.preorder_invoke(place, &mut |place| {
-            if let Some(vi) = map.places[place].value_index {
-                self.0[vi] = value.clone();
-            }
-        });
-    }
-
-    pub fn flood_idx(&mut self, place: PlaceIndex, map: &Map) {
-        self.flood_idx_with(place, map, V::top())
-    }
-
-    pub fn assign_place_idx(&mut self, target: PlaceIndex, source: PlaceIndex, map: &Map) {
-        if let Some(target_value) = map.places[target].value_index {
-            if let Some(source_value) = map.places[source].value_index {
-                self.0[target_value] = self.0[source_value].clone();
-            } else {
-                self.0[target_value] = V::top();
-            }
-        }
-        for target_child in map.children(target) {
-            // Try to find corresponding child in source.
-            let projection = map.places[target_child].proj_elem.unwrap();
-            if let Some(source_child) = map.projections.get(&(source, projection)) {
-                self.assign_place_idx(target_child, *source_child, map);
-            } else {
-                self.flood_idx(target_child, map);
-            }
-        }
-    }
-
-    pub fn assign(&mut self, target: PlaceRef<'_>, result: ValueOrPlaceOrRef<V>, map: &Map) {
-        if let Some(target) = map.find(target) {
-            self.assign_idx(target, result, map);
-        } else {
-            // We don't track this place nor any projections, assignment can be ignored.
-        }
-    }
-
-    pub fn assign_idx(&mut self, target: PlaceIndex, result: ValueOrPlaceOrRef<V>, map: &Map) {
-        match result {
-            ValueOrPlaceOrRef::Value(value) => {
-                // First flood the target place in case we also track any projections (although
-                // this scenario is currently not well-supported by the API).
-                self.flood_idx(target, map);
-                if let Some(value_index) = map.places[target].value_index {
-                    self.0[value_index] = value;
-                }
-            }
-            ValueOrPlaceOrRef::Place(source) => self.assign_place_idx(target, source, map),
-            ValueOrPlaceOrRef::Ref(source) => {
-                if let Some(value_index) = map.places[target].value_index {
-                    self.0[value_index] = V::top();
-                }
-                if let Some(target_deref) = map.apply_elem(target, ProjElem::Deref) {
-                    self.assign_place_idx(target_deref, source, map);
-                }
-            }
-            ValueOrPlaceOrRef::Unknown => {
-                self.flood_idx(target, map);
-            }
-        }
-    }
-
-    pub fn get(&self, place: PlaceRef<'_>, map: &Map) -> V {
-        map.find(place).map(|place| self.get_idx(place, map)).unwrap_or(V::top())
-    }
-
-    pub fn get_idx(&self, place: PlaceIndex, map: &Map) -> V {
-        map.places[place].value_index.map(|v| self.0[v].clone()).unwrap_or(V::top())
-    }
-}
-
-impl<V: JoinSemiLattice> JoinSemiLattice for State<V> {
-    fn join(&mut self, other: &Self) -> bool {
-        self.0.join(&other.0)
-    }
-}
 
 #[derive(Debug)]
 pub struct Map {
@@ -432,6 +452,10 @@ pub struct Map {
 }
 
 impl Map {
+    pub fn value_count(&self) -> usize {
+        self.value_count
+    }
+
     pub fn new() -> Self {
         Self {
             locals: IndexVec::new(),
@@ -692,18 +716,18 @@ fn iter_fields<'tcx>(
 fn debug_with_context_rec<V: Debug + Eq>(
     place: PlaceIndex,
     place_str: &str,
-    new: &State<V>,
-    old: Option<&State<V>>,
+    new: &IndexVec<ValueIndex, V>,
+    old: Option<&IndexVec<ValueIndex, V>>,
     map: &Map,
     f: &mut Formatter<'_>,
 ) -> std::fmt::Result {
     if let Some(value) = map.places[place].value_index {
         match old {
-            None => writeln!(f, "{}: {:?}", place_str, new.0[value])?,
+            None => writeln!(f, "{}: {:?}", place_str, new[value])?,
             Some(old) => {
-                if new.0[value] != old.0[value] {
-                    writeln!(f, "\u{001f}-{}: {:?}", place_str, old.0[value])?;
-                    writeln!(f, "\u{001f}+{}: {:?}", place_str, new.0[value])?;
+                if new[value] != old[value] {
+                    writeln!(f, "\u{001f}-{}: {:?}", place_str, old[value])?;
+                    writeln!(f, "\u{001f}+{}: {:?}", place_str, new[value])?;
                 }
             }
         }
@@ -729,8 +753,8 @@ fn debug_with_context_rec<V: Debug + Eq>(
 }
 
 fn debug_with_context<V: Debug + Eq>(
-    new: &State<V>,
-    old: Option<&State<V>>,
+    new: &IndexVec<ValueIndex, V>,
+    old: Option<&IndexVec<ValueIndex, V>>,
     map: &Map,
     f: &mut Formatter<'_>,
 ) -> std::fmt::Result {
@@ -742,13 +766,14 @@ fn debug_with_context<V: Debug + Eq>(
     Ok(())
 }
 
-impl<'tcx, T> DebugWithContext<ValueAnalysisWrapper<T>> for State<T::Value>
+impl<'tcx, T> DebugWithContext<ValueAnalysisWrapper<T>> for StateWrapper<T::State>
 where
     T: ValueAnalysis<'tcx>,
-    T::Value: Debug,
+    T::State: Debug + Eq,
+    <T::State as State>::Value: Debug + Eq,
 {
     fn fmt_with(&self, ctxt: &ValueAnalysisWrapper<T>, f: &mut Formatter<'_>) -> std::fmt::Result {
-        debug_with_context(self, None, ctxt.0.map(), f)
+        debug_with_context(self.0.yeet(), None, ctxt.0.map(), f)
     }
 
     fn fmt_diff_with(
@@ -757,6 +782,6 @@ where
         ctxt: &ValueAnalysisWrapper<T>,
         f: &mut Formatter<'_>,
     ) -> std::fmt::Result {
-        debug_with_context(self, Some(old), ctxt.0.map(), f)
+        debug_with_context(self.0.yeet(), Some(old.0.yeet()), ctxt.0.map(), f)
     }
 }
