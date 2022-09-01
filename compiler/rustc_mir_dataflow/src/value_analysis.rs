@@ -68,9 +68,9 @@ use crate::{
 pub trait State: Clone + JoinSemiLattice + Eq {
     type Value: Clone + HasTop;
 
-    fn yeet(&self) -> &IndexVec<ValueIndex, Self::Value>;
+    fn values(&self) -> &IndexVec<ValueIndex, Self::Value>;
 
-    fn yeet_mut(&mut self) -> &mut IndexVec<ValueIndex, Self::Value>;
+    fn values_mut(&mut self) -> &mut IndexVec<ValueIndex, Self::Value>;
 }
 
 pub trait StateExt: State {
@@ -79,7 +79,7 @@ pub trait StateExt: State {
     }
 
     fn flood_all_with(&mut self, value: Self::Value) {
-        self.yeet_mut().raw.fill(value);
+        self.values_mut().raw.fill(value);
     }
 
     fn flood_with(&mut self, place: PlaceRef<'_>, map: &Map, value: Self::Value) {
@@ -95,7 +95,7 @@ pub trait StateExt: State {
     fn flood_idx_with(&mut self, place: PlaceIndex, map: &Map, value: Self::Value) {
         map.preorder_invoke(place, &mut |place| {
             if let Some(vi) = map.places[place].value_index {
-                self.yeet_mut()[vi] = value.clone();
+                self.values_mut()[vi] = value.clone();
             }
         });
     }
@@ -107,9 +107,9 @@ pub trait StateExt: State {
     fn assign_place_idx(&mut self, target: PlaceIndex, source: PlaceIndex, map: &Map) {
         if let Some(target_value) = map.places[target].value_index {
             if let Some(source_value) = map.places[source].value_index {
-                self.yeet_mut()[target_value] = self.yeet()[source_value].clone();
+                self.values_mut()[target_value] = self.values()[source_value].clone();
             } else {
-                self.yeet_mut()[target_value] = Self::Value::top();
+                self.values_mut()[target_value] = Self::Value::top();
             }
         }
         for target_child in map.children(target) {
@@ -143,13 +143,13 @@ pub trait StateExt: State {
                 // this scenario is currently not well-supported by the API).
                 self.flood_idx(target, map);
                 if let Some(value_index) = map.places[target].value_index {
-                    self.yeet_mut()[value_index] = value;
+                    self.values_mut()[value_index] = value;
                 }
             }
             ValueOrPlaceOrRef::Place(source) => self.assign_place_idx(target, source, map),
             ValueOrPlaceOrRef::Ref(source) => {
                 if let Some(value_index) = map.places[target].value_index {
-                    self.yeet_mut()[value_index] = Self::Value::top();
+                    self.values_mut()[value_index] = Self::Value::top();
                 }
                 if let Some(target_deref) = map.apply_elem(target, ProjElem::Deref) {
                     self.assign_place_idx(target_deref, source, map);
@@ -166,7 +166,10 @@ pub trait StateExt: State {
     }
 
     fn get_idx(&self, place: PlaceIndex, map: &Map) -> Self::Value {
-        map.places[place].value_index.map(|v| self.yeet()[v].clone()).unwrap_or(Self::Value::top())
+        map.places[place]
+            .value_index
+            .map(|v| self.values()[v].clone())
+            .unwrap_or(Self::Value::top())
     }
 }
 
@@ -374,7 +377,7 @@ impl<'tcx, T: ValueAnalysis<'tcx>> AnalysisDomain<'tcx> for ValueAnalysisWrapper
 
     fn bottom_value(&self, body: &Body<'tcx>) -> Self::Domain {
         let result = self.0.bottom_value(body);
-        assert!(result.yeet().len() == self.0.map().value_count);
+        assert!(result.values().len() == self.0.map().value_count);
         StateWrapper(result)
     }
 
@@ -773,7 +776,7 @@ where
     <T::State as State>::Value: Debug + Eq,
 {
     fn fmt_with(&self, ctxt: &ValueAnalysisWrapper<T>, f: &mut Formatter<'_>) -> std::fmt::Result {
-        debug_with_context(self.0.yeet(), None, ctxt.0.map(), f)
+        debug_with_context(self.0.values(), None, ctxt.0.map(), f)
     }
 
     fn fmt_diff_with(
@@ -782,6 +785,6 @@ where
         ctxt: &ValueAnalysisWrapper<T>,
         f: &mut Formatter<'_>,
     ) -> std::fmt::Result {
-        debug_with_context(self.0.yeet(), Some(old.0.yeet()), ctxt.0.map(), f)
+        debug_with_context(self.0.values(), Some(old.0.values()), ctxt.0.map(), f)
     }
 }

@@ -8,8 +8,8 @@ use rustc_mir_dataflow::value_analysis::{
     Map, ProjElem, State, StateExt, StateWrapper, ValueAnalysis, ValueIndex, ValueOrPlace,
     ValueOrPlaceOrRef,
 };
-use rustc_mir_dataflow::JoinSemiLattice;
 use rustc_mir_dataflow::{lattice::FlatSet, Analysis, ResultsVisitor, SwitchIntEdgeEffects};
+use rustc_mir_dataflow::{CallReturnPlaces, JoinSemiLattice};
 use rustc_span::DUMMY_SP;
 
 use crate::MirPass;
@@ -62,11 +62,11 @@ impl<'tcx> JoinSemiLattice for ConstState<'tcx> {
 impl<'tcx> State for ConstState<'tcx> {
     type Value = Value<'tcx>;
 
-    fn yeet(&self) -> &IndexVec<ValueIndex, Self::Value> {
+    fn values(&self) -> &IndexVec<ValueIndex, Self::Value> {
         &self.values
     }
 
-    fn yeet_mut(&mut self) -> &mut IndexVec<ValueIndex, Self::Value> {
+    fn values_mut(&mut self) -> &mut IndexVec<ValueIndex, Self::Value> {
         &mut self.values
     }
 }
@@ -75,6 +75,10 @@ impl<'tcx> ValueAnalysis<'tcx> for ConstAnalysis<'tcx> {
     type State = ConstState<'tcx>;
 
     const NAME: &'static str = "ConstAnalysis";
+
+    fn map(&self) -> &Map {
+        &self.map
+    }
 
     fn bottom_value(&self, _body: &Body<'tcx>) -> Self::State {
         Self::State {
@@ -88,10 +92,6 @@ impl<'tcx> ValueAnalysis<'tcx> for ConstAnalysis<'tcx> {
         for arg in body.args_iter() {
             state.flood(PlaceRef { local: arg, projection: &[] }, &self.map);
         }
-    }
-
-    fn map(&self) -> &Map {
-        &self.map
     }
 
     fn handle_statement(&self, statement: &Statement<'tcx>, state: &mut Self::State) {
@@ -179,6 +179,22 @@ impl<'tcx> ValueAnalysis<'tcx> for ConstAnalysis<'tcx> {
             .and_then(|scalar| scalar.try_to_int().ok())
             .map(|value| FlatSet::Elem(Const::Scalar(value, constant.ty())))
             .unwrap_or(FlatSet::Top)
+    }
+
+    fn handle_terminator(&self, terminator: &Terminator<'tcx>, state: &mut Self::State) {
+        if state.reachable {
+            self.super_terminator(terminator, state)
+        }
+    }
+
+    fn handle_call_return(
+        &self,
+        return_places: CallReturnPlaces<'_, 'tcx>,
+        state: &mut Self::State,
+    ) {
+        if state.reachable {
+            self.super_call_return(return_places, state)
+        }
     }
 
     fn handle_switch_int(
