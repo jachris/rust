@@ -39,7 +39,7 @@ where
                 let mut local_len = SetLenOnDrop::new(&mut self.len);
                 iterator.for_each(move |element| {
                     ptr::write(ptr, element);
-                    ptr = ptr.offset(1);
+                    ptr = ptr.add(1);
                     // Since the loop executes user code which can panic we have to bump the pointer
                     // after each step.
                     // NB can't overflow since we would have had to alloc the address space
@@ -62,7 +62,7 @@ impl<T, A: Allocator> SpecExtend<T, IntoIter<T>> for Vec<T, A> {
         unsafe {
             self.append_elements(iterator.as_slice() as _);
         }
-        iterator.ptr = iterator.end;
+        iterator.forget_remaining_elements();
     }
 }
 

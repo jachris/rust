@@ -149,7 +149,7 @@ fn optgroups() -> getopts::Options {
 }
 
 fn usage(binary: &str, options: &getopts::Options) {
-    let message = format!("Usage: {} [OPTIONS] [FILTERS...]", binary);
+    let message = format!("Usage: {binary} [OPTIONS] [FILTERS...]");
     println!(
         r#"{usage}
 
@@ -196,6 +196,7 @@ Test Attributes:
 pub fn parse_opts(args: &[String]) -> Option<OptRes> {
     // Parse matches.
     let opts = optgroups();
+    let binary = args.get(0).map(|c| &**c).unwrap_or("...");
     let args = args.get(1..).unwrap_or(args);
     let matches = match opts.parse(args) {
         Ok(m) => m,
@@ -205,7 +206,7 @@ pub fn parse_opts(args: &[String]) -> Option<OptRes> {
     // Check if help was requested.
     if matches.opt_present("h") {
         // Show help and do nothing more.
-        usage(&args[0], &opts);
+        usage(binary, &opts);
         return None;
     }
 
@@ -360,7 +361,7 @@ fn get_shuffle_seed(matches: &getopts::Matches, allow_unstable: bool) -> OptPart
         shuffle_seed = match env::var("RUST_TEST_SHUFFLE_SEED") {
             Ok(val) => match val.parse::<u64>() {
                 Ok(n) => Some(n),
-                Err(_) => panic!("RUST_TEST_SHUFFLE_SEED is `{}`, should be a number.", val),
+                Err(_) => panic!("RUST_TEST_SHUFFLE_SEED is `{val}`, should be a number."),
             },
             Err(_) => None,
         };

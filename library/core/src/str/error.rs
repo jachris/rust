@@ -1,5 +1,7 @@
 //! Defines utf8 error type.
 
+#[cfg(not(bootstrap))]
+use crate::error::Error;
 use crate::fmt;
 
 /// Errors which can occur when attempting to interpret a sequence of [`u8`]
@@ -72,7 +74,7 @@ impl Utf8Error {
     /// assert_eq!(1, error.valid_up_to());
     /// ```
     #[stable(feature = "utf8_error", since = "1.5.0")]
-    #[rustc_const_unstable(feature = "const_str_from_utf8", issue = "91006")]
+    #[rustc_const_stable(feature = "const_str_from_utf8_shared", since = "1.63.0")]
     #[must_use]
     #[inline]
     pub const fn valid_up_to(&self) -> usize {
@@ -95,11 +97,11 @@ impl Utf8Error {
     ///
     /// [U+FFFD]: ../../std/char/constant.REPLACEMENT_CHARACTER.html
     #[stable(feature = "utf8_error_error_len", since = "1.20.0")]
-    #[rustc_const_unstable(feature = "const_str_from_utf8", issue = "91006")]
+    #[rustc_const_stable(feature = "const_str_from_utf8_shared", since = "1.63.0")]
     #[must_use]
     #[inline]
     pub const fn error_len(&self) -> Option<usize> {
-        // This should become `map` again, once it's `const`
+        // FIXME: This should become `map` again, once it's `const`
         match self.error_len {
             Some(len) => Some(len as usize),
             None => None,
@@ -122,6 +124,15 @@ impl fmt::Display for Utf8Error {
     }
 }
 
+#[cfg(not(bootstrap))]
+#[stable(feature = "rust1", since = "1.0.0")]
+impl Error for Utf8Error {
+    #[allow(deprecated)]
+    fn description(&self) -> &str {
+        "invalid utf-8: corrupt contents"
+    }
+}
+
 /// An error returned when parsing a `bool` using [`from_str`] fails
 ///
 /// [`from_str`]: super::FromStr::from_str
@@ -134,5 +145,14 @@ pub struct ParseBoolError;
 impl fmt::Display for ParseBoolError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         "provided string was not `true` or `false`".fmt(f)
+    }
+}
+
+#[cfg(not(bootstrap))]
+#[stable(feature = "rust1", since = "1.0.0")]
+impl Error for ParseBoolError {
+    #[allow(deprecated)]
+    fn description(&self) -> &str {
+        "failed to parse bool"
     }
 }

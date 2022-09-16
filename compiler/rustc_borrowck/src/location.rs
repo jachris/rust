@@ -30,10 +30,10 @@ pub enum RichLocation {
 }
 
 impl LocationTable {
-    crate fn new(body: &Body<'_>) -> Self {
+    pub(crate) fn new(body: &Body<'_>) -> Self {
         let mut num_points = 0;
         let statements_before_block = body
-            .basic_blocks()
+            .basic_blocks
             .iter()
             .map(|block_data| {
                 let v = num_points;
@@ -86,8 +86,7 @@ impl LocationTable {
         let (block, &first_index) = self
             .statements_before_block
             .iter_enumerated()
-            .filter(|(_, first_index)| **first_index <= point_index)
-            .last()
+            .rfind(|&(_, &first_index)| first_index <= point_index)
             .unwrap();
 
         let statement_index = (point_index - first_index) / 2;
@@ -100,7 +99,7 @@ impl LocationTable {
 }
 
 impl LocationIndex {
-    fn is_start(&self) -> bool {
+    fn is_start(self) -> bool {
         // even indices are start points; odd indices are mid points
         (self.index() % 2) == 0
     }

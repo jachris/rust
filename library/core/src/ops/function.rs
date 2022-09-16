@@ -53,11 +53,18 @@
 /// ```
 #[lang = "fn"]
 #[stable(feature = "rust1", since = "1.0.0")]
+#[rustc_diagnostic_item = "Fn"]
 #[rustc_paren_sugar]
 #[rustc_on_unimplemented(
     on(
         Args = "()",
         note = "wrap the `{Self}` in a closure with no arguments: `|| {{ /* code */ }}`"
+    ),
+    on(
+        _Self = "unsafe fn",
+        note = "unsafe function cannot be called generically without an unsafe block",
+        // SAFETY: tidy is not smart enough to tell that the below unsafe block is a string
+        label = "call the function in a closure: `|| unsafe {{ /* code */ }}`"
     ),
     message = "expected a `{Fn}<{Args}>` closure, found `{Self}`",
     label = "expected an `Fn<{Args}>` closure, found `{Self}`"
@@ -133,11 +140,18 @@ pub trait Fn<Args>: FnMut<Args> {
 /// ```
 #[lang = "fn_mut"]
 #[stable(feature = "rust1", since = "1.0.0")]
+#[rustc_diagnostic_item = "FnMut"]
 #[rustc_paren_sugar]
 #[rustc_on_unimplemented(
     on(
         Args = "()",
         note = "wrap the `{Self}` in a closure with no arguments: `|| {{ /* code */ }}`"
+    ),
+    on(
+        _Self = "unsafe fn",
+        note = "unsafe function cannot be called generically without an unsafe block",
+        // SAFETY: tidy is not smart enough to tell that the below unsafe block is a string
+        label = "call the function in a closure: `|| unsafe {{ /* code */ }}`"
     ),
     message = "expected a `{FnMut}<{Args}>` closure, found `{Self}`",
     label = "expected an `FnMut<{Args}>` closure, found `{Self}`"
@@ -205,11 +219,18 @@ pub trait FnMut<Args>: FnOnce<Args> {
 /// ```
 #[lang = "fn_once"]
 #[stable(feature = "rust1", since = "1.0.0")]
+#[rustc_diagnostic_item = "FnOnce"]
 #[rustc_paren_sugar]
 #[rustc_on_unimplemented(
     on(
         Args = "()",
         note = "wrap the `{Self}` in a closure with no arguments: `|| {{ /* code */ }}`"
+    ),
+    on(
+        _Self = "unsafe fn",
+        note = "unsafe function cannot be called generically without an unsafe block",
+        // SAFETY: tidy is not smart enough to tell that the below unsafe block is a string
+        label = "call the function in a closure: `|| unsafe {{ /* code */ }}`"
     ),
     message = "expected a `{FnOnce}<{Args}>` closure, found `{Self}`",
     label = "expected an `FnOnce<{Args}>` closure, found `{Self}`"
@@ -229,9 +250,10 @@ pub trait FnOnce<Args> {
 
 mod impls {
     #[stable(feature = "rust1", since = "1.0.0")]
-    impl<A, F: ?Sized> Fn<A> for &F
+    #[rustc_const_unstable(feature = "const_fn_trait_ref_impls", issue = "101803")]
+    impl<A, F: ?Sized> const Fn<A> for &F
     where
-        F: Fn<A>,
+        F: ~const Fn<A>,
     {
         extern "rust-call" fn call(&self, args: A) -> F::Output {
             (**self).call(args)
@@ -239,9 +261,10 @@ mod impls {
     }
 
     #[stable(feature = "rust1", since = "1.0.0")]
-    impl<A, F: ?Sized> FnMut<A> for &F
+    #[rustc_const_unstable(feature = "const_fn_trait_ref_impls", issue = "101803")]
+    impl<A, F: ?Sized> const FnMut<A> for &F
     where
-        F: Fn<A>,
+        F: ~const Fn<A>,
     {
         extern "rust-call" fn call_mut(&mut self, args: A) -> F::Output {
             (**self).call(args)
@@ -249,9 +272,10 @@ mod impls {
     }
 
     #[stable(feature = "rust1", since = "1.0.0")]
-    impl<A, F: ?Sized> FnOnce<A> for &F
+    #[rustc_const_unstable(feature = "const_fn_trait_ref_impls", issue = "101803")]
+    impl<A, F: ?Sized> const FnOnce<A> for &F
     where
-        F: Fn<A>,
+        F: ~const Fn<A>,
     {
         type Output = F::Output;
 
@@ -261,9 +285,10 @@ mod impls {
     }
 
     #[stable(feature = "rust1", since = "1.0.0")]
-    impl<A, F: ?Sized> FnMut<A> for &mut F
+    #[rustc_const_unstable(feature = "const_fn_trait_ref_impls", issue = "101803")]
+    impl<A, F: ?Sized> const FnMut<A> for &mut F
     where
-        F: FnMut<A>,
+        F: ~const FnMut<A>,
     {
         extern "rust-call" fn call_mut(&mut self, args: A) -> F::Output {
             (*self).call_mut(args)
@@ -271,9 +296,10 @@ mod impls {
     }
 
     #[stable(feature = "rust1", since = "1.0.0")]
-    impl<A, F: ?Sized> FnOnce<A> for &mut F
+    #[rustc_const_unstable(feature = "const_fn_trait_ref_impls", issue = "101803")]
+    impl<A, F: ?Sized> const FnOnce<A> for &mut F
     where
-        F: FnMut<A>,
+        F: ~const FnMut<A>,
     {
         type Output = F::Output;
         extern "rust-call" fn call_once(self, args: A) -> F::Output {

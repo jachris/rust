@@ -1,5 +1,5 @@
 use clippy_utils::diagnostics::span_lint_and_then;
-use clippy_utils::source::snippet;
+use clippy_utils::source::{snippet, snippet_with_applicability, snippet_with_context};
 use clippy_utils::ty::is_type_diagnostic_item;
 use clippy_utils::{iter_input_pats, method_chain_args};
 use if_chain::if_chain;
@@ -97,11 +97,7 @@ declare_clippy_lint! {
 declare_lint_pass!(MapUnit => [OPTION_MAP_UNIT_FN, RESULT_MAP_UNIT_FN]);
 
 fn is_unit_type(ty: Ty<'_>) -> bool {
-    match ty.kind() {
-        ty::Tuple(slice) => slice.is_empty(),
-        ty::Never => true,
-        _ => false,
-    }
+    ty.is_unit() || ty.is_never()
 }
 
 fn is_unit_function(cx: &LateContext<'_>, expr: &hir::Expr<'_>) -> bool {
@@ -169,12 +165,12 @@ fn unit_closure<'tcx>(
     expr: &hir::Expr<'_>,
 ) -> Option<(&'tcx hir::Param<'tcx>, &'tcx hir::Expr<'tcx>)> {
     if_chain! {
-        if let hir::ExprKind::Closure(_, decl, inner_expr_id, _, _) = expr.kind;
-        let body = cx.tcx.hir().body(inner_expr_id);
+        if let hir::ExprKind::Closure(&hir::Closure { fn_decl, body, .. }) = expr.kind;
+        let body = cx.tcx.hir().body(body);
         let body_expr = &body.value;
-        if decl.inputs.len() == 1;
+        if fn_decl.inputs.len() == 1;
         if is_unit_expression(cx, body_expr);
-        if let Some(binding) = iter_input_pats(decl, body).next();
+        if let Some(binding) = iter_input_pats(fn_decl, body).next();
         then {
             return Some((binding, body_expr));
         }
@@ -204,8 +200,13 @@ fn suggestion_msg(function_type: &str, map_type: &str) -> String {
     )
 }
 
-fn lint_map_unit_fn(cx: &LateContext<'_>, stmt: &hir::Stmt<'_>, expr: &hir::Expr<'_>, map_args: &[hir::Expr<'_>]) {
-    let var_arg = &map_args[0];
+fn lint_map_unit_fn(
+    cx: &LateContext<'_>,
+    stmt: &hir::Stmt<'_>,
+    expr: &hir::Expr<'_>,
+    map_args: (&hir::Expr<'_>, &[hir::Expr<'_>]),
+) {
+    let var_arg = &map_args.0;
 
     let (map_type, variant, lint) = if is_type_diagnostic_item(cx, cx.typeck_results().expr_ty(var_arg), sym::Option) {
         ("Option", "Some", OPTION_MAP_UNIT_FN)
@@ -214,39 +215,36 @@ fn lint_map_unit_fn(cx: &LateContext<'_>, stmt: &hir::Stmt<'_>, expr: &hir::Expr
     } else {
         return;
     };
-    let fn_arg = &map_args[1];
+    let fn_arg = &map_args.1[0];
 
     if is_unit_function(cx, fn_arg) {
+        let mut applicability = Applicability::MachineApplicable;
         let msg = suggestion_msg("function", map_type);
         let suggestion = format!(
             "if let {0}({binding}) = {1} {{ {2}({binding}) }}",
             variant,
-            snippet(cx, var_arg.span, "_"),
-            snippet(cx, fn_arg.span, "_"),
+            snippet_with_applicability(cx, var_arg.span, "_", &mut applicability),
+            snippet_with_applicability(cx, fn_arg.span, "_", &mut applicability),
             binding = let_binding_name(cx, var_arg)
         );
 
         span_lint_and_then(cx, lint, expr.span, &msg, |diag| {
-            diag.span_suggestion(stmt.span, "try this", suggestion, Applicability::MachineApplicable);
+            diag.span_suggestion(stmt.span, "try this", suggestion, applicability);
         });
     } else if let Some((binding, closure_expr)) = unit_closure(cx, fn_arg) {
         let msg = suggestion_msg("closure", map_type);
 
         span_lint_and_then(cx, lint, expr.span, &msg, |diag| {
             if let Some(reduced_expr_span) = reduce_unit_expression(cx, closure_expr) {
+                let mut applicability = Applicability::MachineApplicable;
                 let suggestion = format!(
                     "if let {0}({1}) = {2} {{ {3} }}",
                     variant,
-                    snippet(cx, binding.pat.span, "_"),
-                    snippet(cx, var_arg.span, "_"),
-                    snippet(cx, reduced_expr_span, "_")
+                    snippet_with_applicability(cx, binding.pat.span, "_", &mut applicability),
+                    snippet_with_applicability(cx, var_arg.span, "_", &mut applicability),
+                    snippet_with_context(cx, reduced_expr_span, var_arg.span.ctxt(), "_", &mut applicability).0,
                 );
-                diag.span_suggestion(
-                    stmt.span,
-                    "try this",
-                    suggestion,
-                    Applicability::MachineApplicable, // snippet
-                );
+                diag.span_suggestion(stmt.span, "try this", suggestion, applicability);
             } else {
                 let suggestion = format!(
                     "if let {0}({1}) = {2} {{ ... }}",

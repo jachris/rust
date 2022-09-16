@@ -1,4 +1,3 @@
-#![feature(generic_associated_types)]
 #![feature(type_alias_impl_trait)]
 
 fn main() {}
@@ -17,7 +16,6 @@ struct C;
 
 impl<'a> A<'a> for C {
     type B<'b> = impl Clone;
-    //~^ ERROR: could not find defining uses
 
     fn a(&'a self) -> Self::B<'a> {} //~ ERROR: non-defining opaque type use in defining scope
 }

@@ -2,7 +2,7 @@ use clippy_utils::diagnostics::span_lint;
 use clippy_utils::trait_ref_of_method;
 use rustc_hir as hir;
 use rustc_lint::{LateContext, LateLintPass};
-use rustc_middle::ty::TypeFoldable;
+use rustc_middle::ty::TypeVisitable;
 use rustc_middle::ty::{Adt, Array, Ref, Slice, Tuple, Ty};
 use rustc_session::{declare_lint_pass, declare_tool_lint};
 use rustc_span::source_map::Span;
@@ -105,7 +105,7 @@ impl<'tcx> LateLintPass<'tcx> for MutableKeyType {
         if let hir::PatKind::Wild = local.pat.kind {
             return;
         }
-        check_ty(cx, local.span, cx.typeck_results().pat_ty(&*local.pat));
+        check_ty(cx, local.span, cx.typeck_results().pat_ty(local.pat));
     }
 }
 
@@ -125,7 +125,7 @@ fn check_ty<'tcx>(cx: &LateContext<'tcx>, span: Span, ty: Ty<'tcx>) {
     if let Adt(def, substs) = ty.kind() {
         let is_keyed_type = [sym::HashMap, sym::BTreeMap, sym::HashSet, sym::BTreeSet]
             .iter()
-            .any(|diag_item| cx.tcx.is_diagnostic_item(*diag_item, def.did));
+            .any(|diag_item| cx.tcx.is_diagnostic_item(*diag_item, def.did()));
         if is_keyed_type && is_interior_mutable_type(cx, substs.type_at(0), span) {
             span_lint(cx, MUTABLE_KEY_TYPE, span, "mutable key type");
         }
@@ -159,8 +159,8 @@ fn is_interior_mutable_type<'tcx>(cx: &LateContext<'tcx>, ty: Ty<'tcx>, span: Sp
                 sym::Arc,
             ]
             .iter()
-            .any(|diag_item| cx.tcx.is_diagnostic_item(*diag_item, def.did));
-            let is_box = Some(def.did) == cx.tcx.lang_items().owned_box();
+            .any(|diag_item| cx.tcx.is_diagnostic_item(*diag_item, def.did()));
+            let is_box = Some(def.did()) == cx.tcx.lang_items().owned_box();
             if is_std_collection || is_box {
                 // The type is mutable if any of its type parameters are
                 substs.types().any(|ty| is_interior_mutable_type(cx, ty, span))

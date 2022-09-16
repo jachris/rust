@@ -55,21 +55,26 @@ This API is completely unstable and subject to change.
 
 */
 
+#![allow(rustc::potential_query_instability)]
 #![doc(html_root_url = "https://doc.rust-lang.org/nightly/nightly-rustc/")]
-#![feature(bool_to_option)]
-#![feature(crate_visibility_modifier)]
+#![feature(box_patterns)]
+#![feature(control_flow_enum)]
+#![feature(drain_filter)]
+#![feature(hash_drain_filter)]
 #![feature(if_let_guard)]
 #![feature(is_sorted)]
+#![feature(iter_intersperse)]
+#![cfg_attr(bootstrap, feature(label_break_value))]
+#![feature(let_chains)]
 #![feature(let_else)]
 #![feature(min_specialization)]
-#![feature(nll)]
-#![feature(try_blocks)]
 #![feature(never_type)]
+#![feature(once_cell)]
 #![feature(slice_partition_dedup)]
-#![feature(control_flow_enum)]
-#![feature(hash_drain_filter)]
+#![feature(try_blocks)]
+#![feature(is_some_with)]
+#![feature(type_alias_impl_trait)]
 #![recursion_limit = "256"]
-#![cfg_attr(not(bootstrap), allow(rustc::potential_query_instability))]
 
 #[macro_use]
 extern crate tracing;
@@ -95,12 +100,11 @@ mod outlives;
 mod structured_errors;
 mod variance;
 
-use rustc_errors::{struct_span_err, ErrorReported};
+use rustc_errors::{struct_span_err, ErrorGuaranteed};
 use rustc_hir as hir;
 use rustc_hir::def_id::DefId;
 use rustc_hir::{Node, CRATE_HIR_ID};
 use rustc_infer::infer::{InferOk, TyCtxtInferExt};
-use rustc_infer::traits::TraitEngineExt as _;
 use rustc_middle::middle;
 use rustc_middle::ty::query::Providers;
 use rustc_middle::ty::{self, Ty, TyCtxt};
@@ -108,11 +112,8 @@ use rustc_middle::util;
 use rustc_session::config::EntryFnType;
 use rustc_span::{symbol::sym, Span, DUMMY_SP};
 use rustc_target::spec::abi::Abi;
-use rustc_trait_selection::infer::InferCtxtExt;
 use rustc_trait_selection::traits::error_reporting::InferCtxtExt as _;
-use rustc_trait_selection::traits::{
-    self, ObligationCause, ObligationCauseCode, TraitEngine, TraitEngineExt as _,
-};
+use rustc_trait_selection::traits::{self, ObligationCause, ObligationCauseCode};
 
 use std::iter;
 
@@ -144,18 +145,15 @@ fn require_same_types<'tcx>(
 ) -> bool {
     tcx.infer_ctxt().enter(|ref infcx| {
         let param_env = ty::ParamEnv::empty();
-        let mut fulfill_cx = <dyn TraitEngine<'_>>::new(infcx.tcx);
-        match infcx.at(cause, param_env).eq(expected, actual) {
-            Ok(InferOk { obligations, .. }) => {
-                fulfill_cx.register_predicate_obligations(infcx, obligations);
-            }
+        let errors = match infcx.at(cause, param_env).eq(expected, actual) {
+            Ok(InferOk { obligations, .. }) => traits::fully_solve_obligations(infcx, obligations),
             Err(err) => {
                 infcx.report_mismatched_types(cause, expected, actual, err).emit();
                 return false;
             }
-        }
+        };
 
-        match fulfill_cx.select_all_or_error(infcx).as_slice() {
+        match &errors[..] {
             [] => true,
             errors => {
                 infcx.report_fulfillment_errors(errors, None, false);
@@ -208,7 +206,7 @@ fn check_main_fn_ty(tcx: TyCtxt<'_>, main_def_id: DefId) {
         let hir_id = tcx.hir().local_def_id_to_hir_id(def_id.expect_local());
         match tcx.hir().find(hir_id) {
             Some(Node::Item(hir::Item { kind: hir::ItemKind::Fn(_, ref generics, _), .. })) => {
-                generics.where_clause.span()
+                Some(generics.where_clause_span)
             }
             _ => {
                 span_bug!(tcx.def_span(def_id), "main has a non-function type");
@@ -220,15 +218,7 @@ fn check_main_fn_ty(tcx: TyCtxt<'_>, main_def_id: DefId) {
         if !def_id.is_local() {
             return None;
         }
-        let hir_id = tcx.hir().local_def_id_to_hir_id(def_id.expect_local());
-        match tcx.hir().find(hir_id) {
-            Some(Node::Item(hir::Item { span: item_span, .. })) => {
-                Some(tcx.sess.source_map().guess_head_span(*item_span))
-            }
-            _ => {
-                span_bug!(tcx.def_span(def_id), "main has a non-function type");
-            }
-        }
+        Some(tcx.def_span(def_id))
     }
 
     fn main_fn_return_type_span(tcx: TyCtxt<'_>, def_id: DefId) -> Option<Span> {
@@ -257,7 +247,7 @@ fn check_main_fn_ty(tcx: TyCtxt<'_>, main_def_id: DefId) {
         let mut diag =
             struct_span_err!(tcx.sess, generics_param_span.unwrap_or(main_span), E0131, "{}", msg);
         if let Some(generics_param_span) = generics_param_span {
-            let label = "`main` cannot have generic parameters".to_string();
+            let label = "`main` cannot have generic parameters";
             diag.span_label(generics_param_span, label);
         }
         diag.emit();
@@ -294,17 +284,12 @@ fn check_main_fn_ty(tcx: TyCtxt<'_>, main_def_id: DefId) {
         error = true;
     }
 
-    for attr in tcx.get_attrs(main_def_id) {
-        if attr.has_name(sym::track_caller) {
-            tcx.sess
-                .struct_span_err(
-                    attr.span,
-                    "`main` function is not allowed to be `#[track_caller]`",
-                )
-                .span_label(main_span, "`main` function is not allowed to be `#[track_caller]`")
-                .emit();
-            error = true;
-        }
+    for attr in tcx.get_attrs(main_def_id, sym::track_caller) {
+        tcx.sess
+            .struct_span_err(attr.span, "`main` function is not allowed to be `#[track_caller]`")
+            .span_label(main_span, "`main` function is not allowed to be `#[track_caller]`")
+            .emit();
+        error = true;
     }
 
     if error {
@@ -312,45 +297,28 @@ fn check_main_fn_ty(tcx: TyCtxt<'_>, main_def_id: DefId) {
     }
 
     let expected_return_type;
-    if let Some(term_id) = tcx.lang_items().termination() {
+    if let Some(term_did) = tcx.lang_items().termination() {
         let return_ty = main_fnsig.output();
         let return_ty_span = main_fn_return_type_span(tcx, main_def_id).unwrap_or(main_span);
         if !return_ty.bound_vars().is_empty() {
             let msg = "`main` function return type is not allowed to have generic \
-                    parameters"
-                .to_owned();
+                    parameters";
             struct_span_err!(tcx.sess, return_ty_span, E0131, "{}", msg).emit();
             error = true;
         }
         let return_ty = return_ty.skip_binder();
         tcx.infer_ctxt().enter(|infcx| {
+            // Main should have no WC, so empty param env is OK here.
+            let param_env = ty::ParamEnv::empty();
             let cause = traits::ObligationCause::new(
                 return_ty_span,
                 main_diagnostics_hir_id,
                 ObligationCauseCode::MainFunctionType,
             );
-            let mut fulfillment_cx = traits::FulfillmentContext::new();
-            // normalize any potential projections in the return type, then add
-            // any possible obligations to the fulfillment context.
-            // HACK(ThePuzzlemaker) this feels symptomatic of a problem within
-            // checking trait fulfillment, not this here. I'm not sure why it
-            // works in the example in `fn test()` given in #88609? This also
-            // probably isn't the best way to do this.
-            let InferOk { value: norm_return_ty, obligations } = infcx
-                .partially_normalize_associated_types_in(
-                    cause.clone(),
-                    ty::ParamEnv::empty(),
-                    return_ty,
-                );
-            fulfillment_cx.register_predicate_obligations(&infcx, obligations);
-            fulfillment_cx.register_bound(
-                &infcx,
-                ty::ParamEnv::empty(),
-                norm_return_ty,
-                term_id,
-                cause,
-            );
-            let errors = fulfillment_cx.select_all_or_error(&infcx);
+            let ocx = traits::ObligationCtxt::new(&infcx);
+            let norm_return_ty = ocx.normalize(cause.clone(), param_env, return_ty);
+            ocx.register_bound(cause, param_env, norm_return_ty, term_did);
+            let errors = ocx.select_all_or_error();
             if !errors.is_empty() {
                 infcx.report_fulfillment_errors(&errors, None, false);
                 error = true;
@@ -403,19 +371,22 @@ fn check_start_fn_ty(tcx: TyCtxt<'_>, start_def_id: DefId) {
                         .emit();
                         error = true;
                     }
-                    if let Some(sp) = generics.where_clause.span() {
+                    if generics.has_where_clause_predicates {
                         struct_span_err!(
                             tcx.sess,
-                            sp,
+                            generics.where_clause_span,
                             E0647,
                             "start function is not allowed to have a `where` clause"
                         )
-                        .span_label(sp, "start function cannot have a `where` clause")
+                        .span_label(
+                            generics.where_clause_span,
+                            "start function cannot have a `where` clause",
+                        )
                         .emit();
                         error = true;
                     }
                     if let hir::IsAsync::Async = sig.header.asyncness {
-                        let span = tcx.sess.source_map().guess_head_span(it.span);
+                        let span = tcx.def_span(it.def_id);
                         struct_span_err!(
                             tcx.sess,
                             span,
@@ -473,7 +444,7 @@ fn check_start_fn_ty(tcx: TyCtxt<'_>, start_def_id: DefId) {
 
 fn check_for_entry_fn(tcx: TyCtxt<'_>) {
     match tcx.entry_fn(()) {
-        Some((def_id, EntryFnType::Main)) => check_main_fn_ty(tcx, def_id),
+        Some((def_id, EntryFnType::Main { .. })) => check_main_fn_ty(tcx, def_id),
         Some((def_id, EntryFnType::Start)) => check_start_fn_ty(tcx, def_id),
         _ => {}
     }
@@ -489,7 +460,7 @@ pub fn provide(providers: &mut Providers) {
     hir_wf_check::provide(providers);
 }
 
-pub fn check_crate(tcx: TyCtxt<'_>) -> Result<(), ErrorReported> {
+pub fn check_crate(tcx: TyCtxt<'_>) -> Result<(), ErrorGuaranteed> {
     let _prof_timer = tcx.sess.timer("type_check_crate");
 
     // this ensures that later parts of type checking can assume that items
@@ -508,11 +479,21 @@ pub fn check_crate(tcx: TyCtxt<'_>) -> Result<(), ErrorReported> {
     }
 
     tcx.sess.track_errors(|| {
-        tcx.sess.time("impl_wf_inference", || impl_wf_check::impl_wf_check(tcx));
+        tcx.sess.time("impl_wf_inference", || {
+            tcx.hir().for_each_module(|module| tcx.ensure().check_mod_impl_wf(module))
+        });
     })?;
 
     tcx.sess.track_errors(|| {
-        tcx.sess.time("coherence_checking", || coherence::check_coherence(tcx));
+        tcx.sess.time("coherence_checking", || {
+            for &trait_def_id in tcx.all_local_trait_impls(()).keys() {
+                tcx.ensure().coherent_trait(trait_def_id);
+            }
+
+            // these queries are executed for side-effects (error reporting):
+            tcx.ensure().crate_inherent_impls(());
+            tcx.ensure().crate_inherent_impls_overlap_check(());
+        });
     })?;
 
     if tcx.features().rustc_attrs {
@@ -522,7 +503,9 @@ pub fn check_crate(tcx: TyCtxt<'_>) -> Result<(), ErrorReported> {
     }
 
     tcx.sess.track_errors(|| {
-        tcx.sess.time("wf_checking", || check::check_wf_new(tcx));
+        tcx.sess.time("wf_checking", || {
+            tcx.hir().par_for_each_module(|module| tcx.ensure().check_mod_type_wf(module))
+        });
     })?;
 
     // NOTE: This is copy/pasted in librustdoc/core.rs and should be kept in sync.
@@ -535,7 +518,7 @@ pub fn check_crate(tcx: TyCtxt<'_>) -> Result<(), ErrorReported> {
     check_unused::check_crate(tcx);
     check_for_entry_fn(tcx);
 
-    if tcx.sess.err_count() == 0 { Ok(()) } else { Err(ErrorReported) }
+    if let Some(reported) = tcx.sess.has_errors() { Err(reported) } else { Ok(()) }
 }
 
 /// A quasi-deprecated helper used in rustdoc and clippy to get

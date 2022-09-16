@@ -1,10 +1,11 @@
 // run-pass
 // revisions: stock precise
 #![feature(const_trait_impl)]
-#![feature(const_fn_trait_bound)]
 #![feature(const_mut_refs)]
 #![feature(never_type)]
 #![cfg_attr(precise, feature(const_precise_live_drops))]
+
+use std::marker::Destruct;
 
 struct S<'a>(&'a mut u8);
 
@@ -14,7 +15,7 @@ impl<'a> const Drop for S<'a> {
     }
 }
 
-const fn a<T: ~const Drop>(_: T) {}
+const fn a<T: ~const Destruct>(_: T) {}
 
 const fn b() -> u8 {
     let mut c = 0;
@@ -95,7 +96,7 @@ implements_const_drop! {
 }
 
 fn main() {
-    struct HasDropGlue(Box<u8>);
+    struct HasDropGlue(#[allow(unused_tuple_struct_fields)] Box<u8>);
     struct HasDropImpl;
     impl Drop for HasDropImpl {
         fn drop(&mut self) {

@@ -1,9 +1,9 @@
 //! New recursive solver modeled on Chalk's recursive solver. Most of
 //! the guts are broken up into modules; see the comments in those modules.
 
-#![feature(crate_visibility_modifier)]
+#![deny(rustc::untranslatable_diagnostic)]
+#![deny(rustc::diagnostic_outside_of_impl)]
 #![feature(let_else)]
-#![feature(nll)]
 #![recursion_limit = "256"]
 
 #[macro_use]

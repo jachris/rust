@@ -4,12 +4,12 @@ error[E0271]: type mismatch resolving `<() as Super>::Assoc == ()`
 LL | fn test() -> impl Test {
    |              ^^^^^^^^^ type mismatch resolving `<() as Super>::Assoc == ()`
    |
-note: expected this to be `()`
+note: expected this to be `u8`
   --> $DIR/projection-mismatch-in-impl-where-clause.rs:6:18
    |
 LL |     type Assoc = u8;
    |                  ^^
-note: required because of the requirements on the impl of `Test` for `()`
+note: required for `()` to implement `Test`
   --> $DIR/projection-mismatch-in-impl-where-clause.rs:11:9
    |
 LL | impl<T> Test for T where T: Super<Assoc = ()> {}

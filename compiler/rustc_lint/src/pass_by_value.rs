@@ -1,5 +1,5 @@
 use crate::{LateContext, LateLintPass, LintContext};
-use rustc_errors::Applicability;
+use rustc_errors::{fluent, Applicability};
 use rustc_hir as hir;
 use rustc_hir::def::Res;
 use rustc_hir::{GenericArg, PathSegment, QPath, TyKind};
@@ -30,10 +30,11 @@ impl<'tcx> LateLintPass<'tcx> for PassByValue {
                 }
                 if let Some(t) = path_for_pass_by_value(cx, &inner_ty) {
                     cx.struct_span_lint(PASS_BY_VALUE, ty.span, |lint| {
-                        lint.build(&format!("passing `{}` by reference", t))
+                        lint.build(fluent::lint::pass_by_value)
+                            .set_arg("ty", t.clone())
                             .span_suggestion(
                                 ty.span,
-                                "try passing by value",
+                                fluent::lint::suggestion,
                                 t,
                                 // Changing type of function argument
                                 Applicability::MaybeIncorrect,
@@ -57,8 +58,8 @@ fn path_for_pass_by_value(cx: &LateContext<'_>, ty: &hir::Ty<'_>) -> Option<Stri
             }
             Res::SelfTy { trait_: None, alias_to: Some((did, _)) } => {
                 if let ty::Adt(adt, substs) = cx.tcx.type_of(did).kind() {
-                    if cx.tcx.has_attr(adt.did, sym::rustc_pass_by_value) {
-                        return Some(cx.tcx.def_path_str_with_substs(adt.did, substs));
+                    if cx.tcx.has_attr(adt.did(), sym::rustc_pass_by_value) {
+                        return Some(cx.tcx.def_path_str_with_substs(adt.did(), substs));
                     }
                 }
             }

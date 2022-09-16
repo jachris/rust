@@ -1,4 +1,4 @@
-use super::{const_io_error, Custom, Error, ErrorData, ErrorKind, Repr};
+use super::{const_io_error, Custom, Error, ErrorData, ErrorKind, Repr, SimpleMessage};
 use crate::assert_matches::assert_matches;
 use crate::error;
 use crate::fmt;
@@ -17,10 +17,10 @@ fn test_debug_error() {
     let msg = error_string(code);
     let kind = decode_error_kind(code);
     let err = Error {
-        repr: Repr::new_custom(box Custom {
+        repr: Repr::new_custom(Box::new(Custom {
             kind: ErrorKind::InvalidInput,
-            error: box Error { repr: super::Repr::new_os(code) },
-        }),
+            error: Box::new(Error { repr: super::Repr::new_os(code) }),
+        })),
     };
     let expected = format!(
         "Custom {{ \
@@ -33,7 +33,7 @@ fn test_debug_error() {
          }}",
         code, kind, msg
     );
-    assert_eq!(format!("{:?}", err), expected);
+    assert_eq!(format!("{err:?}"), expected);
 }
 
 #[test]
@@ -65,8 +65,8 @@ fn test_const() {
 
     assert_eq!(E.kind(), ErrorKind::NotFound);
     assert_eq!(E.to_string(), "hello");
-    assert!(format!("{:?}", E).contains("\"hello\""));
-    assert!(format!("{:?}", E).contains("NotFound"));
+    assert!(format!("{E:?}").contains("\"hello\""));
+    assert!(format!("{E:?}").contains("NotFound"));
 }
 
 #[test]
@@ -101,7 +101,7 @@ fn test_simple_message_packing() {
             let e = &$err;
             // Check that the public api is right.
             assert_eq!(e.kind(), $kind);
-            assert!(format!("{:?}", e).contains($msg));
+            assert!(format!("{e:?}").contains($msg));
             // and we got what we expected
             assert_matches!(
                 e.repr.data(),
@@ -140,4 +140,55 @@ fn test_custom_error_packing() {
             error,
         }) if error.downcast_ref::<Bojji>().as_deref() == Some(&Bojji(true)),
     );
+}
+
+#[derive(Debug)]
+struct E;
+
+impl fmt::Display for E {
+    fn fmt(&self, _f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        Ok(())
+    }
+}
+
+impl error::Error for E {}
+
+#[test]
+fn test_std_io_error_downcast() {
+    // Case 1: custom error, downcast succeeds
+    let io_error = Error::new(ErrorKind::Other, Bojji(true));
+    let e: Box<Bojji> = io_error.downcast().unwrap();
+    assert!(e.0);
+
+    // Case 2: custom error, downcast fails
+    let io_error = Error::new(ErrorKind::Other, Bojji(true));
+    let io_error = io_error.downcast::<E>().unwrap_err();
+
+    //   ensures that the custom error is intact
+    assert_eq!(ErrorKind::Other, io_error.kind());
+    let e: Box<Bojji> = io_error.downcast().unwrap();
+    assert!(e.0);
+
+    // Case 3: os error
+    let errno = 20;
+    let io_error = Error::from_raw_os_error(errno);
+    let io_error = io_error.downcast::<E>().unwrap_err();
+
+    assert_eq!(errno, io_error.raw_os_error().unwrap());
+
+    // Case 4: simple
+    let kind = ErrorKind::OutOfMemory;
+    let io_error: Error = kind.into();
+    let io_error = io_error.downcast::<E>().unwrap_err();
+
+    assert_eq!(kind, io_error.kind());
+
+    // Case 5: simple message
+    const SIMPLE_MESSAGE: SimpleMessage =
+        SimpleMessage { kind: ErrorKind::Other, message: "simple message error test" };
+    let io_error = Error::from_static_message(&SIMPLE_MESSAGE);
+    let io_error = io_error.downcast::<E>().unwrap_err();
+
+    assert_eq!(SIMPLE_MESSAGE.kind, io_error.kind());
+    assert_eq!(SIMPLE_MESSAGE.message, &*format!("{io_error}"));
 }

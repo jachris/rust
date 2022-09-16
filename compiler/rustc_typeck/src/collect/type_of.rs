@@ -1,6 +1,5 @@
-use rustc_errors::{Applicability, ErrorReported, StashKey};
+use rustc_errors::{Applicability, StashKey};
 use rustc_hir as hir;
-use rustc_hir::def::Res;
 use rustc_hir::def_id::{DefId, LocalDefId};
 use rustc_hir::intravisit;
 use rustc_hir::intravisit::Visitor;
@@ -8,17 +7,17 @@ use rustc_hir::{HirId, Node};
 use rustc_middle::hir::nested_filter;
 use rustc_middle::ty::subst::InternalSubsts;
 use rustc_middle::ty::util::IntTypeExt;
-use rustc_middle::ty::{self, Ty, TyCtxt, TypeFoldable, TypeFolder};
+use rustc_middle::ty::{self, DefIdTree, Ty, TyCtxt, TypeFolder, TypeSuperFoldable, TypeVisitable};
 use rustc_span::symbol::Ident;
 use rustc_span::{Span, DUMMY_SP};
 
 use super::ItemCtxt;
 use super::{bad_placeholder, is_suggestable_infer_ty};
+use crate::errors::UnconstrainedOpaqueType;
 
 /// Computes the relevant generic parameter for a potential generic const argument.
 ///
 /// This should be called using the query `tcx.opt_const_param_of`.
-#[instrument(level = "debug", skip(tcx))]
 pub(super) fn opt_const_param_of(tcx: TyCtxt<'_>, def_id: LocalDefId) -> Option<DefId> {
     use hir::*;
     let hir_id = tcx.hir().local_def_id_to_hir_id(def_id);
@@ -43,7 +42,7 @@ pub(super) fn opt_const_param_of(tcx: TyCtxt<'_>, def_id: LocalDefId) -> Option<
         // In the above code we would call this query with the def_id of 3 and
         // the parent_node we match on would be the hir node for Self::Assoc<3>
         //
-        // `Self::Assoc<3>` cant be resolved without typchecking here as we
+        // `Self::Assoc<3>` cant be resolved without typechecking here as we
         // didnt write <Self as Foo>::Assoc<3>. If we did then another match
         // arm would handle this.
         //
@@ -66,8 +65,8 @@ pub(super) fn opt_const_param_of(tcx: TyCtxt<'_>, def_id: LocalDefId) -> Option<
             let ty = item_ctxt.ast_ty_to_ty(hir_ty);
 
             // Iterate through the generics of the projection to find the one that corresponds to
-            // the def_id that this query was called with. We filter to only const args here as a
-            // precaution for if it's ever allowed to elide lifetimes in GAT's. It currently isn't
+            // the def_id that this query was called with. We filter to only type and const args here
+            // as a precaution for if it's ever allowed to elide lifetimes in GAT's. It currently isn't
             // but it can't hurt to be safe ^^
             if let ty::Projection(projection) = ty.kind() {
                 let generics = tcx.generics_of(projection.item_def_id);
@@ -78,7 +77,7 @@ pub(super) fn opt_const_param_of(tcx: TyCtxt<'_>, def_id: LocalDefId) -> Option<
                         args.args
                             .iter()
                             .filter(|arg| arg.is_ty_or_const())
-                            .position(|arg| arg.id() == hir_id)
+                            .position(|arg| arg.hir_id() == hir_id)
                     })
                     .unwrap_or_else(|| {
                         bug!("no arg matching AnonConst in segment");
@@ -99,7 +98,7 @@ pub(super) fn opt_const_param_of(tcx: TyCtxt<'_>, def_id: LocalDefId) -> Option<
                 ExprKind::MethodCall(segment, ..) | ExprKind::Path(QPath::TypeRelative(_, segment)),
             ..
         }) => {
-            let body_owner = tcx.hir().local_def_id(tcx.hir().enclosing_body_owner(hir_id));
+            let body_owner = tcx.hir().enclosing_body_owner(hir_id);
             let tables = tcx.typeck(body_owner);
             // This may fail in case the method/path does not actually exist.
             // As there is no relevant param for `def_id`, we simply return
@@ -111,7 +110,7 @@ pub(super) fn opt_const_param_of(tcx: TyCtxt<'_>, def_id: LocalDefId) -> Option<
                     args.args
                         .iter()
                         .filter(|arg| arg.is_ty_or_const())
-                        .position(|arg| arg.id() == hir_id)
+                        .position(|arg| arg.hir_id() == hir_id)
                 })
                 .unwrap_or_else(|| {
                     bug!("no arg matching AnonConst in segment");
@@ -133,7 +132,7 @@ pub(super) fn opt_const_param_of(tcx: TyCtxt<'_>, def_id: LocalDefId) -> Option<
                         | ExprKind::Struct(&QPath::Resolved(_, path), ..),
                     ..
                 }) => {
-                    let body_owner = tcx.hir().local_def_id(tcx.hir().enclosing_body_owner(hir_id));
+                    let body_owner = tcx.hir().enclosing_body_owner(hir_id);
                     let _tables = tcx.typeck(body_owner);
                     &*path
                 }
@@ -160,49 +159,31 @@ pub(super) fn opt_const_param_of(tcx: TyCtxt<'_>, def_id: LocalDefId) -> Option<
             // We've encountered an `AnonConst` in some path, so we need to
             // figure out which generic parameter it corresponds to and return
             // the relevant type.
-            let filtered = path.segments.iter().find_map(|seg| {
-                seg.args?
-                    .args
+            let Some((arg_index, segment)) = path.segments.iter().find_map(|seg| {
+                let args = seg.args?;
+                args.args
+                .iter()
+                .filter(|arg| arg.is_ty_or_const())
+                .position(|arg| arg.hir_id() == hir_id)
+                .map(|index| (index, seg)).or_else(|| args.bindings
                     .iter()
-                    .filter(|arg| arg.is_ty_or_const())
-                    .position(|arg| arg.id() == hir_id)
-                    .map(|index| (index, seg))
-            });
-
-            // FIXME(associated_const_generics): can we blend this with iteration above?
-            let (arg_index, segment) = match filtered {
-                None => {
-                    let binding_filtered = path.segments.iter().find_map(|seg| {
-                        seg.args?
-                            .bindings
-                            .iter()
-                            .filter_map(TypeBinding::opt_const)
-                            .position(|ct| ct.hir_id == hir_id)
-                            .map(|idx| (idx, seg))
-                    });
-                    match binding_filtered {
-                        Some(inner) => inner,
-                        None => {
-                            tcx.sess.delay_span_bug(
-                                tcx.def_span(def_id),
-                                "no arg matching AnonConst in path",
-                            );
-                            return None;
-                        }
-                    }
-                }
-                Some(inner) => inner,
+                    .filter_map(TypeBinding::opt_const)
+                    .position(|ct| ct.hir_id == hir_id)
+                    .map(|idx| (idx, seg)))
+            }) else {
+                tcx.sess.delay_span_bug(
+                    tcx.def_span(def_id),
+                    "no arg matching AnonConst in path",
+                );
+                return None;
             };
 
-            // Try to use the segment resolution if it is valid, otherwise we
-            // default to the path resolution.
-            let res = segment.res.filter(|&r| r != Res::Err).unwrap_or(path.res);
-            let generics = match tcx.res_generics_def_id(res) {
+            let generics = match tcx.res_generics_def_id(segment.res) {
                 Some(def_id) => tcx.generics_of(def_id),
                 None => {
                     tcx.sess.delay_span_bug(
                         tcx.def_span(def_id),
-                        &format!("unexpected anon const res {:?} in path: {:?}", res, path),
+                        &format!("unexpected anon const res {:?} in path: {:?}", segment.res, path),
                     );
                     return None;
                 }
@@ -243,7 +224,7 @@ fn get_path_containing_arg_in_pat<'hir>(
             .iter()
             .filter_map(|seg| seg.args)
             .flat_map(|args| args.args)
-            .any(|arg| arg.id() == arg_id)
+            .any(|arg| arg.hir_id() == arg_id)
     };
     let mut arg_path = None;
     pat.walk(|pat| match pat.kind {
@@ -337,8 +318,8 @@ pub(super) fn type_of(tcx: TyCtxt<'_>, def_id: DefId) -> Ty<'_> {
                         icx.to_ty(ty)
                     }
                 }
-                ItemKind::TyAlias(self_ty, _)
-                | ItemKind::Impl(hir::Impl { self_ty, .. }) => icx.to_ty(self_ty),
+                ItemKind::TyAlias(self_ty, _) => icx.to_ty(self_ty),
+                ItemKind::Impl(hir::Impl { self_ty, .. }) => icx.to_ty(*self_ty),
                 ItemKind::Fn(..) => {
                     let substs = InternalSubsts::identity_for_item(tcx, def_id.to_def_id());
                     tcx.mk_fn_def(def_id.to_def_id(), substs)
@@ -349,42 +330,15 @@ pub(super) fn type_of(tcx: TyCtxt<'_>, def_id: DefId) -> Ty<'_> {
                     tcx.mk_adt(def, substs)
                 }
                 ItemKind::OpaqueTy(OpaqueTy { origin: hir::OpaqueTyOrigin::TyAlias, .. }) => {
-                    find_opaque_ty_constraints(tcx, def_id)
+                    find_opaque_ty_constraints_for_tait(tcx, def_id)
                 }
                 // Opaque types desugared from `impl Trait`.
-                ItemKind::OpaqueTy(OpaqueTy { origin: hir::OpaqueTyOrigin::FnReturn(owner) | hir::OpaqueTyOrigin::AsyncFn(owner), .. }) => {
-                    let concrete_ty = tcx
-                        .mir_borrowck(owner)
-                        .concrete_opaque_types
-                        .get_value_matching(|(key, _)| key.def_id == def_id.to_def_id())
-                        .copied()
-                        .unwrap_or_else(|| {
-                            tcx.sess.delay_span_bug(
-                                DUMMY_SP,
-                                &format!(
-                                    "owner {:?} has no opaque type for {:?} in its typeck results",
-                                    owner, def_id,
-                                ),
-                            );
-                            if let Some(ErrorReported) =
-                                tcx.typeck(owner).tainted_by_errors
-                            {
-                                // Some error in the
-                                // owner fn prevented us from populating
-                                // the `concrete_opaque_types` table.
-                                tcx.ty_error()
-                            } else {
-                                // We failed to resolve the opaque type or it
-                                // resolves to itself. Return the non-revealed
-                                // type, which should result in E0720.
-                                tcx.mk_opaque(
-                                    def_id.to_def_id(),
-                                    InternalSubsts::identity_for_item(tcx, def_id.to_def_id()),
-                                )
-                            }
-                        });
-                    debug!("concrete_ty = {:?}", concrete_ty);
-                    concrete_ty
+                ItemKind::OpaqueTy(OpaqueTy { origin: hir::OpaqueTyOrigin::FnReturn(owner) | hir::OpaqueTyOrigin::AsyncFn(owner), in_trait, .. }) => {
+                    if in_trait {
+                        span_bug!(item.span, "impl-trait in trait has no default")
+                    } else {
+                        find_opaque_ty_constraints_for_rpit(tcx, def_id, owner)
+                    }
                 }
                 ItemKind::Trait(..)
                 | ItemKind::TraitAlias(..)
@@ -424,7 +378,7 @@ pub(super) fn type_of(tcx: TyCtxt<'_>, def_id: DefId) -> Ty<'_> {
 
         Node::Field(field) => icx.to_ty(field.ty),
 
-        Node::Expr(&Expr { kind: ExprKind::Closure(..), .. }) => tcx.typeck(def_id).node_type(hir_id),
+        Node::Expr(&Expr { kind: ExprKind::Closure{..}, .. }) => tcx.typeck(def_id).node_type(hir_id),
 
         Node::AnonConst(_) if let Some(param) = tcx.opt_const_param_of(def_id) => {
             // We defer to `type_of` of the corresponding parameter
@@ -455,7 +409,8 @@ pub(super) fn type_of(tcx: TyCtxt<'_>, def_id: DefId) -> Ty<'_> {
                 Node::Expr(&Expr { kind: ExprKind::InlineAsm(asm), .. })
                 | Node::Item(&Item { kind: ItemKind::GlobalAsm(asm), .. })
                     if asm.operands.iter().any(|(op, _op_sp)| match op {
-                        hir::InlineAsmOperand::Const { anon_const } => anon_const.hir_id == hir_id,
+                        hir::InlineAsmOperand::Const { anon_const }
+                        | hir::InlineAsmOperand::SymFn { anon_const } => anon_const.hir_id == hir_id,
                         _ => false,
                     }) =>
                 {
@@ -464,25 +419,14 @@ pub(super) fn type_of(tcx: TyCtxt<'_>, def_id: DefId) -> Ty<'_> {
 
                 Node::Variant(Variant { disr_expr: Some(ref e), .. }) if e.hir_id == hir_id => tcx
                     .adt_def(tcx.hir().get_parent_item(hir_id))
-                    .repr
+                    .repr()
                     .discr_type()
                     .to_ty(tcx),
 
-                Node::TraitRef(trait_ref @ &TraitRef {
-                  path, ..
-                }) if let Some((binding, seg)) =
-                  path
-                      .segments
-                      .iter()
-                      .find_map(|seg| {
-                          seg.args?.bindings
-                              .iter()
-                              .find_map(|binding| if binding.opt_const()?.hir_id == hir_id {
-                                Some((binding, seg))
-                              } else {
-                                None
-                              })
-                      }) =>
+                Node::TypeBinding(binding @ &TypeBinding { hir_id: binding_id, ..  })
+                    if let Node::TraitRef(trait_ref) = tcx.hir().get(
+                        tcx.hir().get_parent_node(binding_id)
+                    ) =>
                 {
                   let Some(trait_def_id) = trait_ref.trait_def_id() else {
                     return tcx.ty_error_with_message(DUMMY_SP, "Could not find trait");
@@ -535,7 +479,7 @@ pub(super) fn type_of(tcx: TyCtxt<'_>, def_id: DefId) -> Ty<'_> {
 /// In particular, definitions of opaque types can only use other generics as arguments,
 /// and they cannot repeat an argument. Example:
 ///
-/// ```rust
+/// ```ignore (illustrative)
 /// type Foo<A, B> = impl Bar<A, B>;
 ///
 /// // Okay -- `Foo` is applied to two distinct, generic types.
@@ -548,68 +492,62 @@ pub(super) fn type_of(tcx: TyCtxt<'_>, def_id: DefId) -> Ty<'_> {
 /// fn b<T>() -> Foo<T, u32> { .. }
 /// ```
 ///
-fn find_opaque_ty_constraints(tcx: TyCtxt<'_>, def_id: LocalDefId) -> Ty<'_> {
+fn find_opaque_ty_constraints_for_tait(tcx: TyCtxt<'_>, def_id: LocalDefId) -> Ty<'_> {
     use rustc_hir::{Expr, ImplItem, Item, TraitItem};
 
     struct ConstraintLocator<'tcx> {
         tcx: TyCtxt<'tcx>,
 
         /// def_id of the opaque type whose defining uses are being checked
-        def_id: DefId,
+        def_id: LocalDefId,
 
         /// as we walk the defining uses, we are checking that all of them
         /// define the same hidden type. This variable is set to `Some`
         /// with the first type that we find, and then later types are
         /// checked against it (we also carry the span of that first
         /// type).
-        found: Option<(Span, Ty<'tcx>)>,
+        found: Option<ty::OpaqueHiddenType<'tcx>>,
     }
 
     impl ConstraintLocator<'_> {
         #[instrument(skip(self), level = "debug")]
-        fn check(&mut self, def_id: LocalDefId) {
+        fn check(&mut self, item_def_id: LocalDefId) {
             // Don't try to check items that cannot possibly constrain the type.
-            if !self.tcx.has_typeck_results(def_id) {
+            if !self.tcx.has_typeck_results(item_def_id) {
                 debug!("no constraint: no typeck results");
                 return;
             }
             // Calling `mir_borrowck` can lead to cycle errors through
             // const-checking, avoid calling it if we don't have to.
-            if !self.tcx.typeck(def_id).concrete_opaque_types.contains(&self.def_id) {
+            // ```rust
+            // type Foo = impl Fn() -> usize; // when computing type for this
+            // const fn bar() -> Foo {
+            //     || 0usize
+            // }
+            // const BAZR: Foo = bar(); // we would mir-borrowck this, causing cycles
+            // // because we again need to reveal `Foo` so we can check whether the
+            // // constant does not contain interior mutability.
+            // ```
+            let tables = self.tcx.typeck(item_def_id);
+            if let Some(_) = tables.tainted_by_errors {
+                self.found = Some(ty::OpaqueHiddenType { span: DUMMY_SP, ty: self.tcx.ty_error() });
+                return;
+            }
+            if !tables.concrete_opaque_types.contains_key(&self.def_id) {
                 debug!("no constraints in typeck results");
                 return;
             }
             // Use borrowck to get the type with unerased regions.
-            let concrete_opaque_types = &self.tcx.mir_borrowck(def_id).concrete_opaque_types;
+            let concrete_opaque_types = &self.tcx.mir_borrowck(item_def_id).concrete_opaque_types;
             debug!(?concrete_opaque_types);
-            for (opaque_type_key, concrete_type) in concrete_opaque_types {
-                if opaque_type_key.def_id != self.def_id {
-                    // Ignore constraints for other opaque types.
-                    continue;
-                }
-
-                debug!(?concrete_type, ?opaque_type_key.substs, "found constraint");
-
-                // FIXME(oli-obk): trace the actual span from inference to improve errors.
-                let span = self.tcx.def_span(def_id);
-
-                if let Some((prev_span, prev_ty)) = self.found {
-                    if *concrete_type != prev_ty && !(*concrete_type, prev_ty).references_error() {
-                        debug!(?span);
-                        // Found different concrete types for the opaque type.
-                        let mut err = self.tcx.sess.struct_span_err(
-                            span,
-                            "concrete type differs from previous defining opaque type use",
-                        );
-                        err.span_label(
-                            span,
-                            format!("expected `{}`, got `{}`", prev_ty, concrete_type),
-                        );
-                        err.span_note(prev_span, "previous use here");
-                        err.emit();
+            if let Some(&concrete_type) = concrete_opaque_types.get(&self.def_id) {
+                debug!(?concrete_type, "found constraint");
+                if let Some(prev) = self.found {
+                    if concrete_type.ty != prev.ty && !(concrete_type, prev).references_error() {
+                        prev.report_mismatch(&concrete_type, self.tcx);
                     }
                 } else {
-                    self.found = Some((span, *concrete_type));
+                    self.found = Some(concrete_type);
                 }
             }
         }
@@ -622,30 +560,30 @@ fn find_opaque_ty_constraints(tcx: TyCtxt<'_>, def_id: LocalDefId) -> Ty<'_> {
             self.tcx.hir()
         }
         fn visit_expr(&mut self, ex: &'tcx Expr<'tcx>) {
-            if let hir::ExprKind::Closure(..) = ex.kind {
+            if let hir::ExprKind::Closure { .. } = ex.kind {
                 let def_id = self.tcx.hir().local_def_id(ex.hir_id);
                 self.check(def_id);
             }
             intravisit::walk_expr(self, ex);
         }
         fn visit_item(&mut self, it: &'tcx Item<'tcx>) {
-            debug!("find_existential_constraints: visiting {:?}", it);
+            trace!(?it.def_id);
             // The opaque type itself or its children are not within its reveal scope.
-            if it.def_id.to_def_id() != self.def_id {
+            if it.def_id != self.def_id {
                 self.check(it.def_id);
                 intravisit::walk_item(self, it);
             }
         }
         fn visit_impl_item(&mut self, it: &'tcx ImplItem<'tcx>) {
-            debug!("find_existential_constraints: visiting {:?}", it);
+            trace!(?it.def_id);
             // The opaque type itself or its children are not within its reveal scope.
-            if it.def_id.to_def_id() != self.def_id {
+            if it.def_id != self.def_id {
                 self.check(it.def_id);
                 intravisit::walk_impl_item(self, it);
             }
         }
         fn visit_trait_item(&mut self, it: &'tcx TraitItem<'tcx>) {
-            debug!("find_existential_constraints: visiting {:?}", it);
+            trace!(?it.def_id);
             self.check(it.def_id);
             intravisit::walk_trait_item(self, it);
         }
@@ -653,14 +591,14 @@ fn find_opaque_ty_constraints(tcx: TyCtxt<'_>, def_id: LocalDefId) -> Ty<'_> {
 
     let hir_id = tcx.hir().local_def_id_to_hir_id(def_id);
     let scope = tcx.hir().get_defining_scope(hir_id);
-    let mut locator = ConstraintLocator { def_id: def_id.to_def_id(), tcx, found: None };
+    let mut locator = ConstraintLocator { def_id: def_id, tcx, found: None };
 
-    debug!("find_opaque_ty_constraints: scope={:?}", scope);
+    debug!(?scope);
 
     if scope == hir::CRATE_HIR_ID {
         tcx.hir().walk_toplevel_module(&mut locator);
     } else {
-        debug!("find_opaque_ty_constraints: scope={:?}", tcx.hir().get(scope));
+        trace!("scope={:#?}", tcx.hir().get(scope));
         match tcx.hir().get(scope) {
             // We explicitly call `visit_*` methods, instead of using `intravisit::walk_*` methods
             // This allows our visitor to process the defining item itself, causing
@@ -684,13 +622,131 @@ fn find_opaque_ty_constraints(tcx: TyCtxt<'_>, def_id: LocalDefId) -> Ty<'_> {
     }
 
     match locator.found {
-        Some((_, ty)) => ty,
+        Some(hidden) => hidden.ty,
         None => {
-            let span = tcx.def_span(def_id);
-            tcx.sess.span_err(span, "could not find defining uses");
+            tcx.sess.emit_err(UnconstrainedOpaqueType {
+                span: tcx.def_span(def_id),
+                name: tcx.item_name(tcx.local_parent(def_id).to_def_id()),
+            });
             tcx.ty_error()
         }
     }
+}
+
+fn find_opaque_ty_constraints_for_rpit(
+    tcx: TyCtxt<'_>,
+    def_id: LocalDefId,
+    owner_def_id: LocalDefId,
+) -> Ty<'_> {
+    use rustc_hir::{Expr, ImplItem, Item, TraitItem};
+
+    struct ConstraintChecker<'tcx> {
+        tcx: TyCtxt<'tcx>,
+
+        /// def_id of the opaque type whose defining uses are being checked
+        def_id: LocalDefId,
+
+        found: ty::OpaqueHiddenType<'tcx>,
+    }
+
+    impl ConstraintChecker<'_> {
+        #[instrument(skip(self), level = "debug")]
+        fn check(&self, def_id: LocalDefId) {
+            // Use borrowck to get the type with unerased regions.
+            let concrete_opaque_types = &self.tcx.mir_borrowck(def_id).concrete_opaque_types;
+            debug!(?concrete_opaque_types);
+            for &(def_id, concrete_type) in concrete_opaque_types {
+                if def_id != self.def_id {
+                    // Ignore constraints for other opaque types.
+                    continue;
+                }
+
+                debug!(?concrete_type, "found constraint");
+
+                if concrete_type.ty != self.found.ty
+                    && !(concrete_type, self.found).references_error()
+                {
+                    self.found.report_mismatch(&concrete_type, self.tcx);
+                }
+            }
+        }
+    }
+
+    impl<'tcx> intravisit::Visitor<'tcx> for ConstraintChecker<'tcx> {
+        type NestedFilter = nested_filter::OnlyBodies;
+
+        fn nested_visit_map(&mut self) -> Self::Map {
+            self.tcx.hir()
+        }
+        fn visit_expr(&mut self, ex: &'tcx Expr<'tcx>) {
+            if let hir::ExprKind::Closure { .. } = ex.kind {
+                let def_id = self.tcx.hir().local_def_id(ex.hir_id);
+                self.check(def_id);
+            }
+            intravisit::walk_expr(self, ex);
+        }
+        fn visit_item(&mut self, it: &'tcx Item<'tcx>) {
+            trace!(?it.def_id);
+            // The opaque type itself or its children are not within its reveal scope.
+            if it.def_id != self.def_id {
+                self.check(it.def_id);
+                intravisit::walk_item(self, it);
+            }
+        }
+        fn visit_impl_item(&mut self, it: &'tcx ImplItem<'tcx>) {
+            trace!(?it.def_id);
+            // The opaque type itself or its children are not within its reveal scope.
+            if it.def_id != self.def_id {
+                self.check(it.def_id);
+                intravisit::walk_impl_item(self, it);
+            }
+        }
+        fn visit_trait_item(&mut self, it: &'tcx TraitItem<'tcx>) {
+            trace!(?it.def_id);
+            self.check(it.def_id);
+            intravisit::walk_trait_item(self, it);
+        }
+    }
+
+    let concrete = tcx.mir_borrowck(owner_def_id).concrete_opaque_types.get(&def_id).copied();
+
+    if let Some(concrete) = concrete {
+        let scope = tcx.hir().local_def_id_to_hir_id(owner_def_id);
+        debug!(?scope);
+        let mut locator = ConstraintChecker { def_id: def_id, tcx, found: concrete };
+
+        match tcx.hir().get(scope) {
+            Node::Item(it) => intravisit::walk_item(&mut locator, it),
+            Node::ImplItem(it) => intravisit::walk_impl_item(&mut locator, it),
+            Node::TraitItem(it) => intravisit::walk_trait_item(&mut locator, it),
+            other => bug!("{:?} is not a valid scope for an opaque type item", other),
+        }
+    }
+
+    concrete.map(|concrete| concrete.ty).unwrap_or_else(|| {
+        let table = tcx.typeck(owner_def_id);
+        if let Some(_) = table.tainted_by_errors {
+            // Some error in the
+            // owner fn prevented us from populating
+            // the `concrete_opaque_types` table.
+            tcx.ty_error()
+        } else {
+            table
+                .concrete_opaque_types
+                .get(&def_id)
+                .copied()
+                .unwrap_or_else(|| {
+                    // We failed to resolve the opaque type or it
+                    // resolves to itself. We interpret this as the
+                    // no values of the hidden type ever being constructed,
+                    // so we can just make the hidden type be `!`.
+                    // For backwards compatibility reasons, we fall back to
+                    // `()` until we the diverging default is changed.
+                    Some(tcx.mk_diverging_default())
+                })
+                .expect("RPIT always have a hidden type from typeck")
+        }
+    })
 }
 
 fn infer_placeholder_type<'a>(
@@ -744,6 +800,9 @@ fn infer_placeholder_type<'a>(
     match tcx.sess.diagnostic().steal_diagnostic(span, StashKey::ItemNoType) {
         Some(mut err) => {
             if !ty.references_error() {
+                // Only suggest adding `:` if it was missing (and suggested by parsing diagnostic)
+                let colon = if span == item_ident.span.shrink_to_hi() { ":" } else { "" };
+
                 // The parser provided a sub-optimal `HasPlaceholders` suggestion for the type.
                 // We are typeck and have the real type, so remove that and suggest the actual type.
                 // FIXME(eddyb) this looks like it should be functionality on `Diagnostic`.
@@ -759,7 +818,7 @@ fn infer_placeholder_type<'a>(
                     err.span_suggestion(
                         span,
                         &format!("provide a type for the {item}", item = kind),
-                        format!("{}: {}", item_ident, sugg_ty),
+                        format!("{colon} {sugg_ty}"),
                         Applicability::MachineApplicable,
                     );
                 } else {
@@ -783,7 +842,7 @@ fn infer_placeholder_type<'a>(
                     diag.span_suggestion(
                         span,
                         "replace with the correct type",
-                        sugg_ty.to_string(),
+                        sugg_ty,
                         Applicability::MaybeIncorrect,
                     );
                 } else {
@@ -799,7 +858,7 @@ fn infer_placeholder_type<'a>(
     }
 
     // Typeck doesn't expect erased regions to be returned from `type_of`.
-    tcx.fold_regions(ty, &mut false, |r, _| match *r {
+    tcx.fold_regions(ty, |r, _| match *r {
         ty::ReErased => tcx.lifetimes.re_static,
         _ => r,
     })

@@ -1,4 +1,6 @@
-//! A character type.
+//! Utilities for the `char` primitive type.
+//!
+//! *[See also the `char` primitive type](primitive@char).*
 //!
 //! The `char` type represents a single character. More specifically, since
 //! 'character' isn't a well-defined concept in Unicode, `char` is a '[Unicode
@@ -23,18 +25,12 @@ mod decode;
 mod methods;
 
 // stable re-exports
-#[stable(feature = "char_from_unchecked", since = "1.5.0")]
-pub use self::convert::from_u32_unchecked;
 #[stable(feature = "try_from", since = "1.34.0")]
 pub use self::convert::CharTryFromError;
 #[stable(feature = "char_from_str", since = "1.20.0")]
 pub use self::convert::ParseCharError;
-#[stable(feature = "rust1", since = "1.0.0")]
-pub use self::convert::{from_digit, from_u32};
 #[stable(feature = "decode_utf16", since = "1.9.0")]
-pub use self::decode::{decode_utf16, DecodeUtf16, DecodeUtf16Error};
-#[stable(feature = "unicode_version", since = "1.45.0")]
-pub use crate::unicode::UNICODE_VERSION;
+pub use self::decode::{DecodeUtf16, DecodeUtf16Error};
 
 // perma-unstable re-exports
 #[unstable(feature = "char_internals", reason = "exposed only for libstd", issue = "none")]
@@ -42,6 +38,8 @@ pub use self::methods::encode_utf16_raw;
 #[unstable(feature = "char_internals", reason = "exposed only for libstd", issue = "none")]
 pub use self::methods::encode_utf8_raw;
 
+#[cfg(not(bootstrap))]
+use crate::error::Error;
 use crate::fmt::{self, Write};
 use crate::iter::FusedIterator;
 
@@ -89,29 +87,56 @@ const MAX_THREE_B: u32 = 0x10000;
     Cn  Unassigned              a reserved unassigned code point or a noncharacter
 */
 
-/// The highest valid code point a `char` can have, `'\u{10FFFF}'`.
-///
-/// # Examples
-///
-/// ```
-/// # fn something_which_returns_char() -> char { 'a' }
-/// let c: char = something_which_returns_char();
-/// assert!(c <= char::MAX);
-///
-/// let value_at_max = char::MAX as u32;
-/// assert_eq!(char::from_u32(value_at_max), Some('\u{10FFFF}'));
-/// assert_eq!(char::from_u32(value_at_max + 1), None);
-/// ```
+/// The highest valid code point a `char` can have, `'\u{10FFFF}'`. Use [`char::MAX`] instead.
 #[stable(feature = "rust1", since = "1.0.0")]
 pub const MAX: char = char::MAX;
 
 /// `U+FFFD REPLACEMENT CHARACTER` (�) is used in Unicode to represent a
-/// decoding error.
-///
-/// It can occur, for example, when giving ill-formed UTF-8 bytes to
-/// [`String::from_utf8_lossy`](../../std/string/struct.String.html#method.from_utf8_lossy).
+/// decoding error. Use [`char::REPLACEMENT_CHARACTER`] instead.
 #[stable(feature = "decode_utf16", since = "1.9.0")]
 pub const REPLACEMENT_CHARACTER: char = char::REPLACEMENT_CHARACTER;
+
+/// The version of [Unicode](https://www.unicode.org/) that the Unicode parts of
+/// `char` and `str` methods are based on. Use [`char::UNICODE_VERSION`] instead.
+#[stable(feature = "unicode_version", since = "1.45.0")]
+pub const UNICODE_VERSION: (u8, u8, u8) = char::UNICODE_VERSION;
+
+/// Creates an iterator over the UTF-16 encoded code points in `iter`, returning
+/// unpaired surrogates as `Err`s. Use [`char::decode_utf16`] instead.
+#[stable(feature = "decode_utf16", since = "1.9.0")]
+#[inline]
+pub fn decode_utf16<I: IntoIterator<Item = u16>>(iter: I) -> DecodeUtf16<I::IntoIter> {
+    self::decode::decode_utf16(iter)
+}
+
+/// Converts a `u32` to a `char`. Use [`char::from_u32`] instead.
+#[stable(feature = "rust1", since = "1.0.0")]
+#[rustc_const_unstable(feature = "const_char_convert", issue = "89259")]
+#[must_use]
+#[inline]
+pub const fn from_u32(i: u32) -> Option<char> {
+    self::convert::from_u32(i)
+}
+
+/// Converts a `u32` to a `char`, ignoring validity. Use [`char::from_u32_unchecked`].
+/// instead.
+#[stable(feature = "char_from_unchecked", since = "1.5.0")]
+#[rustc_const_unstable(feature = "const_char_convert", issue = "89259")]
+#[must_use]
+#[inline]
+pub const unsafe fn from_u32_unchecked(i: u32) -> char {
+    // SAFETY: the safety contract must be upheld by the caller.
+    unsafe { self::convert::from_u32_unchecked(i) }
+}
+
+/// Converts a digit in the given radix to a `char`. Use [`char::from_digit`] instead.
+#[stable(feature = "rust1", since = "1.0.0")]
+#[rustc_const_unstable(feature = "const_char_convert", issue = "89259")]
+#[must_use]
+#[inline]
+pub const fn from_digit(num: u32, radix: u32) -> Option<char> {
+    self::convert::from_digit(num, radix)
+}
 
 /// Returns an iterator that yields the hexadecimal Unicode escape of a
 /// character, as `char`s.
@@ -561,3 +586,7 @@ impl fmt::Display for TryFromCharError {
         "unicode code point out of range".fmt(fmt)
     }
 }
+
+#[cfg(not(bootstrap))]
+#[stable(feature = "u8_from_char", since = "1.59.0")]
+impl Error for TryFromCharError {}

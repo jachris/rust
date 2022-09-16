@@ -2,14 +2,11 @@
 // Copyright 2015 Andrew Gallant, bluss and Nicolas Koch
 
 use crate::cmp;
+use crate::intrinsics;
 use crate::mem;
 
-const LO_U64: u64 = 0x0101010101010101;
-const HI_U64: u64 = 0x8080808080808080;
-
-// Use truncation.
-const LO_USIZE: usize = LO_U64 as usize;
-const HI_USIZE: usize = HI_U64 as usize;
+const LO_USIZE: usize = usize::repeat_u8(0x01);
+const HI_USIZE: usize = usize::repeat_u8(0x80);
 const USIZE_BYTES: usize = mem::size_of::<usize>();
 
 /// Returns `true` if `x` contains any zero byte.
@@ -39,13 +36,31 @@ fn repeat_byte(b: u8) -> usize {
 /// Returns the first index matching the byte `x` in `text`.
 #[must_use]
 #[inline]
-pub fn memchr(x: u8, text: &[u8]) -> Option<usize> {
-    // Fast path for small slices
-    if text.len() < 2 * USIZE_BYTES {
-        return text.iter().position(|elt| *elt == x);
+pub const fn memchr(x: u8, text: &[u8]) -> Option<usize> {
+    #[inline]
+    fn rt_impl(x: u8, text: &[u8]) -> Option<usize> {
+        // Fast path for small slices
+        if text.len() < 2 * USIZE_BYTES {
+            return text.iter().position(|elt| *elt == x);
+        }
+
+        memchr_general_case(x, text)
     }
 
-    memchr_general_case(x, text)
+    const fn const_impl(x: u8, bytes: &[u8]) -> Option<usize> {
+        let mut i = 0;
+        while i < bytes.len() {
+            if bytes[i] == x {
+                return Some(i);
+            }
+            i += 1;
+        }
+
+        None
+    }
+
+    // SAFETY: The const and runtime versions have identical behavior
+    unsafe { intrinsics::const_eval_select((x, text), const_impl, rt_impl) }
 }
 
 fn memchr_general_case(x: u8, text: &[u8]) -> Option<usize> {

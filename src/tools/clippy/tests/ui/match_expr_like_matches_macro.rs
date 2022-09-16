@@ -63,6 +63,18 @@ fn main() {
     }
     {
         // lint
+        // skip rustfmt to prevent removing block for first pattern
+        #[rustfmt::skip]
+        let _ans = match x {
+            E::A(_) => {
+                true
+            }
+            E::B(_) => true,
+            _ => false,
+        };
+    }
+    {
+        // lint
         let _ans = match x {
             E::B(_) => false,
             E::C => false,
@@ -181,4 +193,44 @@ fn main() {
         };
         fun(val);
     }
+
+    {
+        enum E {
+            A,
+            B,
+            C,
+        }
+
+        let _ = match E::A {
+            E::B => true,
+            #[cfg(feature = "foo")]
+            E::A => true,
+            _ => false,
+        };
+    }
+
+    let x = ' ';
+    // ignore if match block contains comment
+    let _line_comments = match x {
+        // numbers are bad!
+        '1' | '2' | '3' => true,
+        // spaces are very important to be true.
+        ' ' => true,
+        // as are dots
+        '.' => true,
+        _ => false,
+    };
+
+    let _block_comments = match x {
+        /* numbers are bad!
+         */
+        '1' | '2' | '3' => true,
+        /* spaces are very important to be true.
+         */
+        ' ' => true,
+        /* as are dots
+         */
+        '.' => true,
+        _ => false,
+    };
 }

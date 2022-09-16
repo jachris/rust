@@ -67,7 +67,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         loop {
             let match_pairs = mem::take(&mut candidate.match_pairs);
 
-            if let [MatchPair { pattern: Pat { kind: box PatKind::Or { pats }, .. }, place }] =
+            if let [MatchPair { pattern: Pat { kind: PatKind::Or { pats }, .. }, place }] =
                 &*match_pairs
             {
                 existing_bindings.extend_from_slice(&new_bindings);
@@ -113,7 +113,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 // late as possible.
                 candidate
                     .match_pairs
-                    .sort_by_key(|pair| matches!(*pair.pattern.kind, PatKind::Or { .. }));
+                    .sort_by_key(|pair| matches!(pair.pattern.kind, PatKind::Or { .. }));
                 debug!(simplified = ?candidate, "simplify_candidate");
                 return false; // if we were not able to simplify any, done.
             }
@@ -127,10 +127,10 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         &mut self,
         candidate: &Candidate<'pat, 'tcx>,
         place: PlaceBuilder<'tcx>,
-        pats: &'pat [Pat<'tcx>],
+        pats: &'pat [Box<Pat<'tcx>>],
     ) -> Vec<Candidate<'pat, 'tcx>> {
         pats.iter()
-            .map(|pat| {
+            .map(|box pat| {
                 let mut candidate = Candidate::new(place.clone(), pat, candidate.has_guard);
                 self.simplify_candidate(&mut candidate);
                 candidate
@@ -149,19 +149,18 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
         candidate: &mut Candidate<'pat, 'tcx>,
     ) -> Result<(), MatchPair<'pat, 'tcx>> {
         let tcx = self.tcx;
-        match *match_pair.pattern.kind {
+        match match_pair.pattern.kind {
             PatKind::AscribeUserType {
                 ref subpattern,
-                ascription: thir::Ascription { variance, user_ty, user_ty_span },
+                ascription: thir::Ascription { ref annotation, variance },
             } => {
                 // Apply the type ascription to the value at `match_pair.place`, which is the
                 if let Ok(place_resolved) =
-                    match_pair.place.clone().try_upvars_resolved(self.tcx, self.typeck_results)
+                    match_pair.place.clone().try_upvars_resolved(self.tcx, &self.upvars)
                 {
                     candidate.ascriptions.push(Ascription {
-                        span: user_ty_span,
-                        user_ty,
-                        source: place_resolved.into_place(self.tcx, self.typeck_results),
+                        annotation: annotation.clone(),
+                        source: place_resolved.into_place(self.tcx, &self.upvars),
                         variance,
                     });
                 }
@@ -186,11 +185,11 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 is_primary: _,
             } => {
                 if let Ok(place_resolved) =
-                    match_pair.place.clone().try_upvars_resolved(self.tcx, self.typeck_results)
+                    match_pair.place.clone().try_upvars_resolved(self.tcx, &self.upvars)
                 {
                     candidate.bindings.push(Binding {
                         span: match_pair.pattern.span,
-                        source: place_resolved.into_place(self.tcx, self.typeck_results),
+                        source: place_resolved.into_place(self.tcx, &self.upvars),
                         var_id: var,
                         binding_mode: mode,
                     });
@@ -209,7 +208,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                 Err(match_pair)
             }
 
-            PatKind::Range(PatRange { lo, hi, end }) => {
+            PatKind::Range(box PatRange { lo, hi, end }) => {
                 let (range, bias) = match *lo.ty().kind() {
                     ty::Char => {
                         (Some(('\u{0000}' as u128, '\u{10FFFF}' as u128, Size::from_bits(32))), 0)
@@ -228,17 +227,18 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                     _ => (None, 0),
                 };
                 if let Some((min, max, sz)) = range {
-                    if let (Some(lo), Some(hi)) =
-                        (lo.val().try_to_bits(sz), hi.val().try_to_bits(sz))
-                    {
-                        // We want to compare ranges numerically, but the order of the bitwise
-                        // representation of signed integers does not match their numeric order.
-                        // Thus, to correct the ordering, we need to shift the range of signed
-                        // integers to correct the comparison. This is achieved by XORing with a
-                        // bias (see pattern/_match.rs for another pertinent example of this
-                        // pattern).
-                        let (lo, hi) = (lo ^ bias, hi ^ bias);
-                        if lo <= min && (hi > max || hi == max && end == RangeEnd::Included) {
+                    // We want to compare ranges numerically, but the order of the bitwise
+                    // representation of signed integers does not match their numeric order. Thus,
+                    // to correct the ordering, we need to shift the range of signed integers to
+                    // correct the comparison. This is achieved by XORing with a bias (see
+                    // pattern/_match.rs for another pertinent example of this pattern).
+                    //
+                    // Also, for performance, it's important to only do the second `try_to_bits` if
+                    // necessary.
+                    let lo = lo.try_to_bits(sz).unwrap() ^ bias;
+                    if lo <= min {
+                        let hi = hi.try_to_bits(sz).unwrap() ^ bias;
+                        if hi > max || hi == max && end == RangeEnd::Included {
                             // Irrefutable pattern match.
                             return Ok(());
                         }
@@ -254,7 +254,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                         &mut candidate.match_pairs,
                         &match_pair.place,
                         prefix,
-                        slice.as_ref(),
+                        slice,
                         suffix,
                     );
                     Ok(())
@@ -264,7 +264,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
             }
 
             PatKind::Variant { adt_def, substs, variant_index, ref subpatterns } => {
-                let irrefutable = adt_def.variants.iter_enumerated().all(|(i, v)| {
+                let irrefutable = adt_def.variants().iter_enumerated().all(|(i, v)| {
                     i == variant_index || {
                         self.tcx.features().exhaustive_patterns
                             && !v
@@ -276,7 +276,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                                 )
                                 .is_empty()
                     }
-                }) && (adt_def.did.is_local()
+                }) && (adt_def.did().is_local()
                     || !adt_def.is_variant_list_non_exhaustive());
                 if irrefutable {
                     let place_builder = match_pair.place.downcast(adt_def, variant_index);
@@ -294,7 +294,7 @@ impl<'a, 'tcx> Builder<'a, 'tcx> {
                     &mut candidate.match_pairs,
                     &match_pair.place,
                     prefix,
-                    slice.as_ref(),
+                    slice,
                     suffix,
                 );
                 Ok(())

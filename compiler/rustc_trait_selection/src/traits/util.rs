@@ -1,4 +1,4 @@
-use rustc_errors::DiagnosticBuilder;
+use rustc_errors::Diagnostic;
 use rustc_span::Span;
 use smallvec::smallvec;
 use smallvec::SmallVec;
@@ -6,12 +6,10 @@ use smallvec::SmallVec;
 use rustc_data_structures::fx::FxHashSet;
 use rustc_hir::def_id::DefId;
 use rustc_middle::ty::subst::{GenericArg, Subst, SubstsRef};
-use rustc_middle::ty::{self, ToPredicate, Ty, TyCtxt, TypeFoldable};
+use rustc_middle::ty::{self, ImplSubject, ToPredicate, Ty, TyCtxt, TypeVisitable};
 
 use super::{Normalized, Obligation, ObligationCause, PredicateObligation, SelectionContext};
 pub use rustc_infer::traits::{self, util::*};
-
-use std::iter;
 
 ///////////////////////////////////////////////////////////////////////////
 // `TraitAliasExpander` iterator
@@ -43,12 +41,7 @@ impl<'tcx> TraitAliasExpansionInfo<'tcx> {
 
     /// Adds diagnostic labels to `diag` for the expansion path of a trait through all intermediate
     /// trait aliases.
-    pub fn label_with_exp_info(
-        &self,
-        diag: &mut DiagnosticBuilder<'_>,
-        top_label: &str,
-        use_desc: &str,
-    ) {
+    pub fn label_with_exp_info(&self, diag: &mut Diagnostic, top_label: &str, use_desc: &str) {
         diag.span_label(self.top().1, top_label);
         if self.path.len() > 1 {
             for (_, sp) in self.path.iter().rev().skip(1).take(self.path.len() - 2) {
@@ -123,13 +116,14 @@ impl<'tcx> TraitAliasExpander<'tcx> {
 
         // Get components of trait alias.
         let predicates = tcx.super_predicates_of(trait_ref.def_id());
+        debug!(?predicates);
 
         let items = predicates.predicates.iter().rev().filter_map(|(pred, span)| {
             pred.subst_supertrait(tcx, &trait_ref)
                 .to_opt_poly_trait_pred()
                 .map(|trait_ref| item.clone_and_push(trait_ref.map_bound(|t| t.trait_ref), *span))
         });
-        debug!("expand_trait_aliases: items={:?}", items.clone());
+        debug!("expand_trait_aliases: items={:?}", items.clone().collect::<Vec<_>>());
 
         self.stack.extend(items);
 
@@ -195,53 +189,32 @@ impl Iterator for SupertraitDefIds<'_> {
 // Other
 ///////////////////////////////////////////////////////////////////////////
 
-/// Instantiate all bound parameters of the impl with the given substs,
-/// returning the resulting trait ref and all obligations that arise.
+/// Instantiate all bound parameters of the impl subject with the given substs,
+/// returning the resulting subject and all obligations that arise.
 /// The obligations are closed under normalization.
-pub fn impl_trait_ref_and_oblig<'a, 'tcx>(
+pub fn impl_subject_and_oblig<'a, 'tcx>(
     selcx: &mut SelectionContext<'a, 'tcx>,
     param_env: ty::ParamEnv<'tcx>,
     impl_def_id: DefId,
     impl_substs: SubstsRef<'tcx>,
-) -> (ty::TraitRef<'tcx>, impl Iterator<Item = PredicateObligation<'tcx>>) {
-    let impl_trait_ref = selcx.tcx().impl_trait_ref(impl_def_id).unwrap();
-    let impl_trait_ref = impl_trait_ref.subst(selcx.tcx(), impl_substs);
-    let Normalized { value: impl_trait_ref, obligations: normalization_obligations1 } =
-        super::normalize(selcx, param_env, ObligationCause::dummy(), impl_trait_ref);
+) -> (ImplSubject<'tcx>, impl Iterator<Item = PredicateObligation<'tcx>>) {
+    let subject = selcx.tcx().bound_impl_subject(impl_def_id);
+    let subject = subject.subst(selcx.tcx(), impl_substs);
+    let Normalized { value: subject, obligations: normalization_obligations1 } =
+        super::normalize(selcx, param_env, ObligationCause::dummy(), subject);
 
     let predicates = selcx.tcx().predicates_of(impl_def_id);
     let predicates = predicates.instantiate(selcx.tcx(), impl_substs);
     let Normalized { value: predicates, obligations: normalization_obligations2 } =
         super::normalize(selcx, param_env, ObligationCause::dummy(), predicates);
     let impl_obligations =
-        predicates_for_generics(ObligationCause::dummy(), 0, param_env, predicates);
+        super::predicates_for_generics(|_, _| ObligationCause::dummy(), param_env, predicates);
 
     let impl_obligations = impl_obligations
         .chain(normalization_obligations1.into_iter())
         .chain(normalization_obligations2.into_iter());
 
-    (impl_trait_ref, impl_obligations)
-}
-
-pub fn predicates_for_generics<'tcx>(
-    cause: ObligationCause<'tcx>,
-    recursion_depth: usize,
-    param_env: ty::ParamEnv<'tcx>,
-    generic_bounds: ty::InstantiatedPredicates<'tcx>,
-) -> impl Iterator<Item = PredicateObligation<'tcx>> {
-    debug!("predicates_for_generics(generic_bounds={:?})", generic_bounds);
-
-    iter::zip(generic_bounds.predicates, generic_bounds.spans).map(move |(predicate, span)| {
-        let cause = match *cause.code() {
-            traits::ItemObligation(def_id) if !span.is_dummy() => traits::ObligationCause::new(
-                cause.span,
-                cause.body_id,
-                traits::BindingObligation(def_id, span),
-            ),
-            _ => cause.clone(),
-        };
-        Obligation { cause, recursion_depth, param_env, predicate }
-    })
+    (subject, impl_obligations)
 }
 
 pub fn predicate_for_trait_ref<'tcx>(
@@ -308,22 +281,24 @@ pub fn get_vtable_index_of_object_method<'tcx, N>(
     tcx: TyCtxt<'tcx>,
     object: &super::ImplSourceObjectData<'tcx, N>,
     method_def_id: DefId,
-) -> usize {
+) -> Option<usize> {
     let existential_trait_ref = object
         .upcast_trait_ref
         .map_bound(|trait_ref| ty::ExistentialTraitRef::erase_self_ty(tcx, trait_ref));
     let existential_trait_ref = tcx.erase_regions(existential_trait_ref);
+
     // Count number of methods preceding the one we are selecting and
     // add them to the total offset.
-    let index = tcx
+    if let Some(index) = tcx
         .own_existential_vtable_entries(existential_trait_ref)
         .iter()
         .copied()
         .position(|def_id| def_id == method_def_id)
-        .unwrap_or_else(|| {
-            bug!("get_vtable_index_of_object_method: {:?} was not found", method_def_id);
-        });
-    object.vtable_base + index
+    {
+        Some(object.vtable_base + index)
+    } else {
+        None
+    }
 }
 
 pub fn closure_trait_ref_and_return_type<'tcx>(
@@ -360,7 +335,8 @@ pub fn generator_trait_ref_and_outputs<'tcx>(
 }
 
 pub fn impl_item_is_final(tcx: TyCtxt<'_>, assoc_item: &ty::AssocItem) -> bool {
-    assoc_item.defaultness.is_final() && tcx.impl_defaultness(assoc_item.container.id()).is_final()
+    assoc_item.defaultness(tcx).is_final()
+        && tcx.impl_defaultness(assoc_item.container_id(tcx)).is_final()
 }
 
 pub enum TupleArgumentsFlag {

@@ -5,15 +5,15 @@ use if_chain::if_chain;
 use rustc_ast::ast::{self, LitFloatType, LitKind};
 use rustc_data_structures::sync::Lrc;
 use rustc_hir::def::{DefKind, Res};
-use rustc_hir::{BinOp, BinOpKind, Block, Expr, ExprKind, HirId, QPath, UnOp};
+use rustc_hir::{BinOp, BinOpKind, Block, Expr, ExprKind, HirId, Item, ItemKind, Node, QPath, UnOp};
 use rustc_lint::LateContext;
+use rustc_middle::mir;
 use rustc_middle::mir::interpret::Scalar;
 use rustc_middle::ty::subst::{Subst, SubstsRef};
-use rustc_middle::ty::{self, FloatTy, ScalarInt, Ty, TyCtxt};
+use rustc_middle::ty::{self, EarlyBinder, FloatTy, ScalarInt, Ty, TyCtxt};
 use rustc_middle::{bug, span_bug};
 use rustc_span::symbol::Symbol;
 use std::cmp::Ordering::{self, Equal};
-use std::convert::TryInto;
 use std::hash::{Hash, Hasher};
 use std::iter;
 
@@ -45,7 +45,7 @@ pub enum Constant {
     /// A reference
     Ref(Box<Constant>),
     /// A literal with syntax error.
-    Err(Symbol),
+    Err,
 }
 
 impl PartialEq for Constant {
@@ -118,9 +118,7 @@ impl Hash for Constant {
             Self::Ref(ref r) => {
                 r.hash(state);
             },
-            Self::Err(ref s) => {
-                s.hash(state);
-            },
+            Self::Err => {},
         }
     }
 }
@@ -130,12 +128,10 @@ impl Constant {
         match (left, right) {
             (&Self::Str(ref ls), &Self::Str(ref rs)) => Some(ls.cmp(rs)),
             (&Self::Char(ref l), &Self::Char(ref r)) => Some(l.cmp(r)),
-            (&Self::Int(l), &Self::Int(r)) => {
-                if let ty::Int(int_ty) = *cmp_type.kind() {
-                    Some(sext(tcx, l, int_ty).cmp(&sext(tcx, r, int_ty)))
-                } else {
-                    Some(l.cmp(&r))
-                }
+            (&Self::Int(l), &Self::Int(r)) => match *cmp_type.kind() {
+                ty::Int(int_ty) => Some(sext(tcx, l, int_ty).cmp(&sext(tcx, r, int_ty))),
+                ty::Uint(_) => Some(l.cmp(&r)),
+                _ => bug!("Not an int type"),
             },
             (&Self::F64(l), &Self::F64(r)) => l.partial_cmp(&r),
             (&Self::F32(l), &Self::F32(r)) => l.partial_cmp(&r),
@@ -179,7 +175,7 @@ impl Constant {
 }
 
 /// Parses a `LitKind` to a `Constant`.
-pub fn lit_to_constant(lit: &LitKind, ty: Option<Ty<'_>>) -> Constant {
+pub fn lit_to_mir_constant(lit: &LitKind, ty: Option<Ty<'_>>) -> Constant {
     match *lit {
         LitKind::Str(ref is, _) => Constant::Str(is.to_string()),
         LitKind::Byte(b) => Constant::Int(u128::from(b)),
@@ -196,7 +192,7 @@ pub fn lit_to_constant(lit: &LitKind, ty: Option<Ty<'_>>) -> Constant {
             _ => bug!(),
         },
         LitKind::Bool(b) => Constant::Bool(b),
-        LitKind::Err(s) => Constant::Err(s),
+        LitKind::Err => Constant::Err,
     }
 }
 
@@ -301,7 +297,7 @@ impl<'a, 'tcx> ConstEvalLateContext<'a, 'tcx> {
                 if is_direct_expn_of(e.span, "cfg").is_some() {
                     None
                 } else {
-                    Some(lit_to_constant(&lit.node, self.typeck_results.expr_ty_opt(e)))
+                    Some(lit_to_mir_constant(&lit.node, self.typeck_results.expr_ty_opt(e)))
                 }
             },
             ExprKind::Array(vec) => self.multi(vec).map(Constant::Vec),
@@ -352,7 +348,7 @@ impl<'a, 'tcx> ConstEvalLateContext<'a, 'tcx> {
         }
     }
 
-    #[allow(clippy::cast_possible_wrap)]
+    #[expect(clippy::cast_possible_wrap)]
     fn constant_not(&self, o: &Constant, ty: Ty<'_>) -> Option<Constant> {
         use self::Constant::{Bool, Int};
         match *o {
@@ -400,11 +396,27 @@ impl<'a, 'tcx> ConstEvalLateContext<'a, 'tcx> {
         let res = self.typeck_results.qpath_res(qpath, id);
         match res {
             Res::Def(DefKind::Const | DefKind::AssocConst, def_id) => {
+                // Check if this constant is based on `cfg!(..)`,
+                // which is NOT constant for our purposes.
+                if let Some(node) = self.lcx.tcx.hir().get_if_local(def_id) &&
+                let Node::Item(&Item {
+                    kind: ItemKind::Const(_, body_id),
+                    ..
+                }) = node &&
+                let Node::Expr(&Expr {
+                    kind: ExprKind::Lit(_),
+                    span,
+                    ..
+                }) = self.lcx.tcx.hir().get(body_id.hir_id) &&
+                is_direct_expn_of(span, "cfg").is_some() {
+                    return None;
+                }
+
                 let substs = self.typeck_results.node_substs(id);
                 let substs = if self.substs.is_empty() {
                     substs
                 } else {
-                    substs.subst(self.lcx.tcx, self.substs)
+                    EarlyBinder(substs).subst(self.lcx.tcx, self.substs)
                 };
 
                 let result = self
@@ -416,8 +428,8 @@ impl<'a, 'tcx> ConstEvalLateContext<'a, 'tcx> {
                         None,
                     )
                     .ok()
-                    .map(|val| rustc_middle::ty::Const::from_value(self.lcx.tcx, val, ty))?;
-                let result = miri_to_const(result);
+                    .map(|val| rustc_middle::mir::ConstantKind::from_value(val, ty))?;
+                let result = miri_to_const(self.lcx.tcx, result);
                 if result.is_some() {
                     self.needed_resolution = true;
                 }
@@ -465,7 +477,7 @@ impl<'a, 'tcx> ConstEvalLateContext<'a, 'tcx> {
     fn ifthenelse(&mut self, cond: &Expr<'_>, then: &Expr<'_>, otherwise: Option<&Expr<'_>>) -> Option<Constant> {
         if let Some(Constant::Bool(b)) = self.expr(cond) {
             if b {
-                self.expr(&*then)
+                self.expr(then)
             } else {
                 otherwise.as_ref().and_then(|expr| self.expr(expr))
             }
@@ -567,10 +579,10 @@ impl<'a, 'tcx> ConstEvalLateContext<'a, 'tcx> {
     }
 }
 
-pub fn miri_to_const(result: ty::Const<'_>) -> Option<Constant> {
+pub fn miri_to_const<'tcx>(tcx: TyCtxt<'tcx>, result: mir::ConstantKind<'tcx>) -> Option<Constant> {
     use rustc_middle::mir::interpret::ConstValue;
-    match result.val() {
-        ty::ConstKind::Value(ConstValue::Scalar(Scalar::Int(int))) => {
+    match result {
+        mir::ConstantKind::Val(ConstValue::Scalar(Scalar::Int(int)), _) => {
             match result.ty().kind() {
                 ty::Bool => Some(Constant::Bool(int == ScalarInt::TRUE)),
                 ty::Uint(_) | ty::Int(_) => Some(Constant::Int(int.assert_bits(int.size()))),
@@ -590,10 +602,11 @@ pub fn miri_to_const(result: ty::Const<'_>) -> Option<Constant> {
                 _ => None,
             }
         },
-        ty::ConstKind::Value(ConstValue::Slice { data, start, end }) => match result.ty().kind() {
+        mir::ConstantKind::Val(ConstValue::Slice { data, start, end }, _) => match result.ty().kind() {
             ty::Ref(_, tam, _) => match tam.kind() {
                 ty::Str => String::from_utf8(
-                    data.inspect_with_uninit_and_ptr_outside_interpreter(start..end)
+                    data.inner()
+                        .inspect_with_uninit_and_ptr_outside_interpreter(start..end)
                         .to_owned(),
                 )
                 .ok()
@@ -602,32 +615,26 @@ pub fn miri_to_const(result: ty::Const<'_>) -> Option<Constant> {
             },
             _ => None,
         },
-        ty::ConstKind::Value(ConstValue::ByRef { alloc, offset: _ }) => match result.ty().kind() {
+        mir::ConstantKind::Val(ConstValue::ByRef { alloc, offset: _ }, _) => match result.ty().kind() {
             ty::Array(sub_type, len) => match sub_type.kind() {
-                ty::Float(FloatTy::F32) => match miri_to_const(*len) {
-                    Some(Constant::Int(len)) => alloc
-                        .inspect_with_uninit_and_ptr_outside_interpreter(0..(4 * len as usize))
+                ty::Float(FloatTy::F32) => match len.kind().try_to_machine_usize(tcx) {
+                    Some(len) => alloc
+                        .inner()
+                        .inspect_with_uninit_and_ptr_outside_interpreter(0..(4 * usize::try_from(len).unwrap()))
                         .to_owned()
-                        .chunks(4)
-                        .map(|chunk| {
-                            Some(Constant::F32(f32::from_le_bytes(
-                                chunk.try_into().expect("this shouldn't happen"),
-                            )))
-                        })
+                        .array_chunks::<4>()
+                        .map(|&chunk| Some(Constant::F32(f32::from_le_bytes(chunk))))
                         .collect::<Option<Vec<Constant>>>()
                         .map(Constant::Vec),
                     _ => None,
                 },
-                ty::Float(FloatTy::F64) => match miri_to_const(*len) {
-                    Some(Constant::Int(len)) => alloc
-                        .inspect_with_uninit_and_ptr_outside_interpreter(0..(8 * len as usize))
+                ty::Float(FloatTy::F64) => match len.kind().try_to_machine_usize(tcx) {
+                    Some(len) => alloc
+                        .inner()
+                        .inspect_with_uninit_and_ptr_outside_interpreter(0..(8 * usize::try_from(len).unwrap()))
                         .to_owned()
-                        .chunks(8)
-                        .map(|chunk| {
-                            Some(Constant::F64(f64::from_le_bytes(
-                                chunk.try_into().expect("this shouldn't happen"),
-                            )))
-                        })
+                        .array_chunks::<8>()
+                        .map(|&chunk| Some(Constant::F64(f64::from_le_bytes(chunk))))
                         .collect::<Option<Vec<Constant>>>()
                         .map(Constant::Vec),
                     _ => None,

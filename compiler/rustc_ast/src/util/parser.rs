@@ -247,6 +247,7 @@ pub enum ExprPrecedence {
     Continue,
     Ret,
     Yield,
+    Yeet,
 
     Range,
 
@@ -299,7 +300,8 @@ impl ExprPrecedence {
             ExprPrecedence::Break |
             ExprPrecedence::Continue |
             ExprPrecedence::Ret |
-            ExprPrecedence::Yield => PREC_JUMP,
+            ExprPrecedence::Yield |
+            ExprPrecedence::Yeet => PREC_JUMP,
 
             // `Range` claims to have higher precedence than `Assign`, but `x .. x = x` fails to
             // parse, instead of parsing as `(x .. x) = x`.  Giving `Range` a lower precedence
@@ -394,9 +396,9 @@ pub fn contains_exterior_struct_lit(value: &ast::Expr) -> bool {
             contains_exterior_struct_lit(&x)
         }
 
-        ast::ExprKind::MethodCall(.., ref exprs, _) => {
+        ast::ExprKind::MethodCall(_, ref receiver, _, _) => {
             // X { y: 1 }.bar(...)
-            contains_exterior_struct_lit(&exprs[0])
+            contains_exterior_struct_lit(&receiver)
         }
 
         _ => false,

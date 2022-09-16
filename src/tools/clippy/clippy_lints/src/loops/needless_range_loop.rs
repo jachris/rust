@@ -9,7 +9,7 @@ use rustc_ast::ast;
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
 use rustc_hir::def::{DefKind, Res};
 use rustc_hir::intravisit::{walk_expr, Visitor};
-use rustc_hir::{BinOpKind, BorrowKind, Expr, ExprKind, HirId, Mutability, Pat, PatKind, QPath};
+use rustc_hir::{BinOpKind, BorrowKind, Closure, Expr, ExprKind, HirId, Mutability, Pat, PatKind, QPath};
 use rustc_lint::LateContext;
 use rustc_middle::middle::region;
 use rustc_middle::ty::{self, Ty};
@@ -19,7 +19,7 @@ use std::mem;
 
 /// Checks for looping over a range and then indexing a sequence with it.
 /// The iteratee must be a range literal.
-#[allow(clippy::too_many_lines)]
+#[expect(clippy::too_many_lines)]
 pub(super) fn check<'tcx>(
     cx: &LateContext<'tcx>,
     pat: &'tcx Pat<'_>,
@@ -59,7 +59,7 @@ pub(super) fn check<'tcx>(
                 if let Some(indexed_extent) = indexed_extent {
                     let parent_def_id = cx.tcx.hir().get_parent_item(expr.hir_id);
                     let region_scope_tree = cx.tcx.region_scope_tree(parent_def_id);
-                    let pat_extent = region_scope_tree.var_scope(pat.hir_id.local_id);
+                    let pat_extent = region_scope_tree.var_scope(pat.hir_id.local_id).unwrap();
                     if region_scope_tree.is_subscope_of(indexed_extent, pat_extent) {
                         return;
                     }
@@ -117,7 +117,9 @@ pub(super) fn check<'tcx>(
                                 let take_expr = sugg::Sugg::hir(cx, take_expr, "<count>");
                                 format!(".take({})", take_expr + sugg::ONE)
                             },
-                            ast::RangeLimits::HalfOpen => format!(".take({})", snippet(cx, take_expr.span, "..")),
+                            ast::RangeLimits::HalfOpen => {
+                                format!(".take({})", snippet(cx, take_expr.span, ".."))
+                            },
                         }
                     }
                 } else {
@@ -186,10 +188,9 @@ pub(super) fn check<'tcx>(
 
 fn is_len_call(expr: &Expr<'_>, var: Symbol) -> bool {
     if_chain! {
-        if let ExprKind::MethodCall(method, len_args, _) = expr.kind;
-        if len_args.len() == 1;
+        if let ExprKind::MethodCall(method, recv, [], _) = expr.kind;
         if method.ident.name == sym::len;
-        if let ExprKind::Path(QPath::Resolved(_, path)) = len_args[0].kind;
+        if let ExprKind::Path(QPath::Resolved(_, path)) = recv.kind;
         if path.segments.len() == 1;
         if path.segments[0].ident.name == var;
         then {
@@ -262,7 +263,11 @@ impl<'a, 'tcx> VarVisitor<'a, 'tcx> {
                 match res {
                     Res::Local(hir_id) => {
                         let parent_def_id = self.cx.tcx.hir().get_parent_item(expr.hir_id);
-                        let extent = self.cx.tcx.region_scope_tree(parent_def_id).var_scope(hir_id.local_id);
+                        let extent = self.cx
+                            .tcx
+                            .region_scope_tree(parent_def_id)
+                            .var_scope(hir_id.local_id)
+                            .unwrap();
                         if index_used_directly {
                             self.indexed_directly.insert(
                                 seqvar.segments[0].ident.name,
@@ -273,7 +278,7 @@ impl<'a, 'tcx> VarVisitor<'a, 'tcx> {
                         }
                         return false;  // no need to walk further *on the variable*
                     }
-                    Res::Def(DefKind::Static | DefKind::Const, ..) => {
+                    Res::Def(DefKind::Static (_)| DefKind::Const, ..) => {
                         if index_used_directly {
                             self.indexed_directly.insert(
                                 seqvar.segments[0].ident.name,
@@ -296,7 +301,7 @@ impl<'a, 'tcx> Visitor<'tcx> for VarVisitor<'a, 'tcx> {
     fn visit_expr(&mut self, expr: &'tcx Expr<'_>) {
         if_chain! {
             // a range index op
-            if let ExprKind::MethodCall(meth, [args_0, args_1, ..], _) = &expr.kind;
+            if let ExprKind::MethodCall(meth, args_0, [args_1, ..], _) = &expr.kind;
             if (meth.ident.name == sym::index && match_trait_method(self.cx, expr, &paths::INDEX))
                 || (meth.ident.name == sym::index_mut && match_trait_method(self.cx, expr, &paths::INDEX_MUT));
             if !self.check(args_1, args_0, expr);
@@ -351,9 +356,12 @@ impl<'a, 'tcx> Visitor<'tcx> for VarVisitor<'a, 'tcx> {
                     self.visit_expr(expr);
                 }
             },
-            ExprKind::MethodCall(_, args, _) => {
+            ExprKind::MethodCall(_, receiver, args, _) => {
                 let def_id = self.cx.typeck_results().type_dependent_def_id(expr.hir_id).unwrap();
-                for (ty, expr) in iter::zip(self.cx.tcx.fn_sig(def_id).inputs().skip_binder(), args) {
+                for (ty, expr) in iter::zip(
+                    self.cx.tcx.fn_sig(def_id).inputs().skip_binder(),
+                    std::iter::once(receiver).chain(args.iter()),
+                ) {
                     self.prefer_mutable = false;
                     if let ty::Ref(_, _, mutbl) = *ty.kind() {
                         if mutbl == Mutability::Mut {
@@ -363,9 +371,9 @@ impl<'a, 'tcx> Visitor<'tcx> for VarVisitor<'a, 'tcx> {
                     self.visit_expr(expr);
                 }
             },
-            ExprKind::Closure(_, _, body_id, ..) => {
-                let body = self.cx.tcx.hir().body(body_id);
-                self.visit_expr(&body.value);
+            ExprKind::Closure(&Closure { body, .. }) => {
+                let body = self.cx.tcx.hir().body(body);
+                self.visit_expr(body.value);
             },
             _ => walk_expr(self, expr),
         }

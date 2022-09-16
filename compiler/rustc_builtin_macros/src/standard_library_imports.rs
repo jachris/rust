@@ -6,6 +6,7 @@ use rustc_span::edition::Edition::*;
 use rustc_span::hygiene::AstPass;
 use rustc_span::symbol::{kw, sym, Ident, Symbol};
 use rustc_span::DUMMY_SP;
+use thin_vec::thin_vec;
 
 pub fn inject(
     mut krate: ast::Crate,
@@ -51,7 +52,7 @@ pub fn inject(
             cx.item(
                 span,
                 ident,
-                vec![cx.attribute(cx.meta_word(span, sym::macro_use))],
+                thin_vec![cx.attribute(cx.meta_word(span, sym::macro_use))],
                 ast::ItemKind::ExternCrate(None),
             ),
         );
@@ -70,6 +71,7 @@ pub fn inject(
             Edition2015 => sym::rust_2015,
             Edition2018 => sym::rust_2018,
             Edition2021 => sym::rust_2021,
+            Edition2024 => sym::rust_2024,
         }])
         .map(|&symbol| Ident::new(symbol, span))
         .collect();
@@ -77,7 +79,7 @@ pub fn inject(
     let use_item = cx.item(
         span,
         Ident::empty(),
-        vec![cx.attribute(cx.meta_word(span, sym::prelude_import))],
+        thin_vec![cx.attribute(cx.meta_word(span, sym::prelude_import))],
         ast::ItemKind::Use(ast::UseTree {
             prefix: cx.path(span, import_path),
             kind: ast::UseTreeKind::Glob,

@@ -24,6 +24,14 @@ pub struct Comment {
     pub pos: BytePos,
 }
 
+/// A fast conservative estimate on whether the string can contain documentation links.
+/// A pair of square brackets `[]` must exist in the string, but we only search for the
+/// opening bracket because brackets always go in pairs in practice.
+#[inline]
+pub fn may_have_doc_links(s: &str) -> bool {
+    s.contains('[')
+}
+
 /// Makes a doc string more presentable to users.
 /// Used by rustdoc and perhaps other tools, but not by rustc.
 pub fn beautify_doc_string(data: Symbol, kind: CommentKind) -> Symbol {
@@ -52,7 +60,10 @@ pub fn beautify_doc_string(data: Symbol, kind: CommentKind) -> Symbol {
         // when we try to compute the "horizontal trim".
         let lines = if kind == CommentKind::Block {
             // Whatever happens, we skip the first line.
-            let mut i = if lines[0].trim_start().starts_with('*') { 0 } else { 1 };
+            let mut i = lines
+                .get(0)
+                .map(|l| if l.trim_start().starts_with('*') { 0 } else { 1 })
+                .unwrap_or(0);
             let mut j = lines.len();
 
             while i < j && lines[i].trim().is_empty() {
@@ -183,7 +194,7 @@ pub fn gather_comments(sm: &SourceMap, path: FileName, src: String) -> Vec<Comme
     }
 
     for token in rustc_lexer::tokenize(&text[pos..]) {
-        let token_text = &text[pos..pos + token.len];
+        let token_text = &text[pos..pos + token.len as usize];
         match token.kind {
             rustc_lexer::TokenKind::Whitespace => {
                 if let Some(mut idx) = token_text.find('\n') {
@@ -200,8 +211,10 @@ pub fn gather_comments(sm: &SourceMap, path: FileName, src: String) -> Vec<Comme
             }
             rustc_lexer::TokenKind::BlockComment { doc_style, .. } => {
                 if doc_style.is_none() {
-                    let code_to_the_right =
-                        !matches!(text[pos + token.len..].chars().next(), Some('\r' | '\n'));
+                    let code_to_the_right = !matches!(
+                        text[pos + token.len as usize..].chars().next(),
+                        Some('\r' | '\n')
+                    );
                     let style = match (code_to_the_left, code_to_the_right) {
                         (_, true) => CommentStyle::Mixed,
                         (false, false) => CommentStyle::Isolated,
@@ -235,7 +248,7 @@ pub fn gather_comments(sm: &SourceMap, path: FileName, src: String) -> Vec<Comme
                 code_to_the_left = true;
             }
         }
-        pos += token.len;
+        pos += token.len as usize;
     }
 
     comments

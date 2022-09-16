@@ -30,7 +30,7 @@ impl<'tcx> LateLintPass<'tcx> for Pass {
         let span = cx.tcx.def_span(CRATE_DEF_ID);
         if !cx.sess().contains_name(attrs, Symbol::intern("crate_okay")) {
             cx.lint(CRATE_NOT_OKAY, |lint| {
-                lint.build("crate is not marked with #![crate_okay]").set_span(span).emit()
+                lint.build("crate is not marked with #![crate_okay]").set_span(span).emit();
             });
         }
     }
@@ -39,5 +39,5 @@ impl<'tcx> LateLintPass<'tcx> for Pass {
 #[no_mangle]
 fn __rustc_plugin_registrar(reg: &mut Registry) {
     reg.lint_store.register_lints(&[&CRATE_NOT_OKAY]);
-    reg.lint_store.register_late_pass(|| Box::new(Pass));
+    reg.lint_store.register_late_pass(|_| Box::new(Pass));
 }

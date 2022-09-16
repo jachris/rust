@@ -1,22 +1,15 @@
 //! `bless` updates the reference files in the repo with changed output files
 //! from the last test run.
 
+use crate::cargo_clippy_path;
 use std::ffi::OsStr;
 use std::fs;
-use std::lazy::SyncLazy;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 use walkdir::{DirEntry, WalkDir};
 
-#[cfg(not(windows))]
-static CARGO_CLIPPY_EXE: &str = "cargo-clippy";
-#[cfg(windows)]
-static CARGO_CLIPPY_EXE: &str = "cargo-clippy.exe";
-
-static CLIPPY_BUILD_TIME: SyncLazy<Option<std::time::SystemTime>> = SyncLazy::new(|| {
-    let mut path = std::env::current_exe().unwrap();
-    path.set_file_name(CARGO_CLIPPY_EXE);
-    fs::metadata(path).ok()?.modified().ok()
-});
+static CLIPPY_BUILD_TIME: LazyLock<Option<std::time::SystemTime>> =
+    LazyLock::new(|| cargo_clippy_path().metadata().ok()?.modified().ok());
 
 /// # Panics
 ///
@@ -44,7 +37,7 @@ fn update_reference_file(test_output_entry: &DirEntry, ignore_timestamp: bool) {
         return;
     }
 
-    let test_output_file = fs::read(&test_output_path).expect("Unable to read test output file");
+    let test_output_file = fs::read(test_output_path).expect("Unable to read test output file");
     let reference_file = fs::read(&reference_file_path).unwrap_or_default();
 
     if test_output_file != reference_file {

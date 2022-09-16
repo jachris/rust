@@ -222,7 +222,87 @@ pub trait Try: FromResidual {
 /// Every `Try` type needs to be recreatable from its own associated
 /// `Residual` type, but can also have additional `FromResidual` implementations
 /// to support interconversion with other `Try` types.
-#[rustc_on_unimplemented(
+#[cfg_attr(not(bootstrap), rustc_on_unimplemented(
+    on(
+        all(
+            from_desugaring = "QuestionMark",
+            _Self = "std::result::Result<T, E>",
+            R = "std::option::Option<std::convert::Infallible>"
+        ),
+        message = "the `?` operator can only be used on `Result`s, not `Option`s, \
+            in {ItemContext} that returns `Result`",
+        label = "use `.ok_or(...)?` to provide an error compatible with `{Self}`",
+        parent_label = "this function returns a `Result`"
+    ),
+    on(
+        all(
+            from_desugaring = "QuestionMark",
+            _Self = "std::result::Result<T, E>",
+        ),
+        // There's a special error message in the trait selection code for
+        // `From` in `?`, so this is not shown for result-in-result errors,
+        // and thus it can be phrased more strongly than `ControlFlow`'s.
+        message = "the `?` operator can only be used on `Result`s \
+            in {ItemContext} that returns `Result`",
+        label = "this `?` produces `{R}`, which is incompatible with `{Self}`",
+        parent_label = "this function returns a `Result`"
+    ),
+    on(
+        all(
+            from_desugaring = "QuestionMark",
+            _Self = "std::option::Option<T>",
+            R = "std::result::Result<T, E>",
+        ),
+        message = "the `?` operator can only be used on `Option`s, not `Result`s, \
+            in {ItemContext} that returns `Option`",
+        label = "use `.ok()?` if you want to discard the `{R}` error information",
+        parent_label = "this function returns an `Option`"
+    ),
+    on(
+        all(
+            from_desugaring = "QuestionMark",
+            _Self = "std::option::Option<T>",
+        ),
+        // `Option`-in-`Option` always works, as there's only one possible
+        // residual, so this can also be phrased strongly.
+        message = "the `?` operator can only be used on `Option`s \
+            in {ItemContext} that returns `Option`",
+        label = "this `?` produces `{R}`, which is incompatible with `{Self}`",
+        parent_label = "this function returns an `Option`"
+    ),
+    on(
+        all(
+            from_desugaring = "QuestionMark",
+            _Self = "std::ops::ControlFlow<B, C>",
+            R = "std::ops::ControlFlow<B, C>",
+        ),
+        message = "the `?` operator in {ItemContext} that returns `ControlFlow<B, _>` \
+            can only be used on other `ControlFlow<B, _>`s (with the same Break type)",
+        label = "this `?` produces `{R}`, which is incompatible with `{Self}`",
+        parent_label = "this function returns a `ControlFlow`",
+        note = "unlike `Result`, there's no `From`-conversion performed for `ControlFlow`"
+    ),
+    on(
+        all(
+            from_desugaring = "QuestionMark",
+            _Self = "std::ops::ControlFlow<B, C>",
+            // `R` is not a `ControlFlow`, as that case was matched previously
+        ),
+        message = "the `?` operator can only be used on `ControlFlow`s \
+            in {ItemContext} that returns `ControlFlow`",
+        label = "this `?` produces `{R}`, which is incompatible with `{Self}`",
+        parent_label = "this function returns a `ControlFlow`",
+    ),
+    on(
+        all(from_desugaring = "QuestionMark"),
+        message = "the `?` operator can only be used in {ItemContext} \
+                    that returns `Result` or `Option` \
+                    (or another type that implements `{FromResidual}`)",
+        label = "cannot use the `?` operator in {ItemContext} that returns `{Self}`",
+        parent_label = "this function should return `Result` or `Option` to accept `?`"
+    ),
+))]
+#[cfg_attr(bootstrap, rustc_on_unimplemented(
     on(
         all(
             from_desugaring = "QuestionMark",
@@ -301,7 +381,7 @@ pub trait Try: FromResidual {
         label = "cannot use the `?` operator in {ItemContext} that returns `{Self}`",
         enclosing_scope = "this function should return `Result` or `Option` to accept `?`"
     ),
-)]
+))]
 #[rustc_diagnostic_item = "FromResidual"]
 #[unstable(feature = "try_trait_v2", issue = "84277")]
 pub trait FromResidual<R = <Self as Try>::Residual> {
@@ -328,6 +408,21 @@ pub trait FromResidual<R = <Self as Try>::Residual> {
     #[lang = "from_residual"]
     #[unstable(feature = "try_trait_v2", issue = "84277")]
     fn from_residual(residual: R) -> Self;
+}
+
+#[unstable(
+    feature = "yeet_desugar_details",
+    issue = "none",
+    reason = "just here to simplify the desugaring; will never be stabilized"
+)]
+#[inline]
+#[track_caller] // because `Result::from_residual` has it
+#[lang = "from_yeet"]
+pub fn from_yeet<T, Y>(yeeted: Y) -> T
+where
+    T: FromResidual<Yeet<Y>>,
+{
+    FromResidual::from_residual(Yeet(yeeted))
 }
 
 /// Allows retrieving the canonical type implementing [`Try`] that has this type
@@ -395,3 +490,9 @@ impl<T> FromResidual for NeverShortCircuit<T> {
 impl<T> Residual<T> for NeverShortCircuitResidual {
     type TryType = NeverShortCircuit<T>;
 }
+
+/// Implement `FromResidual<Yeet<T>>` on your type to enable
+/// `do yeet expr` syntax in functions returning your type.
+#[unstable(feature = "try_trait_v2_yeet", issue = "96374")]
+#[derive(Debug)]
+pub struct Yeet<T>(pub T);

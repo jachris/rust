@@ -1,9 +1,7 @@
 // check-fail
-// known-bug
+// known-bug: #87735, #88526
 
 // This should pass, but we need an extension of implied bounds (probably).
-
-#![feature(generic_associated_types)]
 
 pub trait AsRef2 {
   type Output<'a> where Self: 'a;
@@ -12,7 +10,7 @@ pub trait AsRef2 {
 }
 
 impl<T> AsRef2 for Vec<T> {
-  type Output<'a> where Self: 'a = &'a [T];
+  type Output<'a> = &'a [T] where Self: 'a;
 
   fn as_ref2<'a>(&'a self) -> Self::Output<'a> {
     &self[..]
@@ -33,7 +31,7 @@ where
     T: AsRef2<Output<'b> = &'b [U]>,
     U: 'b
 {
-  type Output<'a> where Self: 'a = FooRef<'a, U>;
+  type Output<'a> = FooRef<'a, U> where Self: 'a;
 
   fn as_ref2<'a>(&'a self) -> Self::Output<'a> {
     FooRef(self.0.as_ref2())

@@ -4,7 +4,7 @@ use clippy_utils::{path_to_local_id, visitors::is_local_used};
 use if_chain::if_chain;
 use rustc_errors::Applicability;
 use rustc_hir as hir;
-use rustc_hir::BindingAnnotation;
+use rustc_hir::{BindingAnnotation, Mutability};
 use rustc_lint::{LateContext, LateLintPass};
 use rustc_session::{declare_lint_pass, declare_tool_lint};
 
@@ -68,7 +68,7 @@ impl<'tcx> LateLintPass<'tcx> for LetIfSeq {
                 if let hir::ExprKind::If(hir::Expr { kind: hir::ExprKind::DropTemps(cond), ..}, then, else_) = if_.kind;
                 if !is_local_used(cx, *cond, canonical_id);
                 if let hir::ExprKind::Block(then, _) = then.kind;
-                if let Some(value) = check_assign(cx, canonical_id, &*then);
+                if let Some(value) = check_assign(cx, canonical_id, then);
                 if !is_local_used(cx, value, canonical_id);
                 then {
                     let span = stmt.span.to(if_.span);
@@ -98,7 +98,7 @@ impl<'tcx> LateLintPass<'tcx> for LetIfSeq {
                     };
 
                     let mutability = match mode {
-                        BindingAnnotation::RefMut | BindingAnnotation::Mutable => "<mut> ",
+                        BindingAnnotation(_, Mutability::Mut) => "<mut> ",
                         _ => "",
                     };
 

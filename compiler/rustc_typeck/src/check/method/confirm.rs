@@ -2,9 +2,9 @@ use super::{probe, MethodCallee};
 
 use crate::astconv::{AstConv, CreateSubstsForGenericArgsCtxt, IsMethodCall};
 use crate::check::{callee, FnCtxt};
-use crate::hir::def_id::DefId;
-use crate::hir::GenericArg;
 use rustc_hir as hir;
+use rustc_hir::def_id::DefId;
+use rustc_hir::GenericArg;
 use rustc_infer::infer::{self, InferOk};
 use rustc_middle::traits::{ObligationCauseCode, UnifyReceiverContext};
 use rustc_middle::ty::adjustment::{Adjust, Adjustment, PointerCast};
@@ -81,10 +81,24 @@ impl<'a, 'tcx> ConfirmContext<'a, 'tcx> {
         let rcvr_substs = self.fresh_receiver_substs(self_ty, &pick);
         let all_substs = self.instantiate_method_substs(&pick, segment, rcvr_substs);
 
-        debug!("all_substs={:?}", all_substs);
+        debug!("rcvr_substs={rcvr_substs:?}, all_substs={all_substs:?}");
 
         // Create the final signature for the method, replacing late-bound regions.
         let (method_sig, method_predicates) = self.instantiate_method_sig(&pick, all_substs);
+
+        // If there is a `Self: Sized` bound and `Self` is a trait object, it is possible that
+        // something which derefs to `Self` actually implements the trait and the caller
+        // wanted to make a static dispatch on it but forgot to import the trait.
+        // See test `src/test/ui/issue-35976.rs`.
+        //
+        // In that case, we'll error anyway, but we'll also re-run the search with all traits
+        // in scope, and if we find another method which can be used, we'll output an
+        // appropriate hint suggesting to import the trait.
+        let filler_substs = rcvr_substs
+            .extend_to(self.tcx, pick.item.def_id, |def, _| self.tcx.mk_param_from_def(def));
+        let illegal_sized_bound = self.predicates_require_illegal_sized_bound(
+            &self.tcx.predicates_of(pick.item.def_id).instantiate(self.tcx, filler_substs),
+        );
 
         // Unify the (adjusted) self type with what the method expects.
         //
@@ -105,16 +119,6 @@ impl<'a, 'tcx> ConfirmContext<'a, 'tcx> {
 
         // Make sure nobody calls `drop()` explicitly.
         self.enforce_illegal_method_limitations(&pick);
-
-        // If there is a `Self: Sized` bound and `Self` is a trait object, it is possible that
-        // something which derefs to `Self` actually implements the trait and the caller
-        // wanted to make a static dispatch on it but forgot to import the trait.
-        // See test `src/test/ui/issue-35976.rs`.
-        //
-        // In that case, we'll error anyway, but we'll also re-run the search with all traits
-        // in scope, and if we find another method which can be used, we'll output an
-        // appropriate hint suggesting to import the trait.
-        let illegal_sized_bound = self.predicates_require_illegal_sized_bound(&method_predicates);
 
         // Add any trait/regions obligations specified on the method's type parameters.
         // We won't add these if we encountered an illegal sized bound, so that we can use
@@ -234,7 +238,7 @@ impl<'a, 'tcx> ConfirmContext<'a, 'tcx> {
     ) -> SubstsRef<'tcx> {
         match pick.kind {
             probe::InherentImplPick => {
-                let impl_def_id = pick.item.container.id();
+                let impl_def_id = pick.item.container_id(self.tcx);
                 assert!(
                     self.tcx.impl_trait_ref(impl_def_id).is_none(),
                     "impl {:?} is not an inherent impl",
@@ -244,7 +248,7 @@ impl<'a, 'tcx> ConfirmContext<'a, 'tcx> {
             }
 
             probe::ObjectPick => {
-                let trait_def_id = pick.item.container.id();
+                let trait_def_id = pick.item.container_id(self.tcx);
                 self.extract_existential_trait_ref(self_ty, |this, object_ty, principal| {
                     // The object data has no entry for the Self
                     // Type. For the purposes of this method call, we
@@ -269,7 +273,7 @@ impl<'a, 'tcx> ConfirmContext<'a, 'tcx> {
             }
 
             probe::TraitPick => {
-                let trait_def_id = pick.item.container.id();
+                let trait_def_id = pick.item.container_id(self.tcx);
 
                 // Make a trait reference `$0 : Trait<$1...$n>`
                 // consisting entirely of type variables. Later on in
@@ -460,21 +464,15 @@ impl<'a, 'tcx> ConfirmContext<'a, 'tcx> {
 
         debug!("method_predicates after subst = {:?}", method_predicates);
 
-        let sig = self.tcx.fn_sig(def_id);
+        let sig = self.tcx.bound_fn_sig(def_id);
 
-        // Instantiate late-bound regions and substitute the trait
-        // parameters into the method type to get the actual method type.
-        //
-        // N.B., instantiate late-bound regions first so that
-        // `instantiate_type_scheme` can normalize associated types that
-        // may reference those regions.
-        let method_sig = self.replace_bound_vars_with_fresh_vars(sig);
-        debug!("late-bound lifetimes from method instantiated, method_sig={:?}", method_sig);
+        let sig = sig.subst(self.tcx, all_substs);
+        debug!("type scheme substituted, sig={:?}", sig);
 
-        let method_sig = method_sig.subst(self.tcx, all_substs);
-        debug!("type scheme substituted, method_sig={:?}", method_sig);
+        let sig = self.replace_bound_vars_with_fresh_vars(sig);
+        debug!("late-bound lifetimes from method instantiated, sig={:?}", sig);
 
-        (method_sig, method_predicates)
+        (sig, method_predicates)
     }
 
     fn add_obligations(
@@ -493,7 +491,19 @@ impl<'a, 'tcx> ConfirmContext<'a, 'tcx> {
         // so we just call `predicates_for_generics` directly to avoid redoing work.
         // `self.add_required_obligations(self.span, def_id, &all_substs);`
         for obligation in traits::predicates_for_generics(
-            traits::ObligationCause::new(self.span, self.body_id, traits::ItemObligation(def_id)),
+            |idx, span| {
+                let code = if span.is_dummy() {
+                    ObligationCauseCode::ExprItemObligation(def_id, self.call_expr.hir_id, idx)
+                } else {
+                    ObligationCauseCode::ExprBindingObligation(
+                        def_id,
+                        span,
+                        self.call_expr.hir_id,
+                        idx,
+                    )
+                };
+                traits::ObligationCause::new(self.span, self.body_id, code)
+            },
             self.param_env,
             method_predicates,
         ) {
@@ -507,7 +517,7 @@ impl<'a, 'tcx> ConfirmContext<'a, 'tcx> {
         // the function type must also be well-formed (this is not
         // implied by the substs being well-formed because of inherent
         // impls and late-bound regions - see issue #28609).
-        self.register_wf_obligation(fty.into(), self.span, traits::MiscObligation);
+        self.register_wf_obligation(fty.into(), self.span, traits::WellFormed(None));
     }
 
     ///////////////////////////////////////////////////////////////////////////
@@ -542,15 +552,14 @@ impl<'a, 'tcx> ConfirmContext<'a, 'tcx> {
 
     fn enforce_illegal_method_limitations(&self, pick: &probe::Pick<'_>) {
         // Disallow calls to the method `drop` defined in the `Drop` trait.
-        match pick.item.container {
-            ty::TraitContainer(trait_def_id) => callee::check_legal_trait_for_method_call(
+        if let Some(trait_def_id) = pick.item.trait_container(self.tcx) {
+            callee::check_legal_trait_for_method_call(
                 self.tcx,
                 self.span,
                 Some(self.self_expr.span),
                 self.call_expr.span,
                 trait_def_id,
-            ),
-            ty::ImplContainer(..) => {}
+            )
         }
     }
 
@@ -578,8 +587,8 @@ impl<'a, 'tcx> ConfirmContext<'a, 'tcx> {
 
     fn replace_bound_vars_with_fresh_vars<T>(&self, value: ty::Binder<'tcx, T>) -> T
     where
-        T: TypeFoldable<'tcx>,
+        T: TypeFoldable<'tcx> + Copy,
     {
-        self.fcx.replace_bound_vars_with_fresh_vars(self.span, infer::FnCall, value).0
+        self.fcx.replace_bound_vars_with_fresh_vars(self.span, infer::FnCall, value)
     }
 }

@@ -9,7 +9,7 @@ use rustc_middle::infer::canonical::{Canonical, CanonicalizedQueryResponse, Quer
 use rustc_middle::traits::query::Fallible;
 use rustc_middle::ty::subst::SubstsRef;
 use rustc_middle::ty::ToPredicate;
-use rustc_middle::ty::{self, Ty, TypeFoldable};
+use rustc_middle::ty::{self, Ty, TypeFoldable, TypeVisitable};
 use rustc_span::{Span, DUMMY_SP};
 
 use std::fmt::Debug;
@@ -18,6 +18,13 @@ pub use rustc_infer::infer::*;
 
 pub trait InferCtxtExt<'tcx> {
     fn type_is_copy_modulo_regions(
+        &self,
+        param_env: ty::ParamEnv<'tcx>,
+        ty: Ty<'tcx>,
+        span: Span,
+    ) -> bool;
+
+    fn type_is_sized_modulo_regions(
         &self,
         param_env: ty::ParamEnv<'tcx>,
         ty: Ty<'tcx>,
@@ -72,6 +79,16 @@ impl<'cx, 'tcx> InferCtxtExt<'tcx> for InferCtxt<'cx, 'tcx> {
         // moves_by_default has a cache, which we want to use in other
         // cases.
         traits::type_known_to_meet_bound_modulo_regions(self, param_env, ty, copy_def_id, span)
+    }
+
+    fn type_is_sized_modulo_regions(
+        &self,
+        param_env: ty::ParamEnv<'tcx>,
+        ty: Ty<'tcx>,
+        span: Span,
+    ) -> bool {
+        let lang_item = self.tcx.require_lang_item(LangItem::Sized, None);
+        traits::type_known_to_meet_bound_modulo_regions(self, param_env, ty, lang_item, span)
     }
 
     /// Normalizes associated types in `value`, potentially returning

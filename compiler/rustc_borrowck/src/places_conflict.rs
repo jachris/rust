@@ -14,7 +14,7 @@ use std::iter;
 /// being run in the calling context, the conservative choice is to assume the compared indices
 /// are disjoint (and therefore, do not overlap).
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
-crate enum PlaceConflictBias {
+pub(crate) enum PlaceConflictBias {
     Overlap,
     NoOverlap,
 }
@@ -22,7 +22,7 @@ crate enum PlaceConflictBias {
 /// Helper function for checking if places conflict with a mutable borrow and deep access depth.
 /// This is used to check for places conflicting outside of the borrow checking code (such as in
 /// dataflow).
-crate fn places_conflict<'tcx>(
+pub(crate) fn places_conflict<'tcx>(
     tcx: TyCtxt<'tcx>,
     body: &Body<'tcx>,
     borrow_place: Place<'tcx>,
@@ -44,6 +44,7 @@ crate fn places_conflict<'tcx>(
 /// access depth. The `bias` parameter is used to determine how the unknowable (comparing runtime
 /// array indices, for example) should be interpreted - this depends on what the caller wants in
 /// order to make the conservative choice and preserve soundness.
+#[instrument(level = "debug", skip(tcx, body))]
 pub(super) fn borrow_conflicts_with_place<'tcx>(
     tcx: TyCtxt<'tcx>,
     body: &Body<'tcx>,
@@ -53,17 +54,10 @@ pub(super) fn borrow_conflicts_with_place<'tcx>(
     access: AccessDepth,
     bias: PlaceConflictBias,
 ) -> bool {
-    debug!(
-        "borrow_conflicts_with_place({:?}, {:?}, {:?}, {:?})",
-        borrow_place, access_place, access, bias,
-    );
-
     // This Local/Local case is handled by the more general code below, but
     // it's so common that it's a speed win to check for it first.
-    if let Some(l1) = borrow_place.as_local() {
-        if let Some(l2) = access_place.as_local() {
-            return l1 == l2;
-        }
+    if let Some(l1) = borrow_place.as_local() && let Some(l2) = access_place.as_local() {
+        return l1 == l2;
     }
 
     place_components_conflict(tcx, body, borrow_place, borrow_kind, access_place, access, bias)
@@ -142,10 +136,9 @@ fn place_components_conflict<'tcx>(
     for (i, (borrow_c, &access_c)) in
         iter::zip(borrow_place.projection, access_place.projection).enumerate()
     {
-        debug!("borrow_conflicts_with_place: borrow_c = {:?}", borrow_c);
-        let borrow_proj_base = &borrow_place.projection[..i];
+        debug!(?borrow_c, ?access_c);
 
-        debug!("borrow_conflicts_with_place: access_c = {:?}", access_c);
+        let borrow_proj_base = &borrow_place.projection[..i];
 
         // Borrow and access path both have more components.
         //
@@ -182,7 +175,7 @@ fn place_components_conflict<'tcx>(
                 // idea, at least for now, so just give up and
                 // report a conflict. This is unsafe code anyway so
                 // the user could always use raw pointers.
-                debug!("borrow_conflicts_with_place: arbitrary -> conflict");
+                debug!("arbitrary -> conflict");
                 return true;
             }
             Overlap::EqualOrDisjoint => {
@@ -191,7 +184,7 @@ fn place_components_conflict<'tcx>(
             Overlap::Disjoint => {
                 // We have proven the borrow disjoint - further
                 // projections will remain disjoint.
-                debug!("borrow_conflicts_with_place: disjoint");
+                debug!("disjoint");
                 return false;
             }
         }

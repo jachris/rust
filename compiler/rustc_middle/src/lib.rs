@@ -26,25 +26,24 @@
 #![feature(allocator_api)]
 #![feature(array_windows)]
 #![feature(assert_matches)]
-#![feature(backtrace)]
-#![feature(bool_to_option)]
 #![feature(box_patterns)]
 #![feature(core_intrinsics)]
-#![feature(derive_default_enum)]
 #![feature(discriminant_kind)]
 #![feature(exhaustive_patterns)]
 #![feature(get_mut_unchecked)]
+#![cfg_attr(bootstrap, feature(generic_associated_types))]
 #![feature(if_let_guard)]
 #![feature(map_first_last)]
+#![feature(negative_impls)]
 #![feature(never_type)]
 #![feature(extern_types)]
 #![feature(new_uninit)]
-#![feature(nll)]
 #![feature(once_cell)]
+#![feature(let_chains)]
 #![feature(let_else)]
 #![feature(min_specialization)]
 #![feature(trusted_len)]
-#![feature(crate_visibility_modifier)]
+#![feature(type_alias_impl_trait)]
 #![feature(associated_type_bounds)]
 #![feature(rustc_attrs)]
 #![feature(half_open_range_patterns)]
@@ -56,8 +55,12 @@
 #![feature(nonzero_ops)]
 #![feature(unwrap_infallible)]
 #![feature(decl_macro)]
+#![feature(drain_filter)]
+#![feature(intra_doc_pointers)]
+#![feature(yeet_expr)]
+#![feature(const_option)]
 #![recursion_limit = "512"]
-#![cfg_attr(not(bootstrap), allow(rustc::potential_query_instability))]
+#![allow(rustc::potential_query_instability)]
 
 #[macro_use]
 extern crate bitflags;
@@ -83,6 +86,7 @@ pub mod query;
 pub mod arena;
 #[macro_use]
 pub mod dep_graph;
+pub(crate) mod error;
 pub mod hir;
 pub mod infer;
 pub mod lint;
@@ -92,6 +96,7 @@ pub mod mir;
 pub mod thir;
 pub mod traits;
 pub mod ty;
+mod values;
 
 pub mod util {
     pub mod bug;

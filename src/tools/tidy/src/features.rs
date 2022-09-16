@@ -157,7 +157,7 @@ pub fn check(
         .collect::<Vec<_>>();
 
     for &(name, _) in gate_untested.iter() {
-        println!("Expected a gate test for the feature '{}'.", name);
+        println!("Expected a gate test for the feature '{name}'.");
         println!(
             "Hint: create a failing test file named 'feature-gate-{}.rs'\
                 \n      in the 'ui' test suite, with its failures due to\
@@ -175,6 +175,35 @@ pub fn check(
         tidy_error!(bad, "Found {} features without a gate test.", gate_untested.len());
     }
 
+    let (version, channel) = get_version_and_channel(src_path);
+
+    let all_features_iter = features
+        .iter()
+        .map(|feat| (feat, "lang"))
+        .chain(lib_features.iter().map(|feat| (feat, "lib")));
+    for ((feature_name, feature), kind) in all_features_iter {
+        let since = if let Some(since) = feature.since { since } else { continue };
+        if since > version && since != Version::CurrentPlaceholder {
+            tidy_error!(
+                bad,
+                "The stabilization version {since} of {kind} feature `{feature_name}` is newer than the current {version}"
+            );
+        }
+        if channel == "nightly" && since == version {
+            tidy_error!(
+                bad,
+                "The stabilization version {since} of {kind} feature `{feature_name}` is written out but should be {}",
+                version::VERSION_PLACEHOLDER
+            );
+        }
+        if channel != "nightly" && since == Version::CurrentPlaceholder {
+            tidy_error!(
+                bad,
+                "The placeholder use of {kind} feature `{feature_name}` is not allowed on the {channel} channel",
+            );
+        }
+    }
+
     if *bad {
         return CollectedFeatures { lib: lib_features, lang: features };
     }
@@ -186,13 +215,21 @@ pub fn check(
 
         lines.sort();
         for line in lines {
-            println!("* {}", line);
+            println!("* {line}");
         }
     } else {
         println!("* {} features", features.len());
     }
 
     CollectedFeatures { lib: lib_features, lang: features }
+}
+
+fn get_version_and_channel(src_path: &Path) -> (Version, String) {
+    let version_str = t!(std::fs::read_to_string(src_path.join("version")));
+    let version_str = version_str.trim();
+    let version = t!(std::str::FromStr::from_str(&version_str).map_err(|e| format!("{e:?}")));
+    let channel_str = t!(std::fs::read_to_string(src_path.join("ci").join("channel")));
+    (version, channel_str.trim().to_owned())
 }
 
 fn format_features<'a>(
@@ -221,7 +258,7 @@ fn find_attr_val<'a>(line: &'a str, attr: &str) -> Option<&'a str> {
         "issue" => &*ISSUE,
         "feature" => &*FEATURE,
         "since" => &*SINCE,
-        _ => unimplemented!("{} not handled", attr),
+        _ => unimplemented!("{attr} not handled"),
     };
 
     r.captures(line).and_then(|c| c.get(1)).map(|m| m.as_str())
@@ -231,7 +268,7 @@ fn test_filen_gate(filen_underscore: &str, features: &mut Features) -> bool {
     let prefix = "feature_gate_";
     if filen_underscore.starts_with(prefix) {
         for (n, f) in features.iter_mut() {
-            // Equivalent to filen_underscore == format!("feature_gate_{}", n)
+            // Equivalent to filen_underscore == format!("feature_gate_{n}")
             if &filen_underscore[prefix.len()..] == n {
                 f.has_gate_test = true;
                 return true;

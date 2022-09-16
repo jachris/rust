@@ -1,4 +1,3 @@
-#![feature(generic_associated_types)]
 #![feature(associated_type_defaults)]
 
 // A Collection trait and collection families. Based on
@@ -32,7 +31,7 @@ impl CollectionFamily for VecFamily {
 }
 
 impl<T> Collection<T> for Vec<T> {
-    type Iter<'iter> where T: 'iter = std::slice::Iter<'iter, T>;
+    type Iter<'iter> = std::slice::Iter<'iter, T> where T: 'iter;
     type Family = VecFamily;
 
     fn empty() -> Self {

@@ -1,3 +1,4 @@
+use crate::utils::internal_lints::metadata_collector::is_deprecated_lint;
 use clippy_utils::consts::{constant_simple, Constant};
 use clippy_utils::diagnostics::{span_lint, span_lint_and_help, span_lint_and_sugg, span_lint_and_then};
 use clippy_utils::macros::root_macro_call_first_node;
@@ -19,13 +20,13 @@ use rustc_hir::def_id::DefId;
 use rustc_hir::hir_id::CRATE_HIR_ID;
 use rustc_hir::intravisit::Visitor;
 use rustc_hir::{
-    BinOpKind, Block, Expr, ExprKind, HirId, Item, Local, MutTy, Mutability, Node, Path, Stmt, StmtKind, Ty, TyKind,
-    UnOp,
+    BinOpKind, Block, Closure, Expr, ExprKind, HirId, Item, Local, MutTy, Mutability, Node, Path, Stmt, StmtKind, Ty,
+    TyKind, UnOp,
 };
 use rustc_lint::{EarlyContext, EarlyLintPass, LateContext, LateLintPass, LintContext};
 use rustc_middle::hir::nested_filter;
 use rustc_middle::mir::interpret::ConstValue;
-use rustc_middle::ty;
+use rustc_middle::ty::{self, fast_reject::SimplifiedTypeGen, subst::GenericArgKind, FloatTy};
 use rustc_semver::RustcVersion;
 use rustc_session::{declare_lint_pass, declare_tool_lint, impl_lint_pass};
 use rustc_span::source_map::Spanned;
@@ -89,12 +90,11 @@ declare_clippy_lint! {
     /// warning/error messages.
     ///
     /// ### Example
-    /// Bad:
     /// ```rust,ignore
     /// cx.span_lint(LINT_NAME, "message");
     /// ```
     ///
-    /// Good:
+    /// Use instead:
     /// ```rust,ignore
     /// utils::span_lint(cx, LINT_NAME, "message");
     /// ```
@@ -112,12 +112,11 @@ declare_clippy_lint! {
     /// `cx.outer_expn_data()` is faster and more concise.
     ///
     /// ### Example
-    /// Bad:
     /// ```rust,ignore
     /// expr.span.ctxt().outer().expn_data()
     /// ```
     ///
-    /// Good:
+    /// Use instead:
     /// ```rust,ignore
     /// expr.span.ctxt().outer_expn_data()
     /// ```
@@ -135,7 +134,6 @@ declare_clippy_lint! {
     /// ICE in large quantities can damage your teeth
     ///
     /// ### Example
-    /// Bad:
     /// ```rust,ignore
     /// 🍦🍦🍦🍦🍦
     /// ```
@@ -153,12 +151,11 @@ declare_clippy_lint! {
     /// Indicates that the lint is not finished.
     ///
     /// ### Example
-    /// Bad:
     /// ```rust,ignore
     /// declare_lint! { pub COOL_LINT, nursery, "default lint description" }
     /// ```
     ///
-    /// Good:
+    /// Use instead:
     /// ```rust,ignore
     /// declare_lint! { pub COOL_LINT, nursery, "a great new lint" }
     /// ```
@@ -183,7 +180,6 @@ declare_clippy_lint! {
     /// convenient, readable and less error prone.
     ///
     /// ### Example
-    /// Bad:
     /// ```rust,ignore
     /// span_lint_and_then(cx, TEST_LINT, expr.span, lint_msg, |diag| {
     ///     diag.span_suggestion(
@@ -207,7 +203,7 @@ declare_clippy_lint! {
     /// });
     /// ```
     ///
-    /// Good:
+    /// Use instead:
     /// ```rust,ignore
     /// span_lint_and_sugg(
     ///     cx,
@@ -237,12 +233,11 @@ declare_clippy_lint! {
     /// `utils::is_type_diagnostic_item()` does not require hardcoded paths.
     ///
     /// ### Example
-    /// Bad:
     /// ```rust,ignore
     /// utils::match_type(cx, ty, &paths::VEC)
     /// ```
     ///
-    /// Good:
+    /// Use instead:
     /// ```rust,ignore
     /// utils::is_type_diagnostic_item(cx, ty, sym::Vec)
     /// ```
@@ -273,12 +268,11 @@ declare_clippy_lint! {
     /// It's faster and easier to use the symbol constant.
     ///
     /// ### Example
-    /// Bad:
     /// ```rust,ignore
     /// let _ = sym!(f32);
     /// ```
     ///
-    /// Good:
+    /// Use instead:
     /// ```rust,ignore
     /// let _ = sym::f32;
     /// ```
@@ -292,15 +286,14 @@ declare_clippy_lint! {
     /// Checks for unnecessary conversion from Symbol to a string.
     ///
     /// ### Why is this bad?
-    /// It's faster use symbols directly intead of strings.
+    /// It's faster use symbols directly instead of strings.
     ///
     /// ### Example
-    /// Bad:
     /// ```rust,ignore
     /// symbol.as_str() == "clippy";
     /// ```
     ///
-    /// Good:
+    /// Use instead:
     /// ```rust,ignore
     /// symbol == sym::clippy;
     /// ```
@@ -335,6 +328,55 @@ declare_clippy_lint! {
     pub MISSING_CLIPPY_VERSION_ATTRIBUTE,
     internal,
     "found clippy lint without `clippy::version` attribute"
+}
+
+declare_clippy_lint! {
+    /// ### What it does
+    /// Check that the `extract_msrv_attr!` macro is used, when a lint has a MSRV.
+    ///
+    pub MISSING_MSRV_ATTR_IMPL,
+    internal,
+    "checking if all necessary steps were taken when adding a MSRV to a lint"
+}
+
+declare_clippy_lint! {
+    /// ### What it does
+    /// Checks for cases of an auto-generated deprecated lint without an updated reason,
+    /// i.e. `"default deprecation note"`.
+    ///
+    /// ### Why is this bad?
+    /// Indicates that the documentation is incomplete.
+    ///
+    /// ### Example
+    /// ```rust,ignore
+    /// declare_deprecated_lint! {
+    ///     /// ### What it does
+    ///     /// Nothing. This lint has been deprecated.
+    ///     ///
+    ///     /// ### Deprecation reason
+    ///     /// TODO
+    ///     #[clippy::version = "1.63.0"]
+    ///     pub COOL_LINT,
+    ///     "default deprecation note"
+    /// }
+    /// ```
+    ///
+    /// Use instead:
+    /// ```rust,ignore
+    /// declare_deprecated_lint! {
+    ///     /// ### What it does
+    ///     /// Nothing. This lint has been deprecated.
+    ///     ///
+    ///     /// ### Deprecation reason
+    ///     /// This lint has been replaced by `cooler_lint`
+    ///     #[clippy::version = "1.63.0"]
+    ///     pub COOL_LINT,
+    ///     "this lint has been replaced by `cooler_lint`"
+    /// }
+    /// ```
+    pub DEFAULT_DEPRECATION_REASON,
+    internal,
+    "found 'default deprecation note' in a deprecated lint declaration"
 }
 
 declare_lint_pass!(ClippyLintsInternal => [CLIPPY_LINTS_INTERNAL]);
@@ -374,46 +416,71 @@ pub struct LintWithoutLintPass {
     registered_lints: FxHashSet<Symbol>,
 }
 
-impl_lint_pass!(LintWithoutLintPass => [DEFAULT_LINT, LINT_WITHOUT_LINT_PASS, INVALID_CLIPPY_VERSION_ATTRIBUTE, MISSING_CLIPPY_VERSION_ATTRIBUTE]);
+impl_lint_pass!(LintWithoutLintPass => [DEFAULT_LINT, LINT_WITHOUT_LINT_PASS, INVALID_CLIPPY_VERSION_ATTRIBUTE, MISSING_CLIPPY_VERSION_ATTRIBUTE, DEFAULT_DEPRECATION_REASON]);
 
 impl<'tcx> LateLintPass<'tcx> for LintWithoutLintPass {
     fn check_item(&mut self, cx: &LateContext<'tcx>, item: &'tcx Item<'_>) {
-        if is_lint_allowed(cx, DEFAULT_LINT, item.hir_id()) {
+        if is_lint_allowed(cx, DEFAULT_LINT, item.hir_id())
+            || is_lint_allowed(cx, DEFAULT_DEPRECATION_REASON, item.hir_id())
+        {
             return;
         }
 
         if let hir::ItemKind::Static(ty, Mutability::Not, body_id) = item.kind {
-            if is_lint_ref_type(cx, ty) {
+            let is_lint_ref_ty = is_lint_ref_type(cx, ty);
+            if is_deprecated_lint(cx, ty) || is_lint_ref_ty {
                 check_invalid_clippy_version_attribute(cx, item);
 
                 let expr = &cx.tcx.hir().body(body_id).value;
-                if_chain! {
-                    if let ExprKind::AddrOf(_, _, inner_exp) = expr.kind;
-                    if let ExprKind::Struct(_, fields, _) = inner_exp.kind;
-                    let field = fields
-                        .iter()
-                        .find(|f| f.ident.as_str() == "desc")
-                        .expect("lints must have a description field");
-                    if let ExprKind::Lit(Spanned {
-                        node: LitKind::Str(ref sym, _),
-                        ..
-                    }) = field.expr.kind;
-                    if sym.as_str() == "default lint description";
+                let fields;
+                if is_lint_ref_ty {
+                    if let ExprKind::AddrOf(_, _, inner_exp) = expr.kind
+                        && let ExprKind::Struct(_, struct_fields, _) = inner_exp.kind {
+                            fields = struct_fields;
+                    } else {
+                        return;
+                    }
+                } else if let ExprKind::Struct(_, struct_fields, _) = expr.kind {
+                    fields = struct_fields;
+                } else {
+                    return;
+                }
 
-                    then {
+                let field = fields
+                    .iter()
+                    .find(|f| f.ident.as_str() == "desc")
+                    .expect("lints must have a description field");
+
+                if let ExprKind::Lit(Spanned {
+                    node: LitKind::Str(ref sym, _),
+                    ..
+                }) = field.expr.kind
+                {
+                    let sym_str = sym.as_str();
+                    if is_lint_ref_ty {
+                        if sym_str == "default lint description" {
+                            span_lint(
+                                cx,
+                                DEFAULT_LINT,
+                                item.span,
+                                &format!("the lint `{}` has the default lint description", item.ident.name),
+                            );
+                        }
+
+                        self.declared_lints.insert(item.ident.name, item.span);
+                    } else if sym_str == "default deprecation note" {
                         span_lint(
                             cx,
-                            DEFAULT_LINT,
+                            DEFAULT_DEPRECATION_REASON,
                             item.span,
-                            &format!("the lint `{}` has the default lint description", item.ident.name),
+                            &format!("the lint `{}` has the default deprecation reason", item.ident.name),
                         );
                     }
                 }
-                self.declared_lints.insert(item.ident.name, item.span);
             }
         } else if let Some(macro_call) = root_macro_call_first_node(cx, item) {
             if !matches!(
-                &*cx.tcx.item_name(macro_call.def_id).as_str(),
+                cx.tcx.item_name(macro_call.def_id).as_str(),
                 "impl_lint_pass" | "declare_lint_pass"
             ) {
                 return;
@@ -429,14 +496,16 @@ impl<'tcx> LateLintPass<'tcx> for LintWithoutLintPass {
                     cx,
                 };
                 let body_id = cx.tcx.hir().body_owned_by(
-                    impl_item_refs
-                        .iter()
-                        .find(|iiref| iiref.ident.as_str() == "get_lints")
-                        .expect("LintPass needs to implement get_lints")
-                        .id
-                        .hir_id(),
+                    cx.tcx.hir().local_def_id(
+                        impl_item_refs
+                            .iter()
+                            .find(|iiref| iiref.ident.as_str() == "get_lints")
+                            .expect("LintPass needs to implement get_lints")
+                            .id
+                            .hir_id(),
+                    ),
                 );
-                collector.visit_expr(&cx.tcx.hir().body(body_id).value);
+                collector.visit_expr(cx.tcx.hir().body(body_id).value);
             }
         }
     }
@@ -495,14 +564,14 @@ fn check_invalid_clippy_version_attribute(cx: &LateContext<'_>, item: &'_ Item<'
             return;
         }
 
-        if RustcVersion::parse(&*value.as_str()).is_err() {
+        if RustcVersion::parse(value.as_str()).is_err() {
             span_lint_and_help(
                 cx,
                 INVALID_CLIPPY_VERSION_ATTRIBUTE,
                 item.span,
                 "this item has an invalid `clippy::version` attribute",
                 None,
-                "please use a valid sematic version, see `doc/adding_lints.md`",
+                "please use a valid semantic version, see `doc/adding_lints.md`",
             );
         }
     } else {
@@ -524,8 +593,8 @@ fn extract_clippy_version_value(cx: &LateContext<'_>, item: &'_ Item<'_>) -> Opt
     attrs.iter().find_map(|attr| {
         if_chain! {
             // Identify attribute
-            if let ast::AttrKind::Normal(ref attr_kind, _) = &attr.kind;
-            if let [tool_name, attr_name] = &attr_kind.path.segments[..];
+            if let ast::AttrKind::Normal(ref attr_kind) = &attr.kind;
+            if let [tool_name, attr_name] = &attr_kind.item.path.segments[..];
             if tool_name.ident.name == sym::clippy;
             if attr_name.ident.name == sym::version;
             if let Some(version) = attr.value_str();
@@ -584,9 +653,9 @@ impl<'tcx> LateLintPass<'tcx> for CompilerLintFunctions {
         }
 
         if_chain! {
-            if let ExprKind::MethodCall(path, [self_arg, ..], _) = &expr.kind;
+            if let ExprKind::MethodCall(path, self_arg, _, _) = &expr.kind;
             let fn_name = path.ident;
-            if let Some(sugg) = self.map.get(&*fn_name.as_str());
+            if let Some(sugg) = self.map.get(fn_name.as_str());
             let ty = cx.typeck_results().expr_ty(self_arg).peel_refs();
             if match_type(cx, ty, &paths::EARLY_CONTEXT)
                 || match_type(cx, ty, &paths::LATE_CONTEXT);
@@ -616,9 +685,8 @@ impl<'tcx> LateLintPass<'tcx> for OuterExpnDataPass {
         let method_names: Vec<&str> = method_names.iter().map(Symbol::as_str).collect();
         if_chain! {
             if let ["expn_data", "outer_expn"] = method_names.as_slice();
-            let args = arg_lists[1];
-            if args.len() == 1;
-            let self_arg = &args[0];
+            let (self_arg, args)= arg_lists[1];
+            if args.is_empty();
             let self_ty = cx.typeck_results().expr_ty(self_arg).peel_refs();
             if match_type(cx, self_ty, &paths::SYNTAX_CONTEXT);
             then {
@@ -663,31 +731,32 @@ impl<'tcx> LateLintPass<'tcx> for CollapsibleCalls {
             if let ExprKind::Call(func, and_then_args) = expr.kind;
             if is_expr_path_def_path(cx, func, &["clippy_utils", "diagnostics", "span_lint_and_then"]);
             if and_then_args.len() == 5;
-            if let ExprKind::Closure(_, _, body_id, _, _) = &and_then_args[4].kind;
-            let body = cx.tcx.hir().body(*body_id);
-            let only_expr = peel_blocks_with_stmt(&body.value);
-            if let ExprKind::MethodCall(ps, span_call_args, _) = &only_expr.kind;
+            if let ExprKind::Closure(&Closure { body, .. }) = &and_then_args[4].kind;
+            let body = cx.tcx.hir().body(body);
+            let only_expr = peel_blocks_with_stmt(body.value);
+            if let ExprKind::MethodCall(ps, recv, span_call_args, _) = &only_expr.kind;
+            if let ExprKind::Path(..) = recv.kind;
             then {
                 let and_then_snippets = get_and_then_snippets(cx, and_then_args);
                 let mut sle = SpanlessEq::new(cx).deny_side_effects();
-                match &*ps.ident.as_str() {
-                    "span_suggestion" if sle.eq_expr(&and_then_args[2], &span_call_args[1]) => {
+                match ps.ident.as_str() {
+                    "span_suggestion" if sle.eq_expr(&and_then_args[2], &span_call_args[0]) => {
                         suggest_suggestion(cx, expr, &and_then_snippets, &span_suggestion_snippets(cx, span_call_args));
                     },
-                    "span_help" if sle.eq_expr(&and_then_args[2], &span_call_args[1]) => {
-                        let help_snippet = snippet(cx, span_call_args[2].span, r#""...""#);
+                    "span_help" if sle.eq_expr(&and_then_args[2], &span_call_args[0]) => {
+                        let help_snippet = snippet(cx, span_call_args[1].span, r#""...""#);
                         suggest_help(cx, expr, &and_then_snippets, help_snippet.borrow(), true);
                     },
-                    "span_note" if sle.eq_expr(&and_then_args[2], &span_call_args[1]) => {
-                        let note_snippet = snippet(cx, span_call_args[2].span, r#""...""#);
+                    "span_note" if sle.eq_expr(&and_then_args[2], &span_call_args[0]) => {
+                        let note_snippet = snippet(cx, span_call_args[1].span, r#""...""#);
                         suggest_note(cx, expr, &and_then_snippets, note_snippet.borrow(), true);
                     },
                     "help" => {
-                        let help_snippet = snippet(cx, span_call_args[1].span, r#""...""#);
+                        let help_snippet = snippet(cx, span_call_args[0].span, r#""...""#);
                         suggest_help(cx, expr, &and_then_snippets, help_snippet.borrow(), false);
                     }
                     "note" => {
-                        let note_snippet = snippet(cx, span_call_args[1].span, r#""...""#);
+                        let note_snippet = snippet(cx, span_call_args[0].span, r#""...""#);
                         suggest_note(cx, expr, &and_then_snippets, note_snippet.borrow(), false);
                     }
                     _  => (),
@@ -728,9 +797,9 @@ fn span_suggestion_snippets<'a, 'hir>(
     cx: &LateContext<'_>,
     span_call_args: &'hir [Expr<'hir>],
 ) -> SpanSuggestionSnippets<'a> {
-    let help_snippet = snippet(cx, span_call_args[2].span, r#""...""#);
-    let sugg_snippet = snippet(cx, span_call_args[3].span, "..");
-    let applicability_snippet = snippet(cx, span_call_args[4].span, "Applicability::MachineApplicable");
+    let help_snippet = snippet(cx, span_call_args[1].span, r#""...""#);
+    let sugg_snippet = snippet(cx, span_call_args[2].span, "..");
+    let applicability_snippet = snippet(cx, span_call_args[3].span, "Applicability::MachineApplicable");
 
     SpanSuggestionSnippets {
         help: help_snippet,
@@ -814,7 +883,7 @@ fn suggest_note(
         cx,
         COLLAPSIBLE_SPAN_LINT_CALLS,
         expr.span,
-        "this call is collspible",
+        "this call is collapsible",
         "collapse into",
         format!(
             "span_lint_and_note({}, {}, {}, {}, {}, {})",
@@ -880,11 +949,11 @@ fn path_to_matched_type(cx: &LateContext<'_>, expr: &hir::Expr<'_>) -> Option<Ve
                     }
                 }
             },
-            Res::Def(DefKind::Const | DefKind::Static, def_id) => {
+            Res::Def(DefKind::Const | DefKind::Static(..), def_id) => {
                 if let Some(Node::Item(item)) = cx.tcx.hir().get_if_local(def_id) {
                     if let ItemKind::Const(.., body_id) | ItemKind::Static(.., body_id) = item.kind {
                         let body = cx.tcx.hir().body(body_id);
-                        return path_to_matched_type(cx, &body.value);
+                        return path_to_matched_type(cx, body.value);
                     }
                 }
             },
@@ -925,7 +994,16 @@ pub fn check_path(cx: &LateContext<'_>, path: &[&str]) -> bool {
     // implementations of native types. Check lang items.
     let path_syms: Vec<_> = path.iter().map(|p| Symbol::intern(p)).collect();
     let lang_items = cx.tcx.lang_items();
-    for item_def_id in lang_items.items().iter().flatten() {
+    // This list isn't complete, but good enough for our current list of paths.
+    let incoherent_impls = [
+        SimplifiedTypeGen::FloatSimplifiedType(FloatTy::F32),
+        SimplifiedTypeGen::FloatSimplifiedType(FloatTy::F64),
+        SimplifiedTypeGen::SliceSimplifiedType,
+        SimplifiedTypeGen::StrSimplifiedType,
+    ]
+    .iter()
+    .flat_map(|&ty| cx.tcx.incoherent_impls(ty));
+    for item_def_id in lang_items.items().iter().flatten().chain(incoherent_impls) {
         let lang_item_path = cx.get_def_path(*item_def_id);
         if path_syms.starts_with(&lang_item_path) {
             if let [item] = &path_syms[lang_item_path.len()..] {
@@ -967,7 +1045,7 @@ impl<'tcx> LateLintPass<'tcx> for InvalidPaths {
             if el_ty.is_str();
             let body = cx.tcx.hir().body(body_id);
             let typeck_results = cx.tcx.typeck_body(body_id);
-            if let Some(Constant::Vec(path)) = constant_simple(cx, typeck_results, &body.value);
+            if let Some(Constant::Vec(path)) = constant_simple(cx, typeck_results, body.value);
             let path: Vec<&str> = path.iter().map(|x| {
                     if let Constant::Str(s) = x {
                         s.as_str()
@@ -1098,7 +1176,7 @@ impl InterningDefinedSymbol {
         };
         if_chain! {
             // is a method call
-            if let ExprKind::MethodCall(_, [item], _) = call.kind;
+            if let ExprKind::MethodCall(_, item, [], _) = call.kind;
             if let Some(did) = cx.typeck_results().type_dependent_def_id(call.hir_id);
             let ty = cx.typeck_results().expr_ty(item);
             // ...on either an Ident or a Symbol
@@ -1305,7 +1383,7 @@ fn if_chain_local_span(cx: &LateContext<'_>, local: &Local<'_>, if_chain_span: S
     }
     span.adjust(if_chain_span.ctxt().outer_expn());
     let sm = cx.sess().source_map();
-    let span = sm.span_extend_to_prev_str(span, "let", false);
+    let span = sm.span_extend_to_prev_str(span, "let", false, true).unwrap_or(span);
     let span = sm.span_extend_to_next_char(span, ';', false);
     Span::new(
         span.lo() - BytePos(3),
@@ -1313,4 +1391,47 @@ fn if_chain_local_span(cx: &LateContext<'_>, local: &Local<'_>, if_chain_span: S
         span.ctxt(),
         span.parent(),
     )
+}
+
+declare_lint_pass!(MsrvAttrImpl => [MISSING_MSRV_ATTR_IMPL]);
+
+impl LateLintPass<'_> for MsrvAttrImpl {
+    fn check_item(&mut self, cx: &LateContext<'_>, item: &hir::Item<'_>) {
+        if_chain! {
+            if let hir::ItemKind::Impl(hir::Impl {
+                of_trait: Some(lint_pass_trait_ref),
+                self_ty,
+                items,
+                ..
+            }) = &item.kind;
+            if let Some(lint_pass_trait_def_id) = lint_pass_trait_ref.trait_def_id();
+            let is_late_pass = match_def_path(cx, lint_pass_trait_def_id, &paths::LATE_LINT_PASS);
+            if is_late_pass || match_def_path(cx, lint_pass_trait_def_id, &paths::EARLY_LINT_PASS);
+            let self_ty = hir_ty_to_ty(cx.tcx, self_ty);
+            if let ty::Adt(self_ty_def, _) = self_ty.kind();
+            if self_ty_def.is_struct();
+            if self_ty_def.all_fields().any(|f| {
+                cx.tcx
+                    .type_of(f.did)
+                    .walk()
+                    .filter(|t| matches!(t.unpack(), GenericArgKind::Type(_)))
+                    .any(|t| match_type(cx, t.expect_ty(), &paths::RUSTC_VERSION))
+            });
+            if !items.iter().any(|item| item.ident.name == sym!(enter_lint_attrs));
+            then {
+                let context = if is_late_pass { "LateContext" } else { "EarlyContext" };
+                let lint_pass = if is_late_pass { "LateLintPass" } else { "EarlyLintPass" };
+                let span = cx.sess().source_map().span_through_char(item.span, '{');
+                span_lint_and_sugg(
+                    cx,
+                    MISSING_MSRV_ATTR_IMPL,
+                    span,
+                    &format!("`extract_msrv_attr!` macro missing from `{lint_pass}` implementation"),
+                    &format!("add `extract_msrv_attr!({context})` to the `{lint_pass}` implementation"),
+                    format!("{}\n    extract_msrv_attr!({context});", snippet(cx, span, "..")),
+                    Applicability::MachineApplicable,
+                );
+            }
+        }
+    }
 }

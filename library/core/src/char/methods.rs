@@ -7,7 +7,6 @@ use crate::unicode::{self, conversions};
 
 use super::*;
 
-#[lang = "char"]
 impl char {
     /// The highest valid code point a `char` can have, `'\u{10FFFF}'`.
     ///
@@ -344,10 +343,10 @@ impl char {
                   without modifying the original"]
     #[inline]
     pub const fn to_digit(self, radix: u32) -> Option<u32> {
-        assert!(radix <= 36, "to_digit: radix is too high (maximum 36)");
         // If not a digit, a number greater than radix will be created.
         let mut digit = (self as u32).wrapping_sub('0' as u32);
         if radix > 10 {
+            assert!(radix <= 36, "to_digit: radix is too high (maximum 36)");
             if digit < 10 {
                 return Some(digit);
             }
@@ -370,7 +369,7 @@ impl char {
     ///
     /// ```
     /// for c in '❤'.escape_unicode() {
-    ///     print!("{}", c);
+    ///     print!("{c}");
     /// }
     /// println!();
     /// ```
@@ -421,6 +420,7 @@ impl char {
     #[inline]
     pub(crate) fn escape_debug_ext(self, args: EscapeDebugExtArgs) -> EscapeDebug {
         let init_state = match self {
+            '\0' => EscapeDefaultState::Backslash('0'),
             '\t' => EscapeDefaultState::Backslash('t'),
             '\r' => EscapeDefaultState::Backslash('r'),
             '\n' => EscapeDefaultState::Backslash('n'),
@@ -448,7 +448,7 @@ impl char {
     ///
     /// ```
     /// for c in '\n'.escape_debug() {
-    ///     print!("{}", c);
+    ///     print!("{c}");
     /// }
     /// println!();
     /// ```
@@ -504,7 +504,7 @@ impl char {
     ///
     /// ```
     /// for c in '"'.escape_default() {
-    ///     print!("{}", c);
+    ///     print!("{c}");
     /// }
     /// println!();
     /// ```
@@ -746,10 +746,19 @@ impl char {
     /// assert!(!'中'.is_lowercase());
     /// assert!(!' '.is_lowercase());
     /// ```
+    ///
+    /// In a const context:
+    ///
+    /// ```
+    /// #![feature(const_unicode_case_lookup)]
+    /// const CAPITAL_DELTA_IS_LOWERCASE: bool = 'Δ'.is_lowercase();
+    /// assert!(!CAPITAL_DELTA_IS_LOWERCASE);
+    /// ```
     #[must_use]
     #[stable(feature = "rust1", since = "1.0.0")]
+    #[rustc_const_unstable(feature = "const_unicode_case_lookup", issue = "101400")]
     #[inline]
-    pub fn is_lowercase(self) -> bool {
+    pub const fn is_lowercase(self) -> bool {
         match self {
             'a'..='z' => true,
             c => c > '\x7f' && unicode::Lowercase(c),
@@ -779,10 +788,19 @@ impl char {
     /// assert!(!'中'.is_uppercase());
     /// assert!(!' '.is_uppercase());
     /// ```
+    ///
+    /// In a const context:
+    ///
+    /// ```
+    /// #![feature(const_unicode_case_lookup)]
+    /// const CAPITAL_DELTA_IS_UPPERCASE: bool = 'Δ'.is_uppercase();
+    /// assert!(CAPITAL_DELTA_IS_UPPERCASE);
+    /// ```
     #[must_use]
     #[stable(feature = "rust1", since = "1.0.0")]
+    #[rustc_const_unstable(feature = "const_unicode_case_lookup", issue = "101400")]
     #[inline]
-    pub fn is_uppercase(self) -> bool {
+    pub const fn is_uppercase(self) -> bool {
         match self {
             'A'..='Z' => true,
             c => c > '\x7f' && unicode::Uppercase(c),
@@ -802,6 +820,9 @@ impl char {
     ///
     /// ```
     /// assert!(' '.is_whitespace());
+    ///
+    /// // line break
+    /// assert!('\n'.is_whitespace());
     ///
     /// // a non-breaking space
     /// assert!('\u{A0}'.is_whitespace());
@@ -891,6 +912,14 @@ impl char {
     /// characters, and `No` for other numeric characters) are specified in the [Unicode Character
     /// Database][ucd] [`UnicodeData.txt`].
     ///
+    /// This method doesn't cover everything that could be considered a number, e.g. ideographic numbers like '三'.
+    /// If you want everything including characters with overlapping purposes then you might want to use
+    /// a unicode or language-processing library that exposes the appropriate character properties instead
+    /// of looking at the unicode categories.
+    ///
+    /// If you want to parse ASCII decimal digits (0-9) or ASCII base-N, use
+    /// `is_ascii_digit` or `is_digit` instead.
+    ///
     /// [Unicode Standard]: https://www.unicode.org/versions/latest/
     /// [ucd]: https://www.unicode.org/reports/tr44/
     /// [`UnicodeData.txt`]: https://www.unicode.org/Public/UCD/latest/ucd/UnicodeData.txt
@@ -908,6 +937,7 @@ impl char {
     /// assert!(!'K'.is_numeric());
     /// assert!(!'و'.is_numeric());
     /// assert!(!'藏'.is_numeric());
+    /// assert!(!'三'.is_numeric());
     /// ```
     #[must_use]
     #[stable(feature = "rust1", since = "1.0.0")]
@@ -949,7 +979,7 @@ impl char {
     ///
     /// ```
     /// for c in 'İ'.to_lowercase() {
-    ///     print!("{}", c);
+    ///     print!("{c}");
     /// }
     /// println!();
     /// ```
@@ -1016,7 +1046,7 @@ impl char {
     ///
     /// ```
     /// for c in 'ß'.to_uppercase() {
-    ///     print!("{}", c);
+    ///     print!("{c}");
     /// }
     /// println!();
     /// ```
@@ -1091,7 +1121,7 @@ impl char {
     /// ```
     #[must_use]
     #[stable(feature = "ascii_methods_on_intrinsics", since = "1.23.0")]
-    #[rustc_const_stable(feature = "const_ascii_methods_on_intrinsics", since = "1.32.0")]
+    #[rustc_const_stable(feature = "const_char_is_ascii", since = "1.32.0")]
     #[inline]
     pub const fn is_ascii(&self) -> bool {
         *self as u32 <= 0x7F

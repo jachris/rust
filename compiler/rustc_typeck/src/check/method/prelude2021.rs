@@ -148,7 +148,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     let trait_name = self.trait_path_or_bare_name(
                         span,
                         call_expr.hir_id,
-                        pick.item.container.id(),
+                        pick.item.container_id(self.tcx),
                     );
 
                     let mut lint = lint.build(&format!(
@@ -160,7 +160,6 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     if precise {
                         let args = args
                             .iter()
-                            .skip(1)
                             .map(|arg| {
                                 let span = arg.span.find_ancestor_inside(sp).unwrap_or_default();
                                 format!(
@@ -261,8 +260,9 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         self.tcx.struct_span_lint_hir(RUST_2021_PRELUDE_COLLISIONS, expr_id, span, |lint| {
             // "type" refers to either a type or, more likely, a trait from which
             // the associated function or method is from.
-            let trait_path = self.trait_path_or_bare_name(span, expr_id, pick.item.container.id());
-            let trait_generics = self.tcx.generics_of(pick.item.container.id());
+            let container_id = pick.item.container_id(self.tcx);
+            let trait_path = self.trait_path_or_bare_name(span, expr_id, container_id);
+            let trait_generics = self.tcx.generics_of(container_id);
 
             let trait_name =
                 if trait_generics.params.len() <= trait_generics.has_self as usize {
@@ -297,7 +297,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             // for a "<" in `self_ty_name`.
             if !self_ty_name.contains('<') {
                 if let Adt(def, _) = self_ty.kind() {
-                    let generics = self.tcx.generics_of(def.did);
+                    let generics = self.tcx.generics_of(def.did());
                     if !generics.params.is_empty() {
                         let counts = generics.own_counts();
                         self_ty_name += &format!(
@@ -379,7 +379,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     }
 
     /// Creates a string version of the `expr` that includes explicit adjustments.
-    /// Returns the string and also a bool indicating whther this is a *precise*
+    /// Returns the string and also a bool indicating whether this is a *precise*
     /// suggestion.
     fn adjust_expr(
         &self,

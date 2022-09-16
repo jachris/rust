@@ -1,8 +1,11 @@
 use clippy_utils::diagnostics::span_lint;
 use clippy_utils::qualify_min_const_fn::is_min_const_fn;
 use clippy_utils::ty::has_drop;
-use clippy_utils::{fn_has_unsatisfiable_preds, is_entrypoint_fn, meets_msrv, msrvs, trait_ref_of_method};
+use clippy_utils::{
+    fn_has_unsatisfiable_preds, is_entrypoint_fn, is_from_proc_macro, meets_msrv, msrvs, trait_ref_of_method,
+};
 use rustc_hir as hir;
+use rustc_hir::def_id::CRATE_DEF_ID;
 use rustc_hir::intravisit::FnKind;
 use rustc_hir::{Body, Constness, FnDecl, GenericParamKind, HirId};
 use rustc_lint::{LateContext, LateLintPass};
@@ -85,14 +88,14 @@ impl MissingConstForFn {
 impl<'tcx> LateLintPass<'tcx> for MissingConstForFn {
     fn check_fn(
         &mut self,
-        cx: &LateContext<'_>,
-        kind: FnKind<'_>,
+        cx: &LateContext<'tcx>,
+        kind: FnKind<'tcx>,
         _: &FnDecl<'_>,
-        _: &Body<'_>,
+        body: &Body<'tcx>,
         span: Span,
         hir_id: HirId,
     ) {
-        if !meets_msrv(self.msrv.as_ref(), &msrvs::CONST_IF_MATCH) {
+        if !meets_msrv(self.msrv, msrvs::CONST_IF_MATCH) {
             return;
         }
 
@@ -123,7 +126,7 @@ impl<'tcx> LateLintPass<'tcx> for MissingConstForFn {
             FnKind::Method(_, sig, ..) => {
                 if trait_ref_of_method(cx, def_id).is_some()
                     || already_const(sig.header)
-                    || method_accepts_dropable(cx, sig.decl.inputs)
+                    || method_accepts_droppable(cx, sig.decl.inputs)
                 {
                     return;
                 }
@@ -131,11 +134,27 @@ impl<'tcx> LateLintPass<'tcx> for MissingConstForFn {
             FnKind::Closure => return,
         }
 
+        // Const fns are not allowed as methods in a trait.
+        {
+            let parent = cx.tcx.hir().get_parent_item(hir_id);
+            if parent != CRATE_DEF_ID {
+                if let hir::Node::Item(item) = cx.tcx.hir().get_by_def_id(parent) {
+                    if let hir::ItemKind::Trait(..) = &item.kind {
+                        return;
+                    }
+                }
+            }
+        }
+
+        if is_from_proc_macro(cx, &(&kind, body, hir_id, span)) {
+            return;
+        }
+
         let mir = cx.tcx.optimized_mir(def_id);
 
-        if let Err((span, err)) = is_min_const_fn(cx.tcx, mir, self.msrv.as_ref()) {
+        if let Err((span, err)) = is_min_const_fn(cx.tcx, mir, self.msrv) {
             if cx.tcx.is_const_fn_raw(def_id.to_def_id()) {
-                cx.tcx.sess.span_err(span, &err);
+                cx.tcx.sess.span_err(span, err.as_ref());
             }
         } else {
             span_lint(cx, MISSING_CONST_FOR_FN, span, "this could be a `const fn`");
@@ -146,7 +165,7 @@ impl<'tcx> LateLintPass<'tcx> for MissingConstForFn {
 
 /// Returns true if any of the method parameters is a type that implements `Drop`. The method
 /// can't be made const then, because `drop` can't be const-evaluated.
-fn method_accepts_dropable(cx: &LateContext<'_>, param_tys: &[hir::Ty<'_>]) -> bool {
+fn method_accepts_droppable(cx: &LateContext<'_>, param_tys: &[hir::Ty<'_>]) -> bool {
     // If any of the params are droppable, return true
     param_tys.iter().any(|hir_ty| {
         let ty_ty = hir_ty_to_ty(cx.tcx, hir_ty);

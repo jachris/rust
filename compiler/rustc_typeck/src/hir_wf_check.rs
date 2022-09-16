@@ -1,9 +1,8 @@
 use crate::collect::ItemCtxt;
 use rustc_hir as hir;
 use rustc_hir::intravisit::{self, Visitor};
-use rustc_hir::HirId;
+use rustc_hir::{ForeignItem, ForeignItemKind, HirId};
 use rustc_infer::infer::TyCtxtInferExt;
-use rustc_infer::traits::TraitEngine;
 use rustc_infer::traits::{ObligationCause, WellFormedLoc};
 use rustc_middle::ty::query::Providers;
 use rustc_middle::ty::{self, Region, ToPredicate, TyCtxt, TypeFoldable, TypeFolder};
@@ -66,15 +65,14 @@ fn diagnostic_hir_wf_check<'tcx>(
     impl<'tcx> Visitor<'tcx> for HirWfCheck<'tcx> {
         fn visit_ty(&mut self, ty: &'tcx hir::Ty<'tcx>) {
             self.tcx.infer_ctxt().enter(|infcx| {
-                let mut fulfill = traits::FulfillmentContext::new();
                 let tcx_ty =
                     self.icx.to_ty(ty).fold_with(&mut EraseAllBoundRegions { tcx: self.tcx });
                 let cause = traits::ObligationCause::new(
                     ty.span,
                     self.hir_id,
-                    traits::ObligationCauseCode::MiscObligation,
+                    traits::ObligationCauseCode::WellFormed(None),
                 );
-                fulfill.register_predicate_obligation(
+                let errors = traits::fully_solve_obligation(
                     &infcx,
                     traits::Obligation::new(
                         cause,
@@ -83,10 +81,8 @@ fn diagnostic_hir_wf_check<'tcx>(
                             .to_predicate(self.tcx),
                     ),
                 );
-
-                let errors = fulfill.select_all_or_error(&infcx);
                 if !errors.is_empty() {
-                    tracing::debug!("Wf-check got errors for {:?}: {:?}", ty, errors);
+                    debug!("Wf-check got errors for {:?}: {:?}", ty, errors);
                     for error in errors {
                         if error.obligation.predicate == self.predicate {
                             // Save the cause from the greatest depth - this corresponds
@@ -141,6 +137,13 @@ fn diagnostic_hir_wf_check<'tcx>(
                 ref item => bug!("Unexpected item {:?}", item),
             },
             hir::Node::Field(field) => Some(field.ty),
+            hir::Node::ForeignItem(ForeignItem {
+                kind: ForeignItemKind::Static(ty, _), ..
+            }) => Some(*ty),
+            hir::Node::GenericParam(hir::GenericParam {
+                kind: hir::GenericParamKind::Type { default: Some(ty), .. },
+                ..
+            }) => Some(*ty),
             ref node => bug!("Unexpected node {:?}", node),
         },
         WellFormedLoc::Param { function: _, param_idx } => {
@@ -173,7 +176,7 @@ struct EraseAllBoundRegions<'tcx> {
 // `ItemCtxt::to_ty`. To make things simpler, we just erase all
 // of them, regardless of depth. At worse, this will give
 // us an inaccurate span for an error message, but cannot
-// lead to unsoundess (we call `delay_span_bug` at the start
+// lead to unsoundness (we call `delay_span_bug` at the start
 // of `diagnostic_hir_wf_check`).
 impl<'tcx> TypeFolder<'tcx> for EraseAllBoundRegions<'tcx> {
     fn tcx<'a>(&'a self) -> TyCtxt<'tcx> {

@@ -20,13 +20,9 @@ pub(crate) fn emit_unescape_error(
     range: Range<usize>,
     error: EscapeError,
 ) {
-    tracing::debug!(
+    debug!(
         "emit_unescape_error: {:?}, {:?}, {:?}, {:?}, {:?}",
-        lit,
-        span_with_quotes,
-        mode,
-        range,
-        error
+        lit, span_with_quotes, mode, range, error
     );
     let last_char = || {
         let c = lit[range.clone()].chars().rev().next().unwrap();
@@ -105,7 +101,7 @@ pub(crate) fn emit_unescape_error(
                     handler.span_suggestion(
                         span,
                         "consider removing the non-printing characters",
-                        ch.to_string(),
+                        ch,
                         Applicability::MaybeIncorrect,
                     );
                 }
@@ -141,10 +137,10 @@ pub(crate) fn emit_unescape_error(
                 .span_suggestion(
                     char_span,
                     "escape the character",
-                    c.escape_default().to_string(),
+                    c.escape_default(),
                     Applicability::MachineApplicable,
                 )
-                .emit()
+                .emit();
         }
         EscapeError::BareCarriageReturn => {
             let msg = if mode.in_double_quotes() {
@@ -157,7 +153,7 @@ pub(crate) fn emit_unescape_error(
                 .span_suggestion(
                     span,
                     "escape the character",
-                    "\\r".to_string(),
+                    "\\r",
                     Applicability::MachineApplicable,
                 )
                 .emit();
@@ -202,7 +198,7 @@ pub(crate) fn emit_unescape_error(
             diag.emit();
         }
         EscapeError::TooShortHexEscape => {
-            handler.span_err(span, "numeric character escape is too short")
+            handler.span_err(span, "numeric character escape is too short");
         }
         EscapeError::InvalidCharInHexEscape | EscapeError::InvalidCharInUnicodeEscape => {
             let (c, span) = last_char();
@@ -292,16 +288,18 @@ pub(crate) fn emit_unescape_error(
                 .span_label(span, "must have at most 6 hex digits")
                 .emit();
         }
-        EscapeError::UnclosedUnicodeEscape => handler
-            .struct_span_err(span, "unterminated unicode escape")
-            .span_label(span, "missing a closing `}`")
-            .span_suggestion_verbose(
-                span.shrink_to_hi(),
-                "terminate the unicode escape",
-                "}".to_string(),
-                Applicability::MaybeIncorrect,
-            )
-            .emit(),
+        EscapeError::UnclosedUnicodeEscape => {
+            handler
+                .struct_span_err(span, "unterminated unicode escape")
+                .span_label(span, "missing a closing `}`")
+                .span_suggestion_verbose(
+                    span.shrink_to_hi(),
+                    "terminate the unicode escape",
+                    "}",
+                    Applicability::MaybeIncorrect,
+                )
+                .emit();
+        }
         EscapeError::NoBraceInUnicodeEscape => {
             let msg = "incorrect unicode escape sequence";
             let mut diag = handler.struct_span_err(span, msg);
@@ -347,7 +345,7 @@ pub(crate) fn emit_unescape_error(
         }
         EscapeError::ZeroChars => {
             let msg = "empty character literal";
-            handler.struct_span_err(span, msg).span_label(span, msg).emit()
+            handler.struct_span_err(span, msg).span_label(span, msg).emit();
         }
         EscapeError::LoneSlash => {
             let msg = "invalid trailing slash in literal";

@@ -1,12 +1,13 @@
 //! Defines the set of legal keys that can be used in queries.
 
 use rustc_hir::def_id::{CrateNum, DefId, LocalDefId, LOCAL_CRATE};
+use rustc_hir::hir_id::HirId;
 use rustc_middle::infer::canonical::Canonical;
 use rustc_middle::mir;
 use rustc_middle::traits;
 use rustc_middle::ty::fast_reject::SimplifiedType;
 use rustc_middle::ty::subst::{GenericArg, SubstsRef};
-use rustc_middle::ty::{self, Ty, TyCtxt};
+use rustc_middle::ty::{self, layout::TyAndLayout, Ty, TyCtxt};
 use rustc_span::symbol::{Ident, Symbol};
 use rustc_span::{Span, DUMMY_SP};
 
@@ -141,6 +142,16 @@ impl Key for ty::WithOptConstParam<LocalDefId> {
     }
 }
 
+impl Key for SimplifiedType {
+    #[inline(always)]
+    fn query_crate_is_local(&self) -> bool {
+        true
+    }
+    fn default_span(&self, _: TyCtxt<'_>) -> Span {
+        DUMMY_SP
+    }
+}
+
 impl Key for (DefId, DefId) {
     #[inline(always)]
     fn query_crate_is_local(&self) -> bool {
@@ -181,6 +192,16 @@ impl Key for (LocalDefId, DefId) {
     }
 }
 
+impl Key for (LocalDefId, LocalDefId) {
+    #[inline(always)]
+    fn query_crate_is_local(&self) -> bool {
+        true
+    }
+    fn default_span(&self, tcx: TyCtxt<'_>) -> Span {
+        self.0.default_span(tcx)
+    }
+}
+
 impl Key for (DefId, Option<Ident>) {
     #[inline(always)]
     fn query_crate_is_local(&self) -> bool {
@@ -212,6 +233,16 @@ impl Key for (CrateNum, DefId) {
     }
     fn default_span(&self, tcx: TyCtxt<'_>) -> Span {
         self.1.default_span(tcx)
+    }
+}
+
+impl Key for (CrateNum, SimplifiedType) {
+    #[inline(always)]
+    fn query_crate_is_local(&self) -> bool {
+        self.0 == LOCAL_CRATE
+    }
+    fn default_span(&self, _: TyCtxt<'_>) -> Span {
+        DUMMY_SP
     }
 }
 
@@ -365,6 +396,16 @@ impl<'tcx> Key for Ty<'tcx> {
     }
 }
 
+impl<'tcx> Key for TyAndLayout<'tcx> {
+    #[inline(always)]
+    fn query_crate_is_local(&self) -> bool {
+        true
+    }
+    fn default_span(&self, _: TyCtxt<'_>) -> Span {
+        DUMMY_SP
+    }
+}
+
 impl<'tcx> Key for (Ty<'tcx>, Ty<'tcx>) {
     #[inline(always)]
     fn query_crate_is_local(&self) -> bool {
@@ -406,6 +447,16 @@ impl<'tcx, T: Key> Key for ty::ParamEnvAnd<'tcx, T> {
 }
 
 impl Key for Symbol {
+    #[inline(always)]
+    fn query_crate_is_local(&self) -> bool {
+        true
+    }
+    fn default_span(&self, _tcx: TyCtxt<'_>) -> Span {
+        DUMMY_SP
+    }
+}
+
+impl Key for Option<Symbol> {
     #[inline(always)]
     fn query_crate_is_local(&self) -> bool {
         true
@@ -480,5 +531,32 @@ impl<'tcx> Key for (ty::Instance<'tcx>, &'tcx ty::List<Ty<'tcx>>) {
 
     fn default_span(&self, tcx: TyCtxt<'_>) -> Span {
         self.0.default_span(tcx)
+    }
+}
+
+impl<'tcx> Key for (Ty<'tcx>, ty::ValTree<'tcx>) {
+    #[inline(always)]
+    fn query_crate_is_local(&self) -> bool {
+        true
+    }
+
+    fn default_span(&self, _: TyCtxt<'_>) -> Span {
+        DUMMY_SP
+    }
+}
+
+impl Key for HirId {
+    #[inline(always)]
+    fn query_crate_is_local(&self) -> bool {
+        true
+    }
+
+    fn default_span(&self, tcx: TyCtxt<'_>) -> Span {
+        tcx.hir().span(*self)
+    }
+
+    #[inline(always)]
+    fn key_as_def_id(&self) -> Option<DefId> {
+        None
     }
 }

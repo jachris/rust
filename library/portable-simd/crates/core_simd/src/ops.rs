@@ -1,4 +1,4 @@
-use crate::simd::{LaneCount, Simd, SimdElement, SupportedLaneCount};
+use crate::simd::{LaneCount, Simd, SimdElement, SimdPartialEq, SupportedLaneCount};
 use core::ops::{Add, Mul};
 use core::ops::{BitAnd, BitOr, BitXor};
 use core::ops::{Div, Rem, Sub};
@@ -33,6 +33,7 @@ where
 
 macro_rules! unsafe_base {
     ($lhs:ident, $rhs:ident, {$simd_call:ident}, $($_:tt)*) => {
+        // Safety: $lhs and $rhs are vectors
         unsafe { $crate::simd::intrinsics::$simd_call($lhs, $rhs) }
     };
 }
@@ -48,6 +49,8 @@ macro_rules! unsafe_base {
 // cg_clif defaults to this, and scalar MIR shifts also default to wrapping
 macro_rules! wrap_bitshift {
     ($lhs:ident, $rhs:ident, {$simd_call:ident}, $int:ident) => {
+        #[allow(clippy::suspicious_arithmetic_impl)]
+        // Safety: $lhs and the bitand result are vectors
         unsafe {
             $crate::simd::intrinsics::$simd_call(
                 $lhs,
@@ -57,29 +60,41 @@ macro_rules! wrap_bitshift {
     };
 }
 
-// Division by zero is poison, according to LLVM.
-// So is dividing the MIN value of a signed integer by -1,
-// since that would return MAX + 1.
-// FIXME: Rust allows <SInt>::MIN / -1,
-// so we should probably figure out how to make that safe.
+/// SAFETY: This macro must only be used to impl Div or Rem and given the matching intrinsic.
+/// It guards against LLVM's UB conditions for integer div or rem using masks and selects,
+/// thus guaranteeing a Rust value returns instead.
+///
+/// |                  | LLVM | Rust
+/// | :--------------: | :--- | :----------
+/// | N {/,%} 0        | UB   | panic!()
+/// | <$int>::MIN / -1 | UB   | <$int>::MIN
+/// | <$int>::MIN % -1 | UB   | 0
+///
 macro_rules! int_divrem_guard {
     (   $lhs:ident,
         $rhs:ident,
         {   const PANIC_ZERO: &'static str = $zero:literal;
-            const PANIC_OVERFLOW: &'static str = $overflow:literal;
             $simd_call:ident
         },
         $int:ident ) => {
-        if $rhs.lanes_eq(Simd::splat(0)).any() {
+        if $rhs.simd_eq(Simd::splat(0 as _)).any() {
             panic!($zero);
-        } else if <$int>::MIN != 0
-            && ($lhs.lanes_eq(Simd::splat(<$int>::MIN))
-                // type inference can break here, so cut an SInt to size
-                & $rhs.lanes_eq(Simd::splat(-1i64 as _))).any()
-        {
-            panic!($overflow);
         } else {
-            unsafe { $crate::simd::intrinsics::$simd_call($lhs, $rhs) }
+            // Prevent otherwise-UB overflow on the MIN / -1 case.
+            let rhs = if <$int>::MIN != 0 {
+                // This should, at worst, optimize to a few branchless logical ops
+                // Ideally, this entire conditional should evaporate
+                // Fire LLVM and implement those manually if it doesn't get the hint
+                ($lhs.simd_eq(Simd::splat(<$int>::MIN))
+                // type inference can break here, so cut an SInt to size
+                & $rhs.simd_eq(Simd::splat(-1i64 as _)))
+                .select(Simd::splat(1 as _), $rhs)
+            } else {
+                // Nice base case to make it easy to const-fold away the other branch.
+                $rhs
+            };
+            // Safety: $lhs and rhs are vectors
+            unsafe { $crate::simd::intrinsics::$simd_call($lhs, rhs) }
         }
     };
 }
@@ -183,7 +198,6 @@ for_base_ops! {
     impl Div::div {
         int_divrem_guard {
             const PANIC_ZERO: &'static str = "attempt to divide by zero";
-            const PANIC_OVERFLOW: &'static str = "attempt to divide with overflow";
             simd_div
         }
     }
@@ -191,7 +205,6 @@ for_base_ops! {
     impl Rem::rem {
         int_divrem_guard {
             const PANIC_ZERO: &'static str = "attempt to calculate the remainder with a divisor of zero";
-            const PANIC_OVERFLOW: &'static str = "attempt to calculate the remainder with overflow";
             simd_rem
         }
     }

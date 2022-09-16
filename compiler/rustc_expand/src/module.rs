@@ -1,7 +1,7 @@
 use crate::base::ModuleData;
 use rustc_ast::ptr::P;
-use rustc_ast::{token, Attribute, Inline, Item};
-use rustc_errors::{struct_span_err, DiagnosticBuilder};
+use rustc_ast::{token, AttrVec, Attribute, Inline, Item, ModSpans};
+use rustc_errors::{struct_span_err, DiagnosticBuilder, ErrorGuaranteed};
 use rustc_parse::new_parser_from_file;
 use rustc_parse::validate_attr;
 use rustc_session::parse::ParseSess;
@@ -26,9 +26,9 @@ pub struct ModulePathSuccess {
     pub dir_ownership: DirOwnership,
 }
 
-crate struct ParsedExternalMod {
+pub(crate) struct ParsedExternalMod {
     pub items: Vec<P<Item>>,
-    pub inner_span: Span,
+    pub spans: ModSpans,
     pub file_path: PathBuf,
     pub dir_path: PathBuf,
     pub dir_ownership: DirOwnership,
@@ -39,16 +39,16 @@ pub enum ModError<'a> {
     ModInBlock(Option<Ident>),
     FileNotFound(Ident, PathBuf, PathBuf),
     MultipleCandidates(Ident, PathBuf, PathBuf),
-    ParserError(DiagnosticBuilder<'a>),
+    ParserError(DiagnosticBuilder<'a, ErrorGuaranteed>),
 }
 
-crate fn parse_external_mod(
+pub(crate) fn parse_external_mod(
     sess: &Session,
     ident: Ident,
     span: Span, // The span to blame on errors.
     module: &ModuleData,
     mut dir_ownership: DirOwnership,
-    attrs: &mut Vec<Attribute>,
+    attrs: &mut AttrVec,
 ) -> ParsedExternalMod {
     // We bail on the first error, but that error does not cause a fatal error... (1)
     let result: Result<_, ModError<'_>> = try {
@@ -63,22 +63,22 @@ crate fn parse_external_mod(
 
         // Actually parse the external file as a module.
         let mut parser = new_parser_from_file(&sess.parse_sess, &mp.file_path, Some(span));
-        let (mut inner_attrs, items, inner_span) =
+        let (inner_attrs, items, inner_span) =
             parser.parse_mod(&token::Eof).map_err(|err| ModError::ParserError(err))?;
-        attrs.append(&mut inner_attrs);
+        attrs.extend(inner_attrs);
         (items, inner_span, mp.file_path)
     };
     // (1) ...instead, we return a dummy module.
-    let (items, inner_span, file_path) =
+    let (items, spans, file_path) =
         result.map_err(|err| err.report(sess, span)).unwrap_or_default();
 
     // Extract the directory path for submodules of the module.
     let dir_path = file_path.parent().unwrap_or(&file_path).to_owned();
 
-    ParsedExternalMod { items, inner_span, file_path, dir_path, dir_ownership }
+    ParsedExternalMod { items, spans, file_path, dir_path, dir_ownership }
 }
 
-crate fn mod_dir_path(
+pub(crate) fn mod_dir_path(
     sess: &Session,
     ident: Ident,
     attrs: &[Attribute],
@@ -218,10 +218,9 @@ pub fn default_submod_path<'a>(
         ""
     };
 
-    let mod_name = ident.name.to_string();
-    let default_path_str = format!("{}{}.rs", relative_prefix, mod_name);
+    let default_path_str = format!("{}{}.rs", relative_prefix, ident.name);
     let secondary_path_str =
-        format!("{}{}{}mod.rs", relative_prefix, mod_name, path::MAIN_SEPARATOR);
+        format!("{}{}{}mod.rs", relative_prefix, ident.name, path::MAIN_SEPARATOR);
     let default_path = dir_path.join(&default_path_str);
     let secondary_path = dir_path.join(&secondary_path_str);
     let default_exists = sess.source_map().file_exists(&default_path);
@@ -242,7 +241,7 @@ pub fn default_submod_path<'a>(
 }
 
 impl ModError<'_> {
-    fn report(self, sess: &Session, span: Span) {
+    fn report(self, sess: &Session, span: Span) -> ErrorGuaranteed {
         let diag = &sess.parse_sess.span_diagnostic;
         match self {
             ModError::CircularInclusion(file_paths) => {

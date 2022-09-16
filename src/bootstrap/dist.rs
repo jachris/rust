@@ -14,15 +14,13 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-use build_helper::{output, t};
-
 use crate::builder::{Builder, Kind, RunConfig, ShouldRun, Step};
 use crate::cache::{Interned, INTERNER};
 use crate::compile;
 use crate::config::TargetSelection;
 use crate::tarball::{GeneratedTarball, OverlayKind, Tarball};
 use crate::tool::{self, Tool};
-use crate::util::{exe, is_dylib, timeit};
+use crate::util::{exe, is_dylib, output, t, timeit};
 use crate::{Compiler, DependencyType, Mode, LLVM_TOOLS};
 
 pub fn pkgname(builder: &Builder<'_>, component: &str) -> String {
@@ -41,7 +39,11 @@ fn missing_tool(tool_name: &str, skip: bool) {
     if skip {
         println!("Unable to build {}, skipping dist", tool_name)
     } else {
-        panic!("Unable to build {}", tool_name)
+        let help = "note: not all tools are available on all nightlies\nhelp: see https://forge.rust-lang.org/infra/toolstate.html for more information";
+        panic!(
+            "Unable to build submodule tool {} (use `missing-tools = true` to ignore this failure)\n{}",
+            tool_name, help
+        )
     }
 }
 
@@ -63,7 +65,7 @@ impl Step for Docs {
 
     fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
         let default = run.builder.config.docs;
-        run.path("rust-docs").default_condition(default)
+        run.alias("rust-docs").default_condition(default)
     }
 
     fn make_run(run: RunConfig<'_>) {
@@ -96,7 +98,7 @@ impl Step for RustcDocs {
 
     fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
         let builder = run.builder;
-        run.path("rustc-docs").default_condition(builder.config.compiler_docs)
+        run.alias("rustc-docs").default_condition(builder.config.compiler_docs)
     }
 
     fn make_run(run: RunConfig<'_>) {
@@ -274,7 +276,7 @@ impl Step for Mingw {
     const DEFAULT: bool = true;
 
     fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
-        run.path("rust-mingw")
+        run.alias("rust-mingw")
     }
 
     fn make_run(run: RunConfig<'_>) {
@@ -287,7 +289,7 @@ impl Step for Mingw {
     /// without any extra installed software (e.g., we bundle gcc, libraries, etc).
     fn run(self, builder: &Builder<'_>) -> Option<GeneratedTarball> {
         let host = self.host;
-        if !host.contains("pc-windows-gnu") {
+        if !host.ends_with("pc-windows-gnu") {
             return None;
         }
 
@@ -315,7 +317,7 @@ impl Step for Rustc {
     const ONLY_HOSTS: bool = true;
 
     fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
-        run.path("rustc")
+        run.alias("rustc")
     }
 
     fn make_run(run: RunConfig<'_>) {
@@ -343,7 +345,7 @@ impl Step for Rustc {
         // anything requiring us to distribute a license, but it's likely the
         // install will *also* include the rust-mingw package, which also needs
         // licenses, so to be safe we just include it here in all MinGW packages.
-        if host.contains("pc-windows-gnu") {
+        if host.ends_with("pc-windows-gnu") {
             make_win_dist(tarball.image_dir(), &tmpdir(builder), host, builder);
             tarball.add_dir(builder.src.join("src/etc/third-party"), "share/doc");
         }
@@ -359,6 +361,18 @@ impl Step for Rustc {
             builder.cp_r(&src.join("bin"), &image.join("bin"));
 
             builder.install(&builder.rustdoc(compiler), &image.join("bin"), 0o755);
+
+            let ra_proc_macro_srv = builder
+                .ensure(tool::RustAnalyzerProcMacroSrv {
+                    compiler: builder.compiler_for(
+                        compiler.stage,
+                        builder.config.build,
+                        compiler.host,
+                    ),
+                    target: compiler.host,
+                })
+                .expect("rust-analyzer-proc-macro-server always builds");
+            builder.install(&ra_proc_macro_srv, &image.join("libexec"), 0o755);
 
             let libdir_relative = builder.libdir_relative(compiler);
 
@@ -409,8 +423,8 @@ impl Step for Rustc {
                 let gcc_lld_src_dir = src_dir.join("gcc-ld");
                 let gcc_lld_dst_dir = dst_dir.join("gcc-ld");
                 t!(fs::create_dir(&gcc_lld_dst_dir));
-                for flavor in ["ld", "ld64"] {
-                    let exe_name = exe(flavor, compiler.host);
+                for name in crate::LLD_FILE_NAMES {
+                    let exe_name = exe(name, compiler.host);
                     builder
                         .copy(&gcc_lld_src_dir.join(&exe_name), &gcc_lld_dst_dir.join(&exe_name));
                 }
@@ -458,16 +472,7 @@ impl Step for DebuggerScripts {
     type Output = ();
 
     fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
-        run.path("src/lldb_batchmode.py")
-    }
-
-    fn make_run(run: RunConfig<'_>) {
-        run.builder.ensure(DebuggerScripts {
-            sysroot: run
-                .builder
-                .sysroot(run.builder.compiler(run.builder.top_stage, run.build_triple())),
-            host: run.target,
-        });
+        run.never()
     }
 
     /// Copies debugger scripts for `target` into the `sysroot` specified.
@@ -549,7 +554,7 @@ impl Step for Std {
     const DEFAULT: bool = true;
 
     fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
-        run.path("rust-std")
+        run.alias("rust-std")
     }
 
     fn make_run(run: RunConfig<'_>) {
@@ -571,7 +576,7 @@ impl Step for Std {
             return None;
         }
 
-        builder.ensure(compile::Std { compiler, target });
+        builder.ensure(compile::Std::new(compiler, target));
 
         let mut tarball = Tarball::new(builder, "rust-std", &target.triple);
         tarball.include_target_in_component_name(true);
@@ -596,7 +601,7 @@ impl Step for RustcDev {
     const ONLY_HOSTS: bool = true;
 
     fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
-        run.path("rustc-dev")
+        run.alias("rustc-dev")
     }
 
     fn make_run(run: RunConfig<'_>) {
@@ -617,7 +622,7 @@ impl Step for RustcDev {
             return None;
         }
 
-        builder.ensure(compile::Rustc { compiler, target });
+        builder.ensure(compile::Rustc::new(compiler, target));
 
         let tarball = Tarball::new(builder, "rustc-dev", &target.triple);
 
@@ -632,14 +637,6 @@ impl Step for RustcDev {
             builder,
             &builder.src,
             &["compiler"],
-            &[],
-            &tarball.image_dir().join("lib/rustlib/rustc-src/rust"),
-        );
-        // This particular crate is used as a build dependency of the above.
-        copy_src_dirs(
-            builder,
-            &builder.src,
-            &["src/build_helper"],
             &[],
             &tarball.image_dir().join("lib/rustlib/rustc-src/rust"),
         );
@@ -663,7 +660,7 @@ impl Step for Analysis {
 
     fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
         let default = should_build_extended_tool(&run.builder, "analysis");
-        run.path("rust-analysis").default_condition(default)
+        run.alias("rust-analysis").default_condition(default)
     }
 
     fn make_run(run: RunConfig<'_>) {
@@ -688,7 +685,7 @@ impl Step for Analysis {
             return None;
         }
 
-        builder.ensure(compile::Std { compiler, target });
+        builder.ensure(compile::Std::new(compiler, target));
         let src = builder
             .stage_out(compiler, Mode::Std)
             .join(target.triple)
@@ -800,7 +797,7 @@ impl Step for Src {
     const ONLY_HOSTS: bool = true;
 
     fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
-        run.path("rust-src")
+        run.alias("rust-src")
     }
 
     fn make_run(run: RunConfig<'_>) {
@@ -831,6 +828,11 @@ impl Step for Src {
                 // not needed and contains symlinks which rustup currently
                 // chokes on when unpacking.
                 "library/backtrace/crates",
+                // these are 30MB combined and aren't necessary for building
+                // the standard library.
+                "library/stdarch/Cargo.toml",
+                "library/stdarch/crates/stdarch-verify",
+                "library/stdarch/crates/intrinsic-test",
             ],
             &dst_src,
         );
@@ -853,7 +855,7 @@ impl Step for PlainSourceTarball {
 
     fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
         let builder = run.builder;
-        run.path("rustc-src").default_condition(builder.config.rust_dist_src)
+        run.alias("rustc-src").default_condition(builder.config.rust_dist_src)
     }
 
     fn make_run(run: RunConfig<'_>) {
@@ -862,7 +864,12 @@ impl Step for PlainSourceTarball {
 
     /// Creates the plain source tarball
     fn run(self, builder: &Builder<'_>) -> GeneratedTarball {
-        let tarball = Tarball::new(builder, "rustc", "src");
+        // NOTE: This is a strange component in a lot of ways. It uses `src` as the target, which
+        // means neither rustup nor rustup-toolchain-install-master know how to download it.
+        // It also contains symbolic links, unlike other any other dist tarball.
+        // It's used for distros building rustc from source in a pre-vendored environment.
+        let mut tarball = Tarball::new(builder, "rustc", "src");
+        tarball.permit_symlinks(true);
         let plain_dst_src = tarball.image_dir();
 
         // This is the set of root paths which will become part of the source package
@@ -896,40 +903,32 @@ impl Step for PlainSourceTarball {
 
         // If we're building from git sources, we need to vendor a complete distribution.
         if builder.rust_info.is_git() {
+            // Ensure we have the submodules checked out.
+            builder.update_submodule(Path::new("src/tools/rust-analyzer"));
+
             // Vendor all Cargo dependencies
             let mut cmd = Command::new(&builder.initial_cargo);
             cmd.arg("vendor")
                 .arg("--sync")
                 .arg(builder.src.join("./src/tools/rust-analyzer/Cargo.toml"))
+                .arg("--sync")
                 .arg(builder.src.join("./compiler/rustc_codegen_cranelift/Cargo.toml"))
+                .arg("--sync")
+                .arg(builder.src.join("./src/bootstrap/Cargo.toml"))
                 .current_dir(&plain_dst_src);
-            builder.run(&mut cmd);
+
+            let config = if !builder.config.dry_run {
+                t!(String::from_utf8(t!(cmd.output()).stdout))
+            } else {
+                String::new()
+            };
+
+            let cargo_config_dir = plain_dst_src.join(".cargo");
+            builder.create_dir(&cargo_config_dir);
+            builder.create(&cargo_config_dir.join("config.toml"), &config);
         }
 
         tarball.bare()
-    }
-}
-
-// We have to run a few shell scripts, which choke quite a bit on both `\`
-// characters and on `C:\` paths, so normalize both of them away.
-pub fn sanitize_sh(path: &Path) -> String {
-    let path = path.to_str().unwrap().replace("\\", "/");
-    return change_drive(unc_to_lfs(&path)).unwrap_or(path);
-
-    fn unc_to_lfs(s: &str) -> &str {
-        s.strip_prefix("//?/").unwrap_or(s)
-    }
-
-    fn change_drive(s: &str) -> Option<String> {
-        let mut ch = s.chars();
-        let drive = ch.next().unwrap_or('C');
-        if ch.next() != Some(':') {
-            return None;
-        }
-        if ch.next() != Some('/') {
-            return None;
-        }
-        Some(format!("/{}/{}", drive, &s[drive.len_utf8() + 2..]))
     }
 }
 
@@ -946,7 +945,7 @@ impl Step for Cargo {
 
     fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
         let default = should_build_extended_tool(&run.builder, "cargo");
-        run.path("cargo").default_condition(default)
+        run.alias("cargo").default_condition(default)
     }
 
     fn make_run(run: RunConfig<'_>) {
@@ -1002,7 +1001,7 @@ impl Step for Rls {
 
     fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
         let default = should_build_extended_tool(&run.builder, "rls");
-        run.path("rls").default_condition(default)
+        run.alias("rls").default_condition(default)
     }
 
     fn make_run(run: RunConfig<'_>) {
@@ -1022,10 +1021,7 @@ impl Step for Rls {
 
         let rls = builder
             .ensure(tool::Rls { compiler, target, extra_features: Vec::new() })
-            .or_else(|| {
-                missing_tool("RLS", builder.build.config.missing_tools);
-                None
-            })?;
+            .expect("rls expected to build");
 
         let mut tarball = Tarball::new(builder, "rls", &target.triple);
         tarball.set_overlay(OverlayKind::RLS);
@@ -1049,7 +1045,7 @@ impl Step for RustAnalyzer {
 
     fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
         let default = should_build_extended_tool(&run.builder, "rust-analyzer");
-        run.path("rust-analyzer").default_condition(default)
+        run.alias("rust-analyzer").default_condition(default)
     }
 
     fn make_run(run: RunConfig<'_>) {
@@ -1064,12 +1060,6 @@ impl Step for RustAnalyzer {
     }
 
     fn run(self, builder: &Builder<'_>) -> Option<GeneratedTarball> {
-        // This prevents rust-analyzer from being built for "dist" or "install"
-        // on the stable/beta channels. It is a nightly-only tool and should
-        // not be included.
-        if !builder.build.unstable_features() {
-            return None;
-        }
         let compiler = self.compiler;
         let target = self.target;
 
@@ -1080,7 +1070,7 @@ impl Step for RustAnalyzer {
         }
 
         let rust_analyzer = builder
-            .ensure(tool::RustAnalyzer { compiler, target, extra_features: Vec::new() })
+            .ensure(tool::RustAnalyzer { compiler, target })
             .expect("rust-analyzer always builds");
 
         let mut tarball = Tarball::new(builder, "rust-analyzer", &target.triple);
@@ -1105,7 +1095,7 @@ impl Step for Clippy {
 
     fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
         let default = should_build_extended_tool(&run.builder, "clippy");
-        run.path("clippy").default_condition(default)
+        run.alias("clippy").default_condition(default)
     }
 
     fn make_run(run: RunConfig<'_>) {
@@ -1156,7 +1146,7 @@ impl Step for Miri {
 
     fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
         let default = should_build_extended_tool(&run.builder, "miri");
-        run.path("miri").default_condition(default)
+        run.alias("miri").default_condition(default)
     }
 
     fn make_run(run: RunConfig<'_>) {
@@ -1216,7 +1206,7 @@ impl Step for Rustfmt {
 
     fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
         let default = should_build_extended_tool(&run.builder, "rustfmt");
-        run.path("rustfmt").default_condition(default)
+        run.alias("rustfmt").default_condition(default)
     }
 
     fn make_run(run: RunConfig<'_>) {
@@ -1236,17 +1226,10 @@ impl Step for Rustfmt {
 
         let rustfmt = builder
             .ensure(tool::Rustfmt { compiler, target, extra_features: Vec::new() })
-            .or_else(|| {
-                missing_tool("Rustfmt", builder.build.config.missing_tools);
-                None
-            })?;
+            .expect("rustfmt expected to build - essential tool");
         let cargofmt = builder
             .ensure(tool::Cargofmt { compiler, target, extra_features: Vec::new() })
-            .or_else(|| {
-                missing_tool("Cargofmt", builder.build.config.missing_tools);
-                None
-            })?;
-
+            .expect("cargo fmt expected to build - essential tool");
         let mut tarball = Tarball::new(builder, "rustfmt", &target.triple);
         tarball.set_overlay(OverlayKind::Rustfmt);
         tarball.is_preview(true);
@@ -1275,7 +1258,7 @@ impl Step for RustDemangler {
         // we run the step by default when only `extended = true`, and decide whether to actually
         // run it or not later.
         let default = run.builder.config.extended;
-        run.path("rust-demangler").default_condition(default)
+        run.alias("rust-demangler").default_condition(default)
     }
 
     fn make_run(run: RunConfig<'_>) {
@@ -1328,7 +1311,7 @@ impl Step for Extended {
 
     fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
         let builder = run.builder;
-        run.path("extended").default_condition(builder.config.extended)
+        run.alias("extended").default_condition(builder.config.extended)
     }
 
     fn make_run(run: RunConfig<'_>) {
@@ -1365,7 +1348,7 @@ impl Step for Extended {
         tarballs.push(builder.ensure(Rustc { compiler: builder.compiler(stage, target) }));
         tarballs.push(builder.ensure(Std { compiler, target }).expect("missing std"));
 
-        if target.contains("windows-gnu") {
+        if target.ends_with("windows-gnu") {
             tarballs.push(builder.ensure(Mingw { host: target }).expect("missing mingw"));
         }
 
@@ -1429,7 +1412,7 @@ impl Step for Extended {
 
         let xform = |p: &Path| {
             let mut contents = t!(fs::read_to_string(p));
-            for tool in &["rust-demangler", "rls", "rust-analyzer", "miri", "rustfmt"] {
+            for tool in &["rust-demangler", "rust-analyzer", "miri", "rustfmt"] {
                 if !built_tools.contains(tool) {
                     contents = filter(&contents, tool);
                 }
@@ -1469,7 +1452,7 @@ impl Step for Extended {
             prepare("rust-std");
             prepare("rust-analysis");
             prepare("clippy");
-            for tool in &["rust-docs", "rust-demangler", "rls", "rust-analyzer", "miri"] {
+            for tool in &["rust-docs", "rust-demangler", "rust-analyzer", "miri"] {
                 if built_tools.contains(tool) {
                     prepare(tool);
                 }
@@ -1505,8 +1488,6 @@ impl Step for Extended {
                 builder.create_dir(&exe.join(name));
                 let dir = if name == "rust-std" || name == "rust-analysis" {
                     format!("{}-{}", name, target.triple)
-                } else if name == "rls" {
-                    "rls-preview".to_string()
                 } else if name == "rust-analyzer" {
                     "rust-analyzer-preview".to_string()
                 } else if name == "clippy" {
@@ -1530,12 +1511,12 @@ impl Step for Extended {
             prepare("rust-docs");
             prepare("rust-std");
             prepare("clippy");
-            for tool in &["rust-demangler", "rls", "rust-analyzer", "miri"] {
+            for tool in &["rust-demangler", "rust-analyzer", "miri"] {
                 if built_tools.contains(tool) {
                     prepare(tool);
                 }
             }
-            if target.contains("windows-gnu") {
+            if target.ends_with("windows-gnu") {
                 prepare("rust-mingw");
             }
 
@@ -1614,25 +1595,6 @@ impl Step for Extended {
                     .arg("-out")
                     .arg(exe.join("StdGroup.wxs")),
             );
-            if built_tools.contains("rls") {
-                builder.run(
-                    Command::new(&heat)
-                        .current_dir(&exe)
-                        .arg("dir")
-                        .arg("rls")
-                        .args(&heat_flags)
-                        .arg("-cg")
-                        .arg("RlsGroup")
-                        .arg("-dr")
-                        .arg("Rls")
-                        .arg("-var")
-                        .arg("var.RlsDir")
-                        .arg("-out")
-                        .arg(exe.join("RlsGroup.wxs"))
-                        .arg("-t")
-                        .arg(etc.join("msi/remove-duplicates.xsl")),
-                );
-            }
             if built_tools.contains("rust-analyzer") {
                 builder.run(
                     Command::new(&heat)
@@ -1724,7 +1686,7 @@ impl Step for Extended {
                     .arg("-t")
                     .arg(etc.join("msi/remove-duplicates.xsl")),
             );
-            if target.contains("windows-gnu") {
+            if target.ends_with("windows-gnu") {
                 builder.run(
                     Command::new(&heat)
                         .current_dir(&exe)
@@ -1764,16 +1726,13 @@ impl Step for Extended {
                 if built_tools.contains("rust-demangler") {
                     cmd.arg("-dRustDemanglerDir=rust-demangler");
                 }
-                if built_tools.contains("rls") {
-                    cmd.arg("-dRlsDir=rls");
-                }
                 if built_tools.contains("rust-analyzer") {
                     cmd.arg("-dRustAnalyzerDir=rust-analyzer");
                 }
                 if built_tools.contains("miri") {
                     cmd.arg("-dMiriDir=miri");
                 }
-                if target.contains("windows-gnu") {
+                if target.ends_with("windows-gnu") {
                     cmd.arg("-dGccDir=rust-mingw");
                 }
                 builder.run(&mut cmd);
@@ -1789,9 +1748,6 @@ impl Step for Extended {
             if built_tools.contains("rust-demangler") {
                 candle("RustDemanglerGroup.wxs".as_ref());
             }
-            if built_tools.contains("rls") {
-                candle("RlsGroup.wxs".as_ref());
-            }
             if built_tools.contains("rust-analyzer") {
                 candle("RustAnalyzerGroup.wxs".as_ref());
             }
@@ -1800,7 +1756,7 @@ impl Step for Extended {
             }
             candle("AnalysisGroup.wxs".as_ref());
 
-            if target.contains("windows-gnu") {
+            if target.ends_with("windows-gnu") {
                 candle("GccGroup.wxs".as_ref());
             }
 
@@ -1829,9 +1785,6 @@ impl Step for Extended {
                 .arg("ClippyGroup.wixobj")
                 .current_dir(&exe);
 
-            if built_tools.contains("rls") {
-                cmd.arg("RlsGroup.wixobj");
-            }
             if built_tools.contains("rust-analyzer") {
                 cmd.arg("RustAnalyzerGroup.wixobj");
             }
@@ -1842,7 +1795,7 @@ impl Step for Extended {
                 cmd.arg("MiriGroup.wixobj");
             }
 
-            if target.contains("windows-gnu") {
+            if target.ends_with("windows-gnu") {
                 cmd.arg("GccGroup.wixobj");
             }
             // ICE57 wrongly complains about the shortcuts
@@ -1872,7 +1825,9 @@ fn add_env(builder: &Builder<'_>, cmd: &mut Command, target: TargetSelection) {
         .env("CFG_BUILD", target.triple)
         .env("CFG_CHANNEL", &builder.config.channel);
 
-    if target.contains("windows-gnu") {
+    if target.contains("windows-gnullvm") {
+        cmd.env("CFG_MINGW", "1").env("CFG_ABI", "LLVM");
+    } else if target.contains("windows-gnu") {
         cmd.env("CFG_MINGW", "1").env("CFG_ABI", "GNU");
     } else {
         cmd.env("CFG_MINGW", "0").env("CFG_ABI", "MSVC");
@@ -1881,7 +1836,6 @@ fn add_env(builder: &Builder<'_>, cmd: &mut Command, target: TargetSelection) {
 
 /// Maybe add LLVM object files to the given destination lib-dir. Allows either static or dynamic linking.
 ///
-
 /// Returns whether the files were actually copied.
 fn maybe_install_llvm(builder: &Builder<'_>, target: TargetSelection, dst_libdir: &Path) -> bool {
     if let Some(config) = builder.config.target_config.get(&target) {
@@ -1908,7 +1862,7 @@ fn maybe_install_llvm(builder: &Builder<'_>, target: TargetSelection, dst_libdir
     // clear why this is the case, though. llvm-config will emit the versioned
     // paths and we don't want those in the sysroot (as we're expecting
     // unversioned paths).
-    if target.contains("apple-darwin") && builder.config.llvm_link_shared {
+    if target.contains("apple-darwin") && builder.llvm_link_shared() {
         let src_libdir = builder.llvm_out(target).join("lib");
         let llvm_dylib_path = src_libdir.join("libLLVM.dylib");
         if llvm_dylib_path.exists() {
@@ -1943,7 +1897,7 @@ pub fn maybe_install_llvm_target(builder: &Builder<'_>, target: TargetSelection,
     // We do not need to copy LLVM files into the sysroot if it is not
     // dynamically linked; it is already included into librustc_llvm
     // statically.
-    if builder.config.llvm_link_shared {
+    if builder.llvm_link_shared() {
         maybe_install_llvm(builder, target, &dst_libdir);
     }
 }
@@ -1955,7 +1909,7 @@ pub fn maybe_install_llvm_runtime(builder: &Builder<'_>, target: TargetSelection
     // We do not need to copy LLVM files into the sysroot if it is not
     // dynamically linked; it is already included into librustc_llvm
     // statically.
-    if builder.config.llvm_link_shared {
+    if builder.llvm_link_shared() {
         maybe_install_llvm(builder, target, &dst_libdir);
     }
 }
@@ -1972,7 +1926,8 @@ impl Step for LlvmTools {
 
     fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
         let default = should_build_extended_tool(&run.builder, "llvm-tools");
-        run.path("llvm-tools").default_condition(default)
+        // FIXME: allow using the names of the tools themselves?
+        run.alias("llvm-tools").default_condition(default)
     }
 
     fn make_run(run: RunConfig<'_>) {
@@ -1989,6 +1944,8 @@ impl Step for LlvmTools {
                 return None;
             }
         }
+
+        builder.ensure(crate::native::Llvm { target });
 
         let mut tarball = Tarball::new(builder, "llvm-tools", &target.triple);
         tarball.set_overlay(OverlayKind::LLVM);
@@ -2026,7 +1983,7 @@ impl Step for RustDev {
     const ONLY_HOSTS: bool = true;
 
     fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
-        run.path("rust-dev")
+        run.alias("rust-dev")
     }
 
     fn make_run(run: RunConfig<'_>) {
@@ -2047,7 +2004,12 @@ impl Step for RustDev {
         let mut tarball = Tarball::new(builder, "rust-dev", &target.triple);
         tarball.set_overlay(OverlayKind::LLVM);
 
+        builder.ensure(crate::native::Llvm { target });
+
         let src_bindir = builder.llvm_out(target).join("bin");
+        // If updating this list, you likely want to change
+        // src/bootstrap/download-ci-llvm-stamp as well, otherwise local users
+        // will not pick up the extra file until LLVM gets bumped.
         for bin in &[
             "llvm-config",
             "llvm-ar",
@@ -2057,6 +2019,7 @@ impl Step for RustDev {
             "llvm-cov",
             "llvm-dwp",
             "llvm-nm",
+            "llvm-dwarfdump",
         ] {
             tarball.add_file(src_bindir.join(exe(bin, target)), "bin", 0o755);
         }
@@ -2080,14 +2043,14 @@ impl Step for RustDev {
         // compiler libraries.
         let dst_libdir = tarball.image_dir().join("lib");
         maybe_install_llvm(builder, target, &dst_libdir);
-        let link_type = if builder.config.llvm_link_shared { "dynamic" } else { "static" };
+        let link_type = if builder.llvm_link_shared() { "dynamic" } else { "static" };
         t!(std::fs::write(tarball.image_dir().join("link-type.txt"), link_type), dst_libdir);
 
         Some(tarball.generate())
     }
 }
 
-/// Tarball containing a prebuilt version of the build-manifest tool, intented to be used by the
+/// Tarball containing a prebuilt version of the build-manifest tool, intended to be used by the
 /// release process to avoid cloning the monorepo and building stuff.
 ///
 /// Should not be considered stable by end users.
@@ -2102,7 +2065,7 @@ impl Step for BuildManifest {
     const ONLY_HOSTS: bool = true;
 
     fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
-        run.path("build-manifest")
+        run.alias("build-manifest")
     }
 
     fn make_run(run: RunConfig<'_>) {
@@ -2134,7 +2097,7 @@ impl Step for ReproducibleArtifacts {
     const ONLY_HOSTS: bool = true;
 
     fn should_run(run: ShouldRun<'_>) -> ShouldRun<'_> {
-        run.path("reproducible-artifacts")
+        run.alias("reproducible-artifacts")
     }
 
     fn make_run(run: RunConfig<'_>) {

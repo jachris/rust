@@ -8,16 +8,17 @@
 //! * Functions called by the compiler itself.
 
 use crate::def_id::DefId;
+use crate::errors::LangItemError;
 use crate::{MethodKind, Target};
 
 use rustc_ast as ast;
-use rustc_data_structures::fx::FxHashMap;
+use rustc_data_structures::fx::FxIndexMap;
 use rustc_data_structures::stable_hasher::{HashStable, StableHasher};
 use rustc_macros::HashStable_Generic;
 use rustc_span::symbol::{kw, sym, Symbol};
 use rustc_span::Span;
 
-use std::lazy::SyncLazy;
+use std::sync::LazyLock;
 
 pub enum LangItemGroup {
     Op,
@@ -115,9 +116,9 @@ macro_rules! language_item_table {
 
             /// Requires that a given `LangItem` was bound and returns the corresponding `DefId`.
             /// If it wasn't bound, e.g. due to a missing `#[lang = "<it.name()>"]`,
-            /// returns an error message as a string.
-            pub fn require(&self, it: LangItem) -> Result<DefId, String> {
-                self.items[it as usize].ok_or_else(|| format!("requires `{}` lang_item", it.name()))
+            /// returns an error encapsulating the `LangItem`.
+            pub fn require(&self, it: LangItem) -> Result<DefId, LangItemError> {
+                self.items[it as usize].ok_or_else(|| LangItemError(it))
             }
 
             /// Returns the [`DefId`]s of all lang items in a group.
@@ -134,8 +135,8 @@ macro_rules! language_item_table {
         }
 
         /// A mapping from the name of the lang item to its order and the form it must be of.
-        pub static ITEM_REFS: SyncLazy<FxHashMap<Symbol, (usize, Target)>> = SyncLazy::new(|| {
-            let mut item_refs = FxHashMap::default();
+        pub static ITEM_REFS: LazyLock<FxIndexMap<Symbol, (usize, Target)>> = LazyLock::new(|| {
+            let mut item_refs = FxIndexMap::default();
             $( item_refs.insert($module::$name, (LangItem::$variant as usize, $target)); )*
             item_refs
         });
@@ -166,36 +167,6 @@ pub fn extract(attrs: &[ast::Attribute]) -> Option<(Symbol, Span)> {
 
 language_item_table! {
 //  Variant name,            Name,                     Method name,                Target                  Generic requirements;
-    Bool,                    sym::bool,                bool_impl,                  Target::Impl,           GenericRequirement::None;
-    Char,                    sym::char,                char_impl,                  Target::Impl,           GenericRequirement::None;
-    Str,                     sym::str,                 str_impl,                   Target::Impl,           GenericRequirement::None;
-    Array,                   sym::array,               array_impl,                 Target::Impl,           GenericRequirement::None;
-    Slice,                   sym::slice,               slice_impl,                 Target::Impl,           GenericRequirement::None;
-    SliceU8,                 sym::slice_u8,            slice_u8_impl,              Target::Impl,           GenericRequirement::None;
-    StrAlloc,                sym::str_alloc,           str_alloc_impl,             Target::Impl,           GenericRequirement::None;
-    SliceAlloc,              sym::slice_alloc,         slice_alloc_impl,           Target::Impl,           GenericRequirement::None;
-    SliceU8Alloc,            sym::slice_u8_alloc,      slice_u8_alloc_impl,        Target::Impl,           GenericRequirement::None;
-    ConstPtr,                sym::const_ptr,           const_ptr_impl,             Target::Impl,           GenericRequirement::None;
-    MutPtr,                  sym::mut_ptr,             mut_ptr_impl,               Target::Impl,           GenericRequirement::None;
-    ConstSlicePtr,           sym::const_slice_ptr,     const_slice_ptr_impl,       Target::Impl,           GenericRequirement::None;
-    MutSlicePtr,             sym::mut_slice_ptr,       mut_slice_ptr_impl,         Target::Impl,           GenericRequirement::None;
-    I8,                      sym::i8,                  i8_impl,                    Target::Impl,           GenericRequirement::None;
-    I16,                     sym::i16,                 i16_impl,                   Target::Impl,           GenericRequirement::None;
-    I32,                     sym::i32,                 i32_impl,                   Target::Impl,           GenericRequirement::None;
-    I64,                     sym::i64,                 i64_impl,                   Target::Impl,           GenericRequirement::None;
-    I128,                    sym::i128,                i128_impl,                  Target::Impl,           GenericRequirement::None;
-    Isize,                   sym::isize,               isize_impl,                 Target::Impl,           GenericRequirement::None;
-    U8,                      sym::u8,                  u8_impl,                    Target::Impl,           GenericRequirement::None;
-    U16,                     sym::u16,                 u16_impl,                   Target::Impl,           GenericRequirement::None;
-    U32,                     sym::u32,                 u32_impl,                   Target::Impl,           GenericRequirement::None;
-    U64,                     sym::u64,                 u64_impl,                   Target::Impl,           GenericRequirement::None;
-    U128,                    sym::u128,                u128_impl,                  Target::Impl,           GenericRequirement::None;
-    Usize,                   sym::usize,               usize_impl,                 Target::Impl,           GenericRequirement::None;
-    F32,                     sym::f32,                 f32_impl,                   Target::Impl,           GenericRequirement::None;
-    F64,                     sym::f64,                 f64_impl,                   Target::Impl,           GenericRequirement::None;
-    F32Runtime,              sym::f32_runtime,         f32_runtime_impl,           Target::Impl,           GenericRequirement::None;
-    F64Runtime,              sym::f64_runtime,         f64_runtime_impl,           Target::Impl,           GenericRequirement::None;
-
     Sized,                   sym::sized,               sized_trait,                Target::Trait,          GenericRequirement::Exact(0);
     Unsize,                  sym::unsize,              unsize_trait,               Target::Trait,          GenericRequirement::Minimum(1);
     /// Trait injected by `#[derive(PartialEq)]`, (i.e. "Partial EQ").
@@ -216,9 +187,14 @@ language_item_table! {
     Freeze,                  sym::freeze,              freeze_trait,               Target::Trait,          GenericRequirement::Exact(0);
 
     Drop,                    sym::drop,                drop_trait,                 Target::Trait,          GenericRequirement::None;
+    Destruct,                sym::destruct,            destruct_trait,             Target::Trait,          GenericRequirement::None;
 
     CoerceUnsized,           sym::coerce_unsized,      coerce_unsized_trait,       Target::Trait,          GenericRequirement::Minimum(1);
     DispatchFromDyn,         sym::dispatch_from_dyn,   dispatch_from_dyn_trait,    Target::Trait,          GenericRequirement::Minimum(1);
+
+    // language items relating to transmutability
+    TransmuteOpts,           sym::transmute_opts,      transmute_opts,             Target::Struct,         GenericRequirement::Exact(0);
+    TransmuteTrait,          sym::transmute_trait,     transmute_trait,            Target::Trait,          GenericRequirement::Exact(3);
 
     Add(Op),                 sym::add,                 add_trait,                  Target::Trait,          GenericRequirement::Exact(1);
     Sub(Op),                 sym::sub,                 sub_trait,                  Target::Trait,          GenericRequirement::Exact(1);
@@ -262,7 +238,6 @@ language_item_table! {
     Future,                  sym::future_trait,        future_trait,               Target::Trait,          GenericRequirement::Exact(0);
     GeneratorState,          sym::generator_state,     gen_state,                  Target::Enum,           GenericRequirement::None;
     Generator,               sym::generator,           gen_trait,                  Target::Trait,          GenericRequirement::Minimum(1);
-    GeneratorReturn,         sym::generator_return,    generator_return,           Target::AssocTy,        GenericRequirement::None;
     Unpin,                   sym::unpin,               unpin_trait,                Target::Trait,          GenericRequirement::None;
     Pin,                     sym::pin,                 pin_type,                   Target::Struct,         GenericRequirement::None;
 
@@ -293,8 +268,6 @@ language_item_table! {
     DropInPlace,             sym::drop_in_place,       drop_in_place_fn,           Target::Fn,             GenericRequirement::Minimum(1);
     Oom,                     sym::oom,                 oom,                        Target::Fn,             GenericRequirement::None;
     AllocLayout,             sym::alloc_layout,        alloc_layout,               Target::Struct,         GenericRequirement::None;
-    ConstEvalSelect,         sym::const_eval_select,   const_eval_select,          Target::Fn,             GenericRequirement::Exact(4);
-    ConstConstEvalSelect,    sym::const_eval_select_ct,const_eval_select_ct,       Target::Fn,             GenericRequirement::Exact(4);
 
     Start,                   sym::start,               start_fn,                   Target::Fn,             GenericRequirement::Exact(1);
 
@@ -316,12 +289,15 @@ language_item_table! {
 
     Try,                     sym::Try,                 try_trait,                  Target::Trait,          GenericRequirement::None;
 
+    Tuple,                   sym::tuple_trait,         tuple_trait,                Target::Trait,          GenericRequirement::Exact(0);
+
     SliceLen,                sym::slice_len_fn,        slice_len_fn,               Target::Method(MethodKind::Inherent), GenericRequirement::None;
 
     // Language items from AST lowering
     TryTraitFromResidual,    sym::from_residual,       from_residual_fn,           Target::Method(MethodKind::Trait { body: false }), GenericRequirement::None;
     TryTraitFromOutput,      sym::from_output,         from_output_fn,             Target::Method(MethodKind::Trait { body: false }), GenericRequirement::None;
     TryTraitBranch,          sym::branch,              branch_fn,                  Target::Method(MethodKind::Trait { body: false }), GenericRequirement::None;
+    TryTraitFromYeet,        sym::from_yeet,           from_yeet_fn,               Target::Fn,             GenericRequirement::None;
 
     PollReady,               sym::Ready,               poll_ready_variant,         Target::Variant,        GenericRequirement::None;
     PollPending,             sym::Pending,             poll_pending_variant,       Target::Variant,        GenericRequirement::None;

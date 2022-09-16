@@ -3,7 +3,7 @@ use rustc_index::vec::IndexVec;
 use rustc_middle::middle::codegen_fn_attrs::CodegenFnAttrFlags;
 use rustc_middle::mir;
 use rustc_middle::ty;
-use rustc_middle::ty::layout::LayoutOf;
+use rustc_middle::ty::layout::{HasTyCtxt, LayoutOf};
 use rustc_session::config::DebugInfo;
 use rustc_span::symbol::{kw, Symbol};
 use rustc_span::{BytePos, Span};
@@ -39,8 +39,7 @@ pub struct PerLocalVarDebugInfo<'tcx, D> {
 
 #[derive(Clone, Copy, Debug)]
 pub struct DebugScope<S, L> {
-    // FIXME(eddyb) this should never be `None`, after initialization.
-    pub dbg_scope: Option<S>,
+    pub dbg_scope: S,
 
     /// Call site location, if this scope was inlined from another function.
     pub inlined_at: Option<L>,
@@ -61,17 +60,12 @@ impl<'tcx, S: Copy, L: Copy> DebugScope<S, L> {
         cx: &Cx,
         span: Span,
     ) -> S {
-        // FIXME(eddyb) this should never be `None`.
-        let dbg_scope = self
-            .dbg_scope
-            .unwrap_or_else(|| bug!("`dbg_scope` is only `None` during initialization"));
-
         let pos = span.lo();
         if pos < self.file_start_pos || pos >= self.file_end_pos {
             let sm = cx.sess().source_map();
-            cx.extend_scope_to_file(dbg_scope, &sm.lookup_char_pos(pos).file)
+            cx.extend_scope_to_file(self.dbg_scope, &sm.lookup_char_pos(pos).file)
         } else {
-            dbg_scope
+            self.dbg_scope
         }
     }
 }
@@ -99,15 +93,15 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
     }
 
     /// In order to have a good line stepping behavior in debugger, we overwrite debug
-    /// locations of macro expansions with that of the outermost expansion site
-    /// (unless the crate is being compiled with `-Z debug-macros`).
+    /// locations of macro expansions with that of the outermost expansion site (when the macro is
+    /// annotated with `#[collapse_debuginfo]` or when `-Zdebug-macros` is provided).
     fn adjust_span_for_debugging(&self, mut span: Span) -> Span {
         // Bail out if debug info emission is not enabled.
         if self.debug_context.is_none() {
             return span;
         }
 
-        if span.from_expansion() && !self.cx.sess().opts.debugging_opts.debug_macros {
+        if self.cx.tcx().should_collapse_debuginfo(span) {
             // Walk up the macro expansion chain until we reach a non-expanded span.
             // We also stop at the function body level because no line stepping can occur
             // at the level above that.

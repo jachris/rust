@@ -2,11 +2,13 @@ use rustc_hir as hir;
 use rustc_hir::def_id::DefId;
 use rustc_infer::infer::at::ToTrace;
 use rustc_infer::infer::canonical::{Canonical, QueryResponse};
-use rustc_infer::infer::{InferCtxt, TyCtxtInferExt};
-use rustc_infer::traits::TraitEngineExt as _;
+use rustc_infer::infer::{DefiningAnchor, InferCtxt, TyCtxtInferExt};
+use rustc_infer::traits::{ObligationCauseCode, TraitEngineExt as _};
 use rustc_middle::ty::query::Providers;
 use rustc_middle::ty::subst::{GenericArg, Subst, UserSelfTy, UserSubsts};
-use rustc_middle::ty::{self, FnSig, Lift, PolyFnSig, Ty, TyCtxt, TypeFoldable, Variance};
+use rustc_middle::ty::{
+    self, EarlyBinder, FnSig, Lift, PolyFnSig, Ty, TyCtxt, TypeFoldable, Variance,
+};
 use rustc_middle::ty::{ParamEnv, ParamEnvAnd, Predicate, ToPredicate};
 use rustc_span::{Span, DUMMY_SP};
 use rustc_trait_selection::infer::InferCtxtBuilderExt;
@@ -20,8 +22,9 @@ use rustc_trait_selection::traits::query::type_op::subtype::Subtype;
 use rustc_trait_selection::traits::query::{Fallible, NoSolution};
 use rustc_trait_selection::traits::{Normalized, Obligation, ObligationCause, TraitEngine};
 use std::fmt;
+use std::iter::zip;
 
-crate fn provide(p: &mut Providers) {
+pub(crate) fn provide(p: &mut Providers) {
     *p = Providers {
         type_op_ascribe_user_type,
         type_op_eq,
@@ -59,14 +62,15 @@ pub fn type_op_ascribe_user_type_with_span<'a, 'tcx: 'a>(
         mir_ty, def_id, user_substs
     );
 
-    let mut cx = AscribeUserTypeCx { infcx, param_env, fulfill_cx };
-    cx.relate_mir_and_user_ty(mir_ty, def_id, user_substs, span)?;
+    let mut cx = AscribeUserTypeCx { infcx, param_env, span: span.unwrap_or(DUMMY_SP), fulfill_cx };
+    cx.relate_mir_and_user_ty(mir_ty, def_id, user_substs)?;
     Ok(())
 }
 
 struct AscribeUserTypeCx<'me, 'tcx> {
     infcx: &'me InferCtxt<'me, 'tcx>,
     param_env: ParamEnv<'tcx>,
+    span: Span,
     fulfill_cx: &'me mut dyn TraitEngine<'tcx>,
 }
 
@@ -77,7 +81,7 @@ impl<'me, 'tcx> AscribeUserTypeCx<'me, 'tcx> {
     {
         self.infcx
             .partially_normalize_associated_types_in(
-                ObligationCause::misc(DUMMY_SP, hir::CRATE_HIR_ID),
+                ObligationCause::misc(self.span, hir::CRATE_HIR_ID),
                 self.param_env,
                 value,
             )
@@ -89,18 +93,13 @@ impl<'me, 'tcx> AscribeUserTypeCx<'me, 'tcx> {
         T: ToTrace<'tcx>,
     {
         self.infcx
-            .at(&ObligationCause::dummy(), self.param_env)
+            .at(&ObligationCause::dummy_with_span(self.span), self.param_env)
             .relate(a, variance, b)?
             .into_value_registering_obligations(self.infcx, self.fulfill_cx);
         Ok(())
     }
 
-    fn prove_predicate(&mut self, predicate: Predicate<'tcx>, span: Option<Span>) {
-        let cause = if let Some(span) = span {
-            ObligationCause::dummy_with_span(span)
-        } else {
-            ObligationCause::dummy()
-        };
+    fn prove_predicate(&mut self, predicate: Predicate<'tcx>, cause: ObligationCause<'tcx>) {
         self.fulfill_cx.register_predicate_obligation(
             self.infcx,
             Obligation::new(cause, self.param_env, predicate),
@@ -115,23 +114,23 @@ impl<'me, 'tcx> AscribeUserTypeCx<'me, 'tcx> {
     where
         T: TypeFoldable<'tcx>,
     {
-        value.subst(self.tcx(), substs)
+        EarlyBinder(value).subst(self.tcx(), substs)
     }
 
+    #[instrument(level = "debug", skip(self))]
     fn relate_mir_and_user_ty(
         &mut self,
         mir_ty: Ty<'tcx>,
         def_id: DefId,
         user_substs: UserSubsts<'tcx>,
-        span: Option<Span>,
     ) -> Result<(), NoSolution> {
         let UserSubsts { user_self_ty, substs } = user_substs;
         let tcx = self.tcx();
 
         let ty = tcx.type_of(def_id);
         let ty = self.subst(ty, substs);
-        debug!("relate_type_and_user_type: ty of def-id is {:?}", ty);
         let ty = self.normalize(ty);
+        debug!("relate_type_and_user_type: ty of def-id is {:?}", ty);
 
         self.relate(mir_ty, Variance::Invariant, ty)?;
 
@@ -142,10 +141,20 @@ impl<'me, 'tcx> AscribeUserTypeCx<'me, 'tcx> {
         // outlives" error messages.
         let instantiated_predicates =
             self.tcx().predicates_of(def_id).instantiate(self.tcx(), substs);
-        debug!(?instantiated_predicates.predicates);
-        for instantiated_predicate in instantiated_predicates.predicates {
-            let instantiated_predicate = self.normalize(instantiated_predicate);
-            self.prove_predicate(instantiated_predicate, span);
+
+        let cause = ObligationCause::dummy_with_span(self.span);
+
+        debug!(?instantiated_predicates);
+        for (instantiated_predicate, predicate_span) in
+            zip(instantiated_predicates.predicates, instantiated_predicates.spans)
+        {
+            let span = if self.span == DUMMY_SP { predicate_span } else { self.span };
+            let cause = ObligationCause::new(
+                span,
+                hir::CRATE_HIR_ID,
+                ObligationCauseCode::AscribeUserTypeProvePredicate(predicate_span),
+            );
+            self.prove_predicate(instantiated_predicate, cause);
         }
 
         if let Some(UserSelfTy { impl_def_id, self_ty }) = user_self_ty {
@@ -158,7 +167,7 @@ impl<'me, 'tcx> AscribeUserTypeCx<'me, 'tcx> {
             self.prove_predicate(
                 ty::Binder::dummy(ty::PredicateKind::WellFormed(impl_self_ty.into()))
                     .to_predicate(self.tcx()),
-                span,
+                cause.clone(),
             );
         }
 
@@ -175,7 +184,7 @@ impl<'me, 'tcx> AscribeUserTypeCx<'me, 'tcx> {
         // which...could happen with normalization...
         self.prove_predicate(
             ty::Binder::dummy(ty::PredicateKind::WellFormed(ty.into())).to_predicate(self.tcx()),
-            span,
+            cause,
         );
         Ok(())
     }
@@ -256,10 +265,15 @@ fn type_op_prove_predicate<'tcx>(
     tcx: TyCtxt<'tcx>,
     canonicalized: Canonical<'tcx, ParamEnvAnd<'tcx, ProvePredicate<'tcx>>>,
 ) -> Result<&'tcx Canonical<'tcx, QueryResponse<'tcx, ()>>, NoSolution> {
-    tcx.infer_ctxt().enter_canonical_trait_query(&canonicalized, |infcx, fulfill_cx, key| {
-        type_op_prove_predicate_with_cause(infcx, fulfill_cx, key, ObligationCause::dummy());
-        Ok(())
-    })
+    // HACK This bubble is required for this test to pass:
+    // impl-trait/issue-99642.rs
+    tcx.infer_ctxt().with_opaque_type_inference(DefiningAnchor::Bubble).enter_canonical_trait_query(
+        &canonicalized,
+        |infcx, fulfill_cx, key| {
+            type_op_prove_predicate_with_cause(infcx, fulfill_cx, key, ObligationCause::dummy());
+            Ok(())
+        },
+    )
 }
 
 /// The core of the `type_op_prove_predicate` query: for diagnostics purposes in NLL HRTB errors,

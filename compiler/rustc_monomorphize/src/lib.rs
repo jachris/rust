@@ -1,10 +1,10 @@
 #![feature(array_windows)]
-#![feature(bool_to_option)]
-#![feature(crate_visibility_modifier)]
 #![feature(control_flow_enum)]
 #![feature(let_else)]
 #![recursion_limit = "256"]
-#![cfg_attr(not(bootstrap), allow(rustc::potential_query_instability))]
+#![allow(rustc::potential_query_instability)]
+#![deny(rustc::untranslatable_diagnostic)]
+#![deny(rustc::diagnostic_outside_of_impl)]
 
 #[macro_use]
 extern crate tracing;
@@ -18,6 +18,7 @@ use rustc_middle::ty::query::Providers;
 use rustc_middle::ty::{self, Ty, TyCtxt};
 
 mod collector;
+mod errors;
 mod partitioning;
 mod polymorphize;
 mod util;
@@ -34,7 +35,7 @@ fn custom_coerce_unsize_info<'tcx>(
         substs: tcx.mk_substs_trait(source_ty, &[target_ty.into()]),
     });
 
-    match tcx.codegen_fulfill_obligation((ty::ParamEnv::reveal_all(), trait_ref)) {
+    match tcx.codegen_select_candidate((ty::ParamEnv::reveal_all(), trait_ref)) {
         Ok(traits::ImplSource::UserDefined(traits::ImplSourceUserDefinedData {
             impl_def_id,
             ..

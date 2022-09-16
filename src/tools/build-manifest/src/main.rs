@@ -117,6 +117,7 @@ static TARGETS: &[&str] = &[
     "powerpc64-unknown-linux-gnu",
     "powerpc64le-unknown-linux-gnu",
     "riscv32i-unknown-none-elf",
+    "riscv32im-unknown-none-elf",
     "riscv32imc-unknown-none-elf",
     "riscv32imac-unknown-none-elf",
     "riscv32gc-unknown-linux-gnu",
@@ -151,6 +152,7 @@ static TARGETS: &[&str] = &[
     "x86_64-unknown-linux-gnux32",
     "x86_64-unknown-linux-musl",
     "x86_64-unknown-netbsd",
+    "x86_64-unknown-none",
     "x86_64-unknown-redox",
     "x86_64-unknown-hermit",
 ];
@@ -182,7 +184,7 @@ static PKG_INSTALLERS: &[&str] = &["x86_64-apple-darwin", "aarch64-apple-darwin"
 
 static MINGW: &[&str] = &["i686-pc-windows-gnu", "x86_64-pc-windows-gnu"];
 
-static NIGHTLY_ONLY_COMPONENTS: &[&str] = &["miri-preview", "rust-analyzer-preview"];
+static NIGHTLY_ONLY_COMPONENTS: &[&str] = &["miri-preview"];
 
 macro_rules! t {
     ($e:expr) => {
@@ -208,7 +210,7 @@ fn main() {
     let num_threads = if let Some(num) = env::var_os("BUILD_MANIFEST_NUM_THREADS") {
         num.to_str().unwrap().parse().expect("invalid number for BUILD_MANIFEST_NUM_THREADS")
     } else {
-        num_cpus::get()
+        std::thread::available_parallelism().map_or(1, std::num::NonZeroUsize::get)
     };
     rayon::ThreadPoolBuilder::new()
         .num_threads(num_threads)
@@ -401,6 +403,7 @@ impl Builder {
         rename("rustfmt", "rustfmt-preview");
         rename("clippy", "clippy-preview");
         rename("miri", "miri-preview");
+        rename("rust-analyzer", "rust-analyzer-preview");
     }
 
     fn rust_package(&mut self, manifest: &Manifest) -> Package {

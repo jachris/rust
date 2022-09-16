@@ -45,7 +45,7 @@ pub enum CallKind<'tcx> {
     },
     /// A call to `Fn(..)::call(..)`, desugared from `my_closure(a, b, c)`
     FnCall { fn_trait_id: DefId, self_ty: Ty<'tcx> },
-    /// A call to an operator trait, desuraged from operator syntax (e.g. `a << b`)
+    /// A call to an operator trait, desugared from operator syntax (e.g. `a << b`)
     Operator { self_arg: Option<Ident>, trait_id: DefId, self_ty: Ty<'tcx> },
     DerefCoercion {
         /// The `Span` of the `Target` associated type
@@ -66,9 +66,12 @@ pub fn call_kind<'tcx>(
     from_hir_call: bool,
     self_arg: Option<Ident>,
 ) -> CallKind<'tcx> {
-    let parent = tcx.opt_associated_item(method_did).and_then(|assoc| match assoc.container {
-        AssocItemContainer::ImplContainer(impl_did) => tcx.trait_id_of_impl(impl_did),
-        AssocItemContainer::TraitContainer(trait_did) => Some(trait_did),
+    let parent = tcx.opt_associated_item(method_did).and_then(|assoc| {
+        let container_id = assoc.container_id(tcx);
+        match assoc.container {
+            AssocItemContainer::ImplContainer => tcx.trait_id_of_impl(container_id),
+            AssocItemContainer::TraitContainer => Some(container_id),
+        }
     });
 
     let fn_call = parent
@@ -128,11 +131,11 @@ pub fn call_kind<'tcx>(
         } else {
             None
         };
-        let parent_self_ty = tcx
-            .parent(method_did)
-            .filter(|did| tcx.def_kind(*did) == rustc_hir::def::DefKind::Impl)
+        let parent_did = tcx.parent(method_did);
+        let parent_self_ty = (tcx.def_kind(parent_did) == rustc_hir::def::DefKind::Impl)
+            .then_some(parent_did)
             .and_then(|did| match tcx.type_of(did).kind() {
-                ty::Adt(def, ..) => Some(def.did),
+                ty::Adt(def, ..) => Some(def.did()),
                 _ => None,
             });
         let is_option_or_result = parent_self_ty.map_or(false, |def_id| {

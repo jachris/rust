@@ -1,3 +1,5 @@
+#![deny(rustc::untranslatable_diagnostic)]
+#![deny(rustc::diagnostic_outside_of_impl)]
 #![feature(allow_internal_unstable)]
 #![feature(bench_black_box)]
 #![feature(extend_one)]
@@ -11,6 +13,8 @@
 pub mod bit_set;
 pub mod interval;
 pub mod vec;
+
+pub use rustc_macros::newtype_index;
 
 /// Type size assertion. The first argument is a type and the second argument is its expected size.
 #[macro_export]

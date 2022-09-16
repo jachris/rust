@@ -11,7 +11,7 @@ use rustc_errors::Applicability;
 use rustc_hir::{
     hir_id::HirIdSet,
     intravisit::{walk_expr, Visitor},
-    Block, Expr, ExprKind, Guard, HirId, Pat, Stmt, StmtKind, UnOp,
+    Block, Expr, ExprKind, Guard, HirId, Let, Pat, Stmt, StmtKind, UnOp,
 };
 use rustc_lint::{LateContext, LateLintPass};
 use rustc_session::{declare_lint_pass, declare_tool_lint};
@@ -46,7 +46,7 @@ declare_clippy_lint! {
     ///     map.insert(k, v);
     /// }
     /// ```
-    /// can both be rewritten as:
+    /// Use instead:
     /// ```rust
     /// # use std::collections::HashMap;
     /// # let mut map = HashMap::new();
@@ -63,7 +63,7 @@ declare_clippy_lint! {
 declare_lint_pass!(HashMapPass => [MAP_ENTRY]);
 
 impl<'tcx> LateLintPass<'tcx> for HashMapPass {
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     fn check_expr(&mut self, cx: &LateContext<'tcx>, expr: &'tcx Expr<'_>) {
         let (cond_expr, then_expr, else_expr) = match higher::If::hir(expr) {
             Some(higher::If { cond, then, r#else }) => (cond, then, r#else),
@@ -245,8 +245,8 @@ fn try_parse_contains<'tcx>(cx: &LateContext<'_>, expr: &'tcx Expr<'_>) -> Optio
     match expr.kind {
         ExprKind::MethodCall(
             _,
+            map,
             [
-                map,
                 Expr {
                     kind: ExprKind::AddrOf(_, _, key),
                     span: key_span,
@@ -280,7 +280,7 @@ struct InsertExpr<'tcx> {
     value: &'tcx Expr<'tcx>,
 }
 fn try_parse_insert<'tcx>(cx: &LateContext<'tcx>, expr: &'tcx Expr<'_>) -> Option<InsertExpr<'tcx>> {
-    if let ExprKind::MethodCall(_, [map, key, value], _) = expr.kind {
+    if let ExprKind::MethodCall(_, map, [key, value], _) = expr.kind {
         let id = cx.typeck_results().type_dependent_def_id(expr.hir_id)?;
         if match_def_path(cx, id, &paths::BTREEMAP_INSERT) || match_def_path(cx, id, &paths::HASHMAP_INSERT) {
             Some(InsertExpr { map, key, value })
@@ -319,7 +319,7 @@ struct Insertion<'tcx> {
 ///   `or_insert_with`.
 /// * Determine if there's any sub-expression that can't be placed in a closure.
 /// * Determine if there's only a single insert statement. `or_insert` can be used in this case.
-#[allow(clippy::struct_excessive_bools)]
+#[expect(clippy::struct_excessive_bools)]
 struct InsertSearcher<'cx, 'tcx> {
     cx: &'cx LateContext<'tcx>,
     /// The map expression used in the contains call.
@@ -478,7 +478,7 @@ impl<'tcx> Visitor<'tcx> for InsertSearcher<'_, 'tcx> {
                     let mut is_map_used = self.is_map_used;
                     for arm in arms {
                         self.visit_pat(arm.pat);
-                        if let Some(Guard::If(guard) | Guard::IfLet(_, guard)) = arm.guard {
+                        if let Some(Guard::If(guard) | Guard::IfLet(&Let { init: guard, .. })) = arm.guard {
                             self.visit_non_tail_expr(guard);
                         }
                         is_map_used |= self.visit_cond_arm(arm.body);
@@ -650,7 +650,7 @@ fn find_insert_calls<'tcx>(
     let allow_insert_closure = s.allow_insert_closure;
     let is_single_insert = s.is_single_insert;
     let edits = s.edits;
-    s.can_use_entry.then(|| InsertSearchResults {
+    s.can_use_entry.then_some(InsertSearchResults {
         edits,
         allow_insert_closure,
         is_single_insert,

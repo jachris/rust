@@ -6,14 +6,15 @@ use crate::infer::at::At;
 use crate::infer::canonical::OriginalQueryValues;
 use crate::infer::{InferCtxt, InferOk};
 use crate::traits::error_reporting::InferCtxtExt;
-use crate::traits::project::needs_normalization;
+use crate::traits::project::{needs_normalization, BoundVarReplacer, PlaceholderReplacer};
 use crate::traits::{Obligation, ObligationCause, PredicateObligation, Reveal};
 use rustc_data_structures::sso::SsoHashMap;
 use rustc_data_structures::stack::ensure_sufficient_stack;
 use rustc_infer::traits::Normalized;
 use rustc_middle::mir;
-use rustc_middle::ty::fold::{FallibleTypeFolder, TypeFoldable, TypeFolder};
+use rustc_middle::ty::fold::{FallibleTypeFolder, TypeFoldable, TypeSuperFoldable};
 use rustc_middle::ty::subst::Subst;
+use rustc_middle::ty::visit::{TypeSuperVisitable, TypeVisitable};
 use rustc_middle::ty::{self, Ty, TyCtxt, TypeVisitor};
 
 use std::ops::ControlFlow;
@@ -47,10 +48,11 @@ impl<'cx, 'tcx> AtExt<'tcx> for At<'cx, 'tcx> {
         T: TypeFoldable<'tcx>,
     {
         debug!(
-            "normalize::<{}>(value={:?}, param_env={:?})",
+            "normalize::<{}>(value={:?}, param_env={:?}, cause={:?})",
             std::any::type_name::<T>(),
             value,
             self.param_env,
+            self.cause,
         );
         if !needs_normalization(&value, self.param_env.reveal()) {
             return Ok(Normalized { value, obligations: vec![] });
@@ -100,7 +102,7 @@ impl<'cx, 'tcx> AtExt<'tcx> for At<'cx, 'tcx> {
     }
 }
 
-/// Visitor to find the maximum escaping bound var
+// Visitor to find the maximum escaping bound var
 struct MaxEscapingBoundVarVisitor {
     // The index which would count as escaping
     outer_index: ty::DebruijnIndex,
@@ -108,7 +110,7 @@ struct MaxEscapingBoundVarVisitor {
 }
 
 impl<'tcx> TypeVisitor<'tcx> for MaxEscapingBoundVarVisitor {
-    fn visit_binder<T: TypeFoldable<'tcx>>(
+    fn visit_binder<T: TypeVisitable<'tcx>>(
         &mut self,
         t: &ty::Binder<'tcx, T>,
     ) -> ControlFlow<Self::BreakTy> {
@@ -141,7 +143,7 @@ impl<'tcx> TypeVisitor<'tcx> for MaxEscapingBoundVarVisitor {
     }
 
     fn visit_const(&mut self, ct: ty::Const<'tcx>) -> ControlFlow<Self::BreakTy> {
-        match ct.val() {
+        match ct.kind() {
             ty::ConstKind::Bound(debruijn, _) if debruijn >= self.outer_index => {
                 self.escaping =
                     self.escaping.max(debruijn.as_usize() - self.outer_index.as_usize());
@@ -162,15 +164,13 @@ struct QueryNormalizer<'cx, 'tcx> {
     universes: Vec<Option<ty::UniverseIndex>>,
 }
 
-impl<'cx, 'tcx> TypeFolder<'tcx> for QueryNormalizer<'cx, 'tcx> {
+impl<'cx, 'tcx> FallibleTypeFolder<'tcx> for QueryNormalizer<'cx, 'tcx> {
     type Error = NoSolution;
 
     fn tcx<'c>(&'c self) -> TyCtxt<'tcx> {
         self.infcx.tcx
     }
-}
 
-impl<'cx, 'tcx> FallibleTypeFolder<'tcx> for QueryNormalizer<'cx, 'tcx> {
     fn try_fold_binder<T: TypeFoldable<'tcx>>(
         &mut self,
         t: ty::Binder<'tcx, T>,
@@ -205,7 +205,7 @@ impl<'cx, 'tcx> FallibleTypeFolder<'tcx> for QueryNormalizer<'cx, 'tcx> {
                     Reveal::UserFacing => ty.try_super_fold_with(self),
 
                     Reveal::All => {
-                        let substs = substs.try_super_fold_with(self)?;
+                        let substs = substs.try_fold_with(self)?;
                         let recursion_limit = self.tcx().recursion_limit();
                         if !recursion_limit.value_within_limit(self.anon_depth) {
                             let obligation = Obligation::with_depth(
@@ -217,7 +217,7 @@ impl<'cx, 'tcx> FallibleTypeFolder<'tcx> for QueryNormalizer<'cx, 'tcx> {
                             self.infcx.report_overflow_error(&obligation, true);
                         }
 
-                        let generic_ty = self.tcx().type_of(def_id);
+                        let generic_ty = self.tcx().bound_type_of(def_id);
                         let concrete_ty = generic_ty.subst(self.tcx(), substs);
                         self.anon_depth += 1;
                         if concrete_ty == ty {
@@ -242,7 +242,7 @@ impl<'cx, 'tcx> FallibleTypeFolder<'tcx> for QueryNormalizer<'cx, 'tcx> {
                 // we don't need to replace them with placeholders (see branch below).
 
                 let tcx = self.infcx.tcx;
-                let data = data.try_super_fold_with(self)?;
+                let data = data.try_fold_with(self)?;
 
                 let mut orig_values = OriginalQueryValues::default();
                 // HACK(matthewjasper) `'static` is special-cased in selection,
@@ -255,7 +255,7 @@ impl<'cx, 'tcx> FallibleTypeFolder<'tcx> for QueryNormalizer<'cx, 'tcx> {
                 let result = tcx.normalize_projection_ty(c_data)?;
                 // We don't expect ambiguity.
                 if result.is_ambiguous() {
-                    return Err(NoSolution);
+                    bug!("unexpected ambiguity: {:?} {:?}", c_data, result);
                 }
                 let InferOk { value: result, obligations } =
                     self.infcx.instantiate_query_response_and_region_obligations(
@@ -267,7 +267,15 @@ impl<'cx, 'tcx> FallibleTypeFolder<'tcx> for QueryNormalizer<'cx, 'tcx> {
                 debug!("QueryNormalizer: result = {:#?}", result);
                 debug!("QueryNormalizer: obligations = {:#?}", obligations);
                 self.obligations.extend(obligations);
-                Ok(result.normalized_ty)
+
+                let res = result.normalized_ty;
+                // `tcx.normalize_projection_ty` may normalize to a type that still has
+                // unevaluated consts, so keep normalizing here if that's the case.
+                if res != ty && res.has_type_flags(ty::TypeFlags::HAS_CT_PROJECTION) {
+                    Ok(res.try_super_fold_with(self)?)
+                } else {
+                    Ok(res)
+                }
             }
 
             ty::Projection(data) => {
@@ -276,12 +284,8 @@ impl<'cx, 'tcx> FallibleTypeFolder<'tcx> for QueryNormalizer<'cx, 'tcx> {
                 let tcx = self.infcx.tcx;
                 let infcx = self.infcx;
                 let (data, mapped_regions, mapped_types, mapped_consts) =
-                    crate::traits::project::BoundVarReplacer::replace_bound_vars(
-                        infcx,
-                        &mut self.universes,
-                        data,
-                    );
-                let data = data.try_super_fold_with(self)?;
+                    BoundVarReplacer::replace_bound_vars(infcx, &mut self.universes, data);
+                let data = data.try_fold_with(self)?;
 
                 let mut orig_values = OriginalQueryValues::default();
                 // HACK(matthewjasper) `'static` is special-cased in selection,
@@ -294,7 +298,7 @@ impl<'cx, 'tcx> FallibleTypeFolder<'tcx> for QueryNormalizer<'cx, 'tcx> {
                 let result = tcx.normalize_projection_ty(c_data)?;
                 // We don't expect ambiguity.
                 if result.is_ambiguous() {
-                    return Err(NoSolution);
+                    bug!("unexpected ambiguity: {:?} {:?}", c_data, result);
                 }
                 let InferOk { value: result, obligations } =
                     self.infcx.instantiate_query_response_and_region_obligations(
@@ -306,18 +310,26 @@ impl<'cx, 'tcx> FallibleTypeFolder<'tcx> for QueryNormalizer<'cx, 'tcx> {
                 debug!("QueryNormalizer: result = {:#?}", result);
                 debug!("QueryNormalizer: obligations = {:#?}", obligations);
                 self.obligations.extend(obligations);
-                Ok(crate::traits::project::PlaceholderReplacer::replace_placeholders(
+                let res = PlaceholderReplacer::replace_placeholders(
                     infcx,
                     mapped_regions,
                     mapped_types,
                     mapped_consts,
                     &self.universes,
                     result.normalized_ty,
-                ))
+                );
+                // `tcx.normalize_projection_ty` may normalize to a type that still has
+                // unevaluated consts, so keep normalizing here if that's the case.
+                if res != ty && res.has_type_flags(ty::TypeFlags::HAS_CT_PROJECTION) {
+                    Ok(res.try_super_fold_with(self)?)
+                } else {
+                    Ok(res)
+                }
             }
 
             _ => ty.try_super_fold_with(self),
         })()?;
+
         self.cache.insert(ty, res);
         Ok(res)
     }
@@ -327,13 +339,47 @@ impl<'cx, 'tcx> FallibleTypeFolder<'tcx> for QueryNormalizer<'cx, 'tcx> {
         constant: ty::Const<'tcx>,
     ) -> Result<ty::Const<'tcx>, Self::Error> {
         let constant = constant.try_super_fold_with(self)?;
-        Ok(constant.eval(self.infcx.tcx, self.param_env))
+        debug!(?constant, ?self.param_env);
+        Ok(crate::traits::project::with_replaced_escaping_bound_vars(
+            self.infcx,
+            &mut self.universes,
+            constant,
+            |constant| constant.eval(self.infcx.tcx, self.param_env),
+        ))
     }
 
     fn try_fold_mir_const(
         &mut self,
         constant: mir::ConstantKind<'tcx>,
     ) -> Result<mir::ConstantKind<'tcx>, Self::Error> {
-        constant.try_super_fold_with(self)
+        Ok(match constant {
+            mir::ConstantKind::Ty(c) => {
+                let const_folded = c.try_super_fold_with(self)?;
+                match const_folded.kind() {
+                    ty::ConstKind::Value(valtree) => {
+                        let tcx = self.infcx.tcx;
+                        let ty = const_folded.ty();
+                        let const_val = tcx.valtree_to_const_val((ty, valtree));
+                        debug!(?ty, ?valtree, ?const_val);
+
+                        mir::ConstantKind::Val(const_val, ty)
+                    }
+                    _ => mir::ConstantKind::Ty(const_folded),
+                }
+            }
+            mir::ConstantKind::Val(_, _) => constant.try_super_fold_with(self)?,
+        })
+    }
+
+    #[inline]
+    fn try_fold_predicate(
+        &mut self,
+        p: ty::Predicate<'tcx>,
+    ) -> Result<ty::Predicate<'tcx>, Self::Error> {
+        if p.allow_normalization() && needs_normalization(&p, self.param_env.reveal()) {
+            p.try_super_fold_with(self)
+        } else {
+            Ok(p)
+        }
     }
 }

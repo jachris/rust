@@ -1,37 +1,50 @@
-//! Traits for working with Errors.
-
+#![doc = include_str!("../../core/src/error.md")]
 #![stable(feature = "rust1", since = "1.0.0")]
-
-// A note about crates and the facade:
-//
-// Originally, the `Error` trait was defined in libcore, and the impls
-// were scattered about. However, coherence objected to this
-// arrangement, because to create the blanket impls for `Box` required
-// knowing that `&str: !Error`, and we have no means to deal with that
-// sort of conflict just now. Therefore, for the time being, we have
-// moved the `Error` trait into libstd. As we evolve a sol'n to the
-// coherence challenge (e.g., specialization, neg impls, etc) we can
-// reconsider what crate these items belong in.
 
 #[cfg(test)]
 mod tests;
 
+#[cfg(bootstrap)]
 use core::array;
+#[cfg(bootstrap)]
 use core::convert::Infallible;
 
+#[cfg(bootstrap)]
 use crate::alloc::{AllocError, LayoutError};
-use crate::any::TypeId;
+#[cfg(bootstrap)]
+use crate::any::Demand;
+#[cfg(bootstrap)]
+use crate::any::{Provider, TypeId};
 use crate::backtrace::Backtrace;
+#[cfg(bootstrap)]
 use crate::borrow::Cow;
+#[cfg(bootstrap)]
 use crate::cell;
+#[cfg(bootstrap)]
 use crate::char;
-use crate::fmt::{self, Debug, Display, Write};
+#[cfg(bootstrap)]
+use crate::fmt::Debug;
+#[cfg(bootstrap)]
+use crate::fmt::Display;
+use crate::fmt::{self, Write};
+#[cfg(bootstrap)]
+use crate::io;
+#[cfg(bootstrap)]
 use crate::mem::transmute;
+#[cfg(bootstrap)]
 use crate::num;
+#[cfg(bootstrap)]
 use crate::str;
+#[cfg(bootstrap)]
 use crate::string;
+#[cfg(bootstrap)]
 use crate::sync::Arc;
+#[cfg(bootstrap)]
 use crate::time;
+
+#[cfg(not(bootstrap))]
+#[stable(feature = "rust1", since = "1.0.0")]
+pub use core::error::Error;
 
 /// `Error` is a trait representing the basic expectations for error values,
 /// i.e., values of type `E` in [`Result<T, E>`].
@@ -45,13 +58,15 @@ use crate::time;
 /// assert_eq!(err.to_string(), "invalid digit found in string");
 /// ```
 ///
-/// Errors may provide cause chain information. [`Error::source()`] is generally
+/// Errors may provide cause information. [`Error::source()`] is generally
 /// used when errors cross "abstraction boundaries". If one module must report
 /// an error that is caused by an error from a lower-level module, it can allow
 /// accessing that error via [`Error::source()`]. This makes it possible for the
 /// high-level module to provide its own errors while also revealing some of the
-/// implementation for debugging via `source` chains.
+/// implementation for debugging.
 #[stable(feature = "rust1", since = "1.0.0")]
+#[cfg_attr(not(test), rustc_diagnostic_item = "Error")]
+#[cfg(bootstrap)]
 pub trait Error: Debug + Display {
     /// The lower-level source of this error, if any.
     ///
@@ -96,7 +111,7 @@ pub trait Error: Debug + Display {
     /// fn main() {
     ///     match get_super_error() {
     ///         Err(e) => {
-    ///             println!("Error: {}", e);
+    ///             println!("Error: {e}");
     ///             println!("Caused by: {}", e.source().unwrap());
     ///         }
     ///         _ => println!("No error"),
@@ -122,40 +137,106 @@ pub trait Error: Debug + Display {
         TypeId::of::<Self>()
     }
 
-    /// Returns a stack backtrace, if available, of where this error occurred.
-    ///
-    /// This function allows inspecting the location, in code, of where an error
-    /// happened. The returned `Backtrace` contains information about the stack
-    /// trace of the OS thread of execution of where the error originated from.
-    ///
-    /// Note that not all errors contain a `Backtrace`. Also note that a
-    /// `Backtrace` may actually be empty. For more information consult the
-    /// `Backtrace` type itself.
-    #[unstable(feature = "backtrace", issue = "53487")]
-    fn backtrace(&self) -> Option<&Backtrace> {
-        None
-    }
-
     /// ```
     /// if let Err(e) = "xc".parse::<u32>() {
     ///     // Print `e` itself, no need for description().
-    ///     eprintln!("Error: {}", e);
+    ///     eprintln!("Error: {e}");
     /// }
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
-    #[rustc_deprecated(since = "1.42.0", reason = "use the Display impl or to_string()")]
+    #[deprecated(since = "1.42.0", note = "use the Display impl or to_string()")]
     fn description(&self) -> &str {
         "description() is deprecated; use Display"
     }
 
     #[stable(feature = "rust1", since = "1.0.0")]
-    #[rustc_deprecated(
+    #[deprecated(
         since = "1.33.0",
-        reason = "replaced by Error::source, which can support downcasting"
+        note = "replaced by Error::source, which can support downcasting"
     )]
     #[allow(missing_docs)]
     fn cause(&self) -> Option<&dyn Error> {
         self.source()
+    }
+
+    /// Provides type based access to context intended for error reports.
+    ///
+    /// Used in conjunction with [`Demand::provide_value`] and [`Demand::provide_ref`] to extract
+    /// references to member variables from `dyn Error` trait objects.
+    ///
+    /// # Example
+    ///
+    /// ```rust
+    /// #![feature(provide_any)]
+    /// #![feature(error_generic_member_access)]
+    /// use core::fmt;
+    /// use core::any::Demand;
+    ///
+    /// #[derive(Debug)]
+    /// struct MyBacktrace {
+    ///     // ...
+    /// }
+    ///
+    /// impl MyBacktrace {
+    ///     fn new() -> MyBacktrace {
+    ///         // ...
+    ///         # MyBacktrace {}
+    ///     }
+    /// }
+    ///
+    /// #[derive(Debug)]
+    /// struct SourceError {
+    ///     // ...
+    /// }
+    ///
+    /// impl fmt::Display for SourceError {
+    ///     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    ///         write!(f, "Example Source Error")
+    ///     }
+    /// }
+    ///
+    /// impl std::error::Error for SourceError {}
+    ///
+    /// #[derive(Debug)]
+    /// struct Error {
+    ///     source: SourceError,
+    ///     backtrace: MyBacktrace,
+    /// }
+    ///
+    /// impl fmt::Display for Error {
+    ///     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    ///         write!(f, "Example Error")
+    ///     }
+    /// }
+    ///
+    /// impl std::error::Error for Error {
+    ///     fn provide<'a>(&'a self, demand: &mut Demand<'a>) {
+    ///         demand
+    ///             .provide_ref::<MyBacktrace>(&self.backtrace)
+    ///             .provide_ref::<dyn std::error::Error + 'static>(&self.source);
+    ///     }
+    /// }
+    ///
+    /// fn main() {
+    ///     let backtrace = MyBacktrace::new();
+    ///     let source = SourceError {};
+    ///     let error = Error { source, backtrace };
+    ///     let dyn_error = &error as &dyn std::error::Error;
+    ///     let backtrace_ref = dyn_error.request_ref::<MyBacktrace>().unwrap();
+    ///
+    ///     assert!(core::ptr::eq(&error.backtrace, backtrace_ref));
+    /// }
+    /// ```
+    #[unstable(feature = "error_generic_member_access", issue = "99301")]
+    #[allow(unused_variables)]
+    fn provide<'a>(&'a self, demand: &mut Demand<'a>) {}
+}
+
+#[cfg(bootstrap)]
+#[unstable(feature = "error_generic_member_access", issue = "99301")]
+impl<'b> Provider for dyn Error + 'b {
+    fn provide<'a>(&'a self, demand: &mut Demand<'a>) {
+        self.provide(demand)
     }
 }
 
@@ -167,6 +248,7 @@ mod private {
     pub struct Internal;
 }
 
+#[cfg(bootstrap)]
 #[stable(feature = "rust1", since = "1.0.0")]
 impl<'a, E: Error + 'a> From<E> for Box<dyn Error + 'a> {
     /// Converts a type of [`Error`] into a box of dyn [`Error`].
@@ -199,6 +281,7 @@ impl<'a, E: Error + 'a> From<E> for Box<dyn Error + 'a> {
     }
 }
 
+#[cfg(bootstrap)]
 #[stable(feature = "rust1", since = "1.0.0")]
 impl<'a, E: Error + Send + Sync + 'a> From<E> for Box<dyn Error + Send + Sync + 'a> {
     /// Converts a type of [`Error`] + [`Send`] + [`Sync`] into a box of
@@ -237,6 +320,7 @@ impl<'a, E: Error + Send + Sync + 'a> From<E> for Box<dyn Error + Send + Sync + 
     }
 }
 
+#[cfg(bootstrap)]
 #[stable(feature = "rust1", since = "1.0.0")]
 impl From<String> for Box<dyn Error + Send + Sync> {
     /// Converts a [`String`] into a box of dyn [`Error`] + [`Send`] + [`Sync`].
@@ -280,6 +364,7 @@ impl From<String> for Box<dyn Error + Send + Sync> {
     }
 }
 
+#[cfg(bootstrap)]
 #[stable(feature = "string_box_error", since = "1.6.0")]
 impl From<String> for Box<dyn Error> {
     /// Converts a [`String`] into a box of dyn [`Error`].
@@ -301,6 +386,7 @@ impl From<String> for Box<dyn Error> {
     }
 }
 
+#[cfg(bootstrap)]
 #[stable(feature = "rust1", since = "1.0.0")]
 impl<'a> From<&str> for Box<dyn Error + Send + Sync + 'a> {
     /// Converts a [`str`] into a box of dyn [`Error`] + [`Send`] + [`Sync`].
@@ -324,6 +410,7 @@ impl<'a> From<&str> for Box<dyn Error + Send + Sync + 'a> {
     }
 }
 
+#[cfg(bootstrap)]
 #[stable(feature = "string_box_error", since = "1.6.0")]
 impl From<&str> for Box<dyn Error> {
     /// Converts a [`str`] into a box of dyn [`Error`].
@@ -345,6 +432,7 @@ impl From<&str> for Box<dyn Error> {
     }
 }
 
+#[cfg(bootstrap)]
 #[stable(feature = "cow_box_error", since = "1.22.0")]
 impl<'a, 'b> From<Cow<'b, str>> for Box<dyn Error + Send + Sync + 'a> {
     /// Converts a [`Cow`] into a box of dyn [`Error`] + [`Send`] + [`Sync`].
@@ -366,6 +454,7 @@ impl<'a, 'b> From<Cow<'b, str>> for Box<dyn Error + Send + Sync + 'a> {
     }
 }
 
+#[cfg(bootstrap)]
 #[stable(feature = "cow_box_error", since = "1.22.0")]
 impl<'a> From<Cow<'a, str>> for Box<dyn Error> {
     /// Converts a [`Cow`] into a box of dyn [`Error`].
@@ -386,9 +475,11 @@ impl<'a> From<Cow<'a, str>> for Box<dyn Error> {
     }
 }
 
+#[cfg(bootstrap)]
 #[unstable(feature = "never_type", issue = "35121")]
 impl Error for ! {}
 
+#[cfg(bootstrap)]
 #[unstable(
     feature = "allocator_api",
     reason = "the precise API and guarantees it provides may be tweaked.",
@@ -396,9 +487,11 @@ impl Error for ! {}
 )]
 impl Error for AllocError {}
 
+#[cfg(bootstrap)]
 #[stable(feature = "alloc_layout", since = "1.28.0")]
 impl Error for LayoutError {}
 
+#[cfg(bootstrap)]
 #[stable(feature = "rust1", since = "1.0.0")]
 impl Error for str::ParseBoolError {
     #[allow(deprecated)]
@@ -407,6 +500,7 @@ impl Error for str::ParseBoolError {
     }
 }
 
+#[cfg(bootstrap)]
 #[stable(feature = "rust1", since = "1.0.0")]
 impl Error for str::Utf8Error {
     #[allow(deprecated)]
@@ -415,6 +509,7 @@ impl Error for str::Utf8Error {
     }
 }
 
+#[cfg(bootstrap)]
 #[stable(feature = "rust1", since = "1.0.0")]
 impl Error for num::ParseIntError {
     #[allow(deprecated)]
@@ -423,6 +518,7 @@ impl Error for num::ParseIntError {
     }
 }
 
+#[cfg(bootstrap)]
 #[stable(feature = "try_from", since = "1.34.0")]
 impl Error for num::TryFromIntError {
     #[allow(deprecated)]
@@ -431,6 +527,7 @@ impl Error for num::TryFromIntError {
     }
 }
 
+#[cfg(bootstrap)]
 #[stable(feature = "try_from", since = "1.34.0")]
 impl Error for array::TryFromSliceError {
     #[allow(deprecated)]
@@ -439,6 +536,7 @@ impl Error for array::TryFromSliceError {
     }
 }
 
+#[cfg(bootstrap)]
 #[stable(feature = "rust1", since = "1.0.0")]
 impl Error for num::ParseFloatError {
     #[allow(deprecated)]
@@ -447,6 +545,7 @@ impl Error for num::ParseFloatError {
     }
 }
 
+#[cfg(bootstrap)]
 #[stable(feature = "rust1", since = "1.0.0")]
 impl Error for string::FromUtf8Error {
     #[allow(deprecated)]
@@ -455,6 +554,7 @@ impl Error for string::FromUtf8Error {
     }
 }
 
+#[cfg(bootstrap)]
 #[stable(feature = "rust1", since = "1.0.0")]
 impl Error for string::FromUtf16Error {
     #[allow(deprecated)]
@@ -463,6 +563,7 @@ impl Error for string::FromUtf16Error {
     }
 }
 
+#[cfg(bootstrap)]
 #[stable(feature = "str_parse_error2", since = "1.8.0")]
 impl Error for Infallible {
     fn description(&self) -> &str {
@@ -470,6 +571,7 @@ impl Error for Infallible {
     }
 }
 
+#[cfg(bootstrap)]
 #[stable(feature = "decode_utf16", since = "1.9.0")]
 impl Error for char::DecodeUtf16Error {
     #[allow(deprecated)]
@@ -478,9 +580,11 @@ impl Error for char::DecodeUtf16Error {
     }
 }
 
+#[cfg(bootstrap)]
 #[stable(feature = "u8_from_char", since = "1.59.0")]
 impl Error for char::TryFromCharError {}
 
+#[cfg(bootstrap)]
 #[unstable(feature = "map_try_insert", issue = "82766")]
 impl<'a, K: Debug + Ord, V: Debug> Error
     for crate::collections::btree_map::OccupiedError<'a, K, V>
@@ -491,6 +595,7 @@ impl<'a, K: Debug + Ord, V: Debug> Error
     }
 }
 
+#[cfg(bootstrap)]
 #[unstable(feature = "map_try_insert", issue = "82766")]
 impl<'a, K: Debug, V: Debug> Error for crate::collections::hash_map::OccupiedError<'a, K, V> {
     #[allow(deprecated)]
@@ -499,6 +604,7 @@ impl<'a, K: Debug, V: Debug> Error for crate::collections::hash_map::OccupiedErr
     }
 }
 
+#[cfg(bootstrap)]
 #[stable(feature = "box_error", since = "1.8.0")]
 impl<T: Error> Error for Box<T> {
     #[allow(deprecated, deprecated_in_future)]
@@ -516,6 +622,16 @@ impl<T: Error> Error for Box<T> {
     }
 }
 
+#[cfg(bootstrap)]
+#[unstable(feature = "thin_box", issue = "92791")]
+impl<T: ?Sized + crate::error::Error> crate::error::Error for crate::boxed::ThinBox<T> {
+    fn source(&self) -> Option<&(dyn crate::error::Error + 'static)> {
+        use core::ops::Deref;
+        self.deref().source()
+    }
+}
+
+#[cfg(bootstrap)]
 #[stable(feature = "error_by_ref", since = "1.51.0")]
 impl<'a, T: Error + ?Sized> Error for &'a T {
     #[allow(deprecated, deprecated_in_future)]
@@ -532,11 +648,12 @@ impl<'a, T: Error + ?Sized> Error for &'a T {
         Error::source(&**self)
     }
 
-    fn backtrace(&self) -> Option<&Backtrace> {
-        Error::backtrace(&**self)
+    fn provide<'b>(&'b self, demand: &mut Demand<'b>) {
+        Error::provide(&**self, demand);
     }
 }
 
+#[cfg(bootstrap)]
 #[stable(feature = "arc_error", since = "1.52.0")]
 impl<T: Error + ?Sized> Error for Arc<T> {
     #[allow(deprecated, deprecated_in_future)]
@@ -553,11 +670,12 @@ impl<T: Error + ?Sized> Error for Arc<T> {
         Error::source(&**self)
     }
 
-    fn backtrace(&self) -> Option<&Backtrace> {
-        Error::backtrace(&**self)
+    fn provide<'a>(&'a self, demand: &mut Demand<'a>) {
+        Error::provide(&**self, demand);
     }
 }
 
+#[cfg(bootstrap)]
 #[stable(feature = "fmt_error", since = "1.11.0")]
 impl Error for fmt::Error {
     #[allow(deprecated)]
@@ -566,6 +684,7 @@ impl Error for fmt::Error {
     }
 }
 
+#[cfg(bootstrap)]
 #[stable(feature = "try_borrow", since = "1.13.0")]
 impl Error for cell::BorrowError {
     #[allow(deprecated)]
@@ -574,6 +693,7 @@ impl Error for cell::BorrowError {
     }
 }
 
+#[cfg(bootstrap)]
 #[stable(feature = "try_borrow", since = "1.13.0")]
 impl Error for cell::BorrowMutError {
     #[allow(deprecated)]
@@ -582,6 +702,7 @@ impl Error for cell::BorrowMutError {
     }
 }
 
+#[cfg(bootstrap)]
 #[stable(feature = "try_from", since = "1.34.0")]
 impl Error for char::CharTryFromError {
     #[allow(deprecated)]
@@ -590,6 +711,7 @@ impl Error for char::CharTryFromError {
     }
 }
 
+#[cfg(bootstrap)]
 #[stable(feature = "char_from_str", since = "1.20.0")]
 impl Error for char::ParseCharError {
     #[allow(deprecated)]
@@ -598,13 +720,79 @@ impl Error for char::ParseCharError {
     }
 }
 
+#[cfg(bootstrap)]
 #[stable(feature = "try_reserve", since = "1.57.0")]
 impl Error for alloc::collections::TryReserveError {}
 
+#[cfg(bootstrap)]
 #[unstable(feature = "duration_checked_float", issue = "83400")]
 impl Error for time::FromFloatSecsError {}
 
+#[cfg(bootstrap)]
+#[stable(feature = "rust1", since = "1.0.0")]
+impl Error for alloc::ffi::NulError {
+    #[allow(deprecated)]
+    fn description(&self) -> &str {
+        "nul byte found in data"
+    }
+}
+
+#[cfg(bootstrap)]
+#[stable(feature = "rust1", since = "1.0.0")]
+impl From<alloc::ffi::NulError> for io::Error {
+    /// Converts a [`alloc::ffi::NulError`] into a [`io::Error`].
+    fn from(_: alloc::ffi::NulError) -> io::Error {
+        io::const_io_error!(io::ErrorKind::InvalidInput, "data provided contains a nul byte")
+    }
+}
+
+#[cfg(bootstrap)]
+#[stable(feature = "frombyteswithnulerror_impls", since = "1.17.0")]
+impl Error for core::ffi::FromBytesWithNulError {
+    #[allow(deprecated)]
+    fn description(&self) -> &str {
+        self.__description()
+    }
+}
+
+#[cfg(bootstrap)]
+#[unstable(feature = "cstr_from_bytes_until_nul", issue = "95027")]
+impl Error for core::ffi::FromBytesUntilNulError {}
+
+#[cfg(bootstrap)]
+#[stable(feature = "cstring_from_vec_with_nul", since = "1.58.0")]
+impl Error for alloc::ffi::FromVecWithNulError {}
+
+#[cfg(bootstrap)]
+#[stable(feature = "cstring_into", since = "1.7.0")]
+impl Error for alloc::ffi::IntoStringError {
+    #[allow(deprecated)]
+    fn description(&self) -> &str {
+        "C string contained non-utf8 bytes"
+    }
+
+    fn source(&self) -> Option<&(dyn Error + 'static)> {
+        Some(self.__source())
+    }
+}
+
+#[cfg(bootstrap)]
+impl<'a> dyn Error + 'a {
+    /// Request a reference of type `T` as context about this error.
+    #[unstable(feature = "error_generic_member_access", issue = "99301")]
+    pub fn request_ref<T: ?Sized + 'static>(&'a self) -> Option<&'a T> {
+        core::any::request_ref(self)
+    }
+
+    /// Request a value of type `T` as context about this error.
+    #[unstable(feature = "error_generic_member_access", issue = "99301")]
+    pub fn request_value<T: 'static>(&'a self) -> Option<T> {
+        core::any::request_value(self)
+    }
+}
+
 // Copied from `any.rs`.
+#[cfg(bootstrap)]
 impl dyn Error + 'static {
     /// Returns `true` if the inner type is the same as `T`.
     #[stable(feature = "error_downcast", since = "1.3.0")]
@@ -645,6 +833,7 @@ impl dyn Error + 'static {
     }
 }
 
+#[cfg(bootstrap)]
 impl dyn Error + 'static + Send {
     /// Forwards to the method defined on the type `dyn Error`.
     #[stable(feature = "error_downcast", since = "1.3.0")]
@@ -666,8 +855,21 @@ impl dyn Error + 'static + Send {
     pub fn downcast_mut<T: Error + 'static>(&mut self) -> Option<&mut T> {
         <dyn Error + 'static>::downcast_mut::<T>(self)
     }
+
+    /// Request a reference of type `T` as context about this error.
+    #[unstable(feature = "error_generic_member_access", issue = "99301")]
+    pub fn request_ref<T: ?Sized + 'static>(&self) -> Option<&T> {
+        <dyn Error>::request_ref(self)
+    }
+
+    /// Request a value of type `T` as context about this error.
+    #[unstable(feature = "error_generic_member_access", issue = "99301")]
+    pub fn request_value<T: 'static>(&self) -> Option<T> {
+        <dyn Error>::request_value(self)
+    }
 }
 
+#[cfg(bootstrap)]
 impl dyn Error + 'static + Send + Sync {
     /// Forwards to the method defined on the type `dyn Error`.
     #[stable(feature = "error_downcast", since = "1.3.0")]
@@ -689,8 +891,21 @@ impl dyn Error + 'static + Send + Sync {
     pub fn downcast_mut<T: Error + 'static>(&mut self) -> Option<&mut T> {
         <dyn Error + 'static>::downcast_mut::<T>(self)
     }
+
+    /// Request a reference of type `T` as context about this error.
+    #[unstable(feature = "error_generic_member_access", issue = "99301")]
+    pub fn request_ref<T: ?Sized + 'static>(&self) -> Option<&T> {
+        <dyn Error>::request_ref(self)
+    }
+
+    /// Request a value of type `T` as context about this error.
+    #[unstable(feature = "error_generic_member_access", issue = "99301")]
+    pub fn request_value<T: 'static>(&self) -> Option<T> {
+        <dyn Error>::request_value(self)
+    }
 }
 
+#[cfg(bootstrap)]
 impl dyn Error {
     #[inline]
     #[stable(feature = "error_downcast", since = "1.3.0")]
@@ -750,7 +965,7 @@ impl dyn Error {
     /// // let err : Box<Error> = b.into(); // or
     /// let err = &b as &(dyn Error);
     ///
-    /// let mut iter = err.chain();
+    /// let mut iter = err.sources();
     ///
     /// assert_eq!("B".to_string(), iter.next().unwrap().to_string());
     /// assert_eq!("A".to_string(), iter.next().unwrap().to_string());
@@ -759,8 +974,19 @@ impl dyn Error {
     /// ```
     #[unstable(feature = "error_iter", issue = "58520")]
     #[inline]
-    pub fn chain(&self) -> Chain<'_> {
-        Chain { current: Some(self) }
+    pub fn sources(&self) -> Sources<'_> {
+        // You may think this method would be better in the Error trait, and you'd be right.
+        // Unfortunately that doesn't work, not because of the object safety rules but because we
+        // save a reference to self in Sources below as a trait object. If this method was
+        // declared in Error, then self would have the type &T where T is some concrete type which
+        // implements Error. We would need to coerce self to have type &dyn Error, but that requires
+        // that Self has a known size (i.e., Self: Sized). We can't put that bound on Error
+        // since that would forbid Error trait objects, and we can't put that bound on the method
+        // because that means the method can't be called on trait objects (we'd also need the
+        // 'static bound, but that isn't allowed because methods with bounds on Self other than
+        // Sized are not object-safe). Requiring an Unsize bound is not backwards compatible.
+
+        Sources { current: Some(self) }
     }
 }
 
@@ -770,12 +996,14 @@ impl dyn Error {
 /// its sources, use `skip(1)`.
 #[unstable(feature = "error_iter", issue = "58520")]
 #[derive(Clone, Debug)]
-pub struct Chain<'a> {
+#[cfg(bootstrap)]
+pub struct Sources<'a> {
     current: Option<&'a (dyn Error + 'static)>,
 }
 
+#[cfg(bootstrap)]
 #[unstable(feature = "error_iter", issue = "58520")]
-impl<'a> Iterator for Chain<'a> {
+impl<'a> Iterator for Sources<'a> {
     type Item = &'a (dyn Error + 'static);
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -785,6 +1013,7 @@ impl<'a> Iterator for Chain<'a> {
     }
 }
 
+#[cfg(bootstrap)]
 impl dyn Error + Send {
     #[inline]
     #[stable(feature = "error_downcast", since = "1.3.0")]
@@ -798,6 +1027,7 @@ impl dyn Error + Send {
     }
 }
 
+#[cfg(bootstrap)]
 impl dyn Error + Send + Sync {
     #[inline]
     #[stable(feature = "error_downcast", since = "1.3.0")]
@@ -811,12 +1041,12 @@ impl dyn Error + Send + Sync {
     }
 }
 
-/// An error reporter that print's an error and its sources.
+/// An error reporter that prints an error and its sources.
 ///
-/// Report also exposes configuration options for formatting the error chain, either entirely on a
-/// single line, or in multi-line format with each cause in the error chain on a new line.
+/// Report also exposes configuration options for formatting the error sources, either entirely on a
+/// single line, or in multi-line format with each source on a new line.
 ///
-/// `Report` only requires that the wrapped error implements `Error`. It doesn't require that the
+/// `Report` only requires that the wrapped error implement `Error`. It doesn't require that the
 /// wrapped error be `Send`, `Sync`, or `'static`.
 ///
 /// # Examples
@@ -920,7 +1150,7 @@ impl dyn Error + Send + Sync {
 ///
 /// ## Return from `main`
 ///
-/// `Report` also implements `From` for all types that implement [`Error`], this when combined with
+/// `Report` also implements `From` for all types that implement [`Error`]; this when combined with
 /// the `Debug` output means `Report` is an ideal starting place for formatting errors returned
 /// from `main`.
 ///
@@ -955,7 +1185,7 @@ impl dyn Error + Send + Sync {
 /// #     Err(SuperError { source: SuperErrorSideKick })
 /// # }
 ///
-/// fn main() -> Result<(), Report> {
+/// fn main() -> Result<(), Report<SuperError>> {
 ///     get_super_error()?;
 ///     Ok(())
 /// }
@@ -968,7 +1198,7 @@ impl dyn Error + Send + Sync {
 /// ```
 ///
 /// **Note**: `Report`s constructed via `?` and `From` will be configured to use the single line
-/// output format, if you want to make sure your `Report`s are pretty printed and include backtrace
+/// output format. If you want to make sure your `Report`s are pretty printed and include backtrace
 /// you will need to manually convert and enable those flags.
 ///
 /// ```should_panic
@@ -1002,7 +1232,7 @@ impl dyn Error + Send + Sync {
 /// #     Err(SuperError { source: SuperErrorSideKick })
 /// # }
 ///
-/// fn main() -> Result<(), Report> {
+/// fn main() -> Result<(), Report<SuperError>> {
 ///     get_super_error()
 ///         .map_err(Report::from)
 ///         .map_err(|r| r.pretty(true).show_backtrace(true))?;
@@ -1074,7 +1304,7 @@ impl<E> Report<E> {
     ///
     /// let error = SuperError { source: SuperErrorSideKick };
     /// let report = Report::new(error).pretty(true);
-    /// eprintln!("Error: {:?}", report);
+    /// eprintln!("Error: {report:?}");
     /// ```
     ///
     /// This example produces the following output:
@@ -1135,7 +1365,7 @@ impl<E> Report<E> {
     /// let source = SuperErrorSideKick { source };
     /// let error = SuperError { source };
     /// let report = Report::new(error).pretty(true);
-    /// eprintln!("Error: {:?}", report);
+    /// eprintln!("Error: {report:?}");
     /// ```
     ///
     /// This example produces the following output:
@@ -1159,13 +1389,15 @@ impl<E> Report<E> {
     ///
     /// **Note**: Report will search for the first `Backtrace` it can find starting from the
     /// outermost error. In this example it will display the backtrace from the second error in the
-    /// chain, `SuperErrorSideKick`.
+    /// sources, `SuperErrorSideKick`.
     ///
     /// ```rust
     /// #![feature(error_reporter)]
-    /// #![feature(backtrace)]
+    /// #![feature(provide_any)]
+    /// #![feature(error_generic_member_access)]
     /// # use std::error::Error;
     /// # use std::fmt;
+    /// use std::any::Demand;
     /// use std::error::Report;
     /// use std::backtrace::Backtrace;
     ///
@@ -1195,8 +1427,8 @@ impl<E> Report<E> {
     /// }
     ///
     /// impl Error for SuperErrorSideKick {
-    ///     fn backtrace(&self) -> Option<&Backtrace> {
-    ///         Some(&self.backtrace)
+    ///     fn provide<'a>(&'a self, demand: &mut Demand<'a>) {
+    ///         demand.provide_ref::<Backtrace>(&self.backtrace);
     ///     }
     /// }
     ///
@@ -1210,7 +1442,7 @@ impl<E> Report<E> {
     /// let source = SuperErrorSideKick::new();
     /// let error = SuperError { source };
     /// let report = Report::new(error).pretty(true).show_backtrace(true);
-    /// eprintln!("Error: {:?}", report);
+    /// eprintln!("Error: {report:?}");
     /// ```
     ///
     /// This example produces something similar to the following output:
@@ -1249,11 +1481,11 @@ where
     fn backtrace(&self) -> Option<&Backtrace> {
         // have to grab the backtrace on the first error directly since that error may not be
         // 'static
-        let backtrace = self.error.backtrace();
+        let backtrace = (&self.error as &dyn Error).request_ref();
         let backtrace = backtrace.or_else(|| {
             self.error
                 .source()
-                .map(|source| source.chain().find_map(|source| source.backtrace()))
+                .map(|source| source.sources().find_map(|source| source.request_ref()))
                 .flatten()
         });
         backtrace
@@ -1264,10 +1496,10 @@ where
     fn fmt_singleline(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(f, "{}", self.error)?;
 
-        let sources = self.error.source().into_iter().flat_map(<dyn Error>::chain);
+        let sources = self.error.source().into_iter().flat_map(<dyn Error>::sources);
 
         for cause in sources {
-            write!(f, ": {}", cause)?;
+            write!(f, ": {cause}")?;
         }
 
         Ok(())
@@ -1278,86 +1510,20 @@ where
     fn fmt_multiline(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let error = &self.error;
 
-        write!(f, "{}", error)?;
+        write!(f, "{error}")?;
 
         if let Some(cause) = error.source() {
             write!(f, "\n\nCaused by:")?;
 
             let multiple = cause.source().is_some();
 
-            for (ind, error) in cause.chain().enumerate() {
+            for (ind, error) in cause.sources().enumerate() {
                 writeln!(f)?;
                 let mut indented = Indented { inner: f };
                 if multiple {
-                    write!(indented, "{: >4}: {}", ind, error)?;
+                    write!(indented, "{ind: >4}: {error}")?;
                 } else {
-                    write!(indented, "      {}", error)?;
-                }
-            }
-        }
-
-        if self.show_backtrace {
-            let backtrace = self.backtrace();
-
-            if let Some(backtrace) = backtrace {
-                let backtrace = backtrace.to_string();
-
-                f.write_str("\n\nStack backtrace:\n")?;
-                f.write_str(backtrace.trim_end())?;
-            }
-        }
-
-        Ok(())
-    }
-}
-
-impl Report<Box<dyn Error>> {
-    fn backtrace(&self) -> Option<&Backtrace> {
-        // have to grab the backtrace on the first error directly since that error may not be
-        // 'static
-        let backtrace = self.error.backtrace();
-        let backtrace = backtrace.or_else(|| {
-            self.error
-                .source()
-                .map(|source| source.chain().find_map(|source| source.backtrace()))
-                .flatten()
-        });
-        backtrace
-    }
-
-    /// Format the report as a single line.
-    #[unstable(feature = "error_reporter", issue = "90172")]
-    fn fmt_singleline(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}", self.error)?;
-
-        let sources = self.error.source().into_iter().flat_map(<dyn Error>::chain);
-
-        for cause in sources {
-            write!(f, ": {}", cause)?;
-        }
-
-        Ok(())
-    }
-
-    /// Format the report as multiple lines, with each error cause on its own line.
-    #[unstable(feature = "error_reporter", issue = "90172")]
-    fn fmt_multiline(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let error = &self.error;
-
-        write!(f, "{}", error)?;
-
-        if let Some(cause) = error.source() {
-            write!(f, "\n\nCaused by:")?;
-
-            let multiple = cause.source().is_some();
-
-            for (ind, error) in cause.chain().enumerate() {
-                writeln!(f)?;
-                let mut indented = Indented { inner: f };
-                if multiple {
-                    write!(indented, "{: >4}: {}", ind, error)?;
-                } else {
-                    write!(indented, "      {}", error)?;
+                    write!(indented, "      {error}")?;
                 }
             }
         }
@@ -1388,28 +1554,10 @@ where
 }
 
 #[unstable(feature = "error_reporter", issue = "90172")]
-impl<'a, E> From<E> for Report<Box<dyn Error + 'a>>
-where
-    E: Error + 'a,
-{
-    fn from(error: E) -> Self {
-        let error = box error;
-        Report { error, show_backtrace: false, pretty: false }
-    }
-}
-
-#[unstable(feature = "error_reporter", issue = "90172")]
 impl<E> fmt::Display for Report<E>
 where
     E: Error,
 {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.pretty { self.fmt_multiline(f) } else { self.fmt_singleline(f) }
-    }
-}
-
-#[unstable(feature = "error_reporter", issue = "90172")]
-impl fmt::Display for Report<Box<dyn Error>> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.pretty { self.fmt_multiline(f) } else { self.fmt_singleline(f) }
     }

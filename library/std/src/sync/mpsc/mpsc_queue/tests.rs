@@ -6,14 +6,14 @@ use crate::thread;
 #[test]
 fn test_full() {
     let q: Queue<Box<_>> = Queue::new();
-    q.push(box 1);
-    q.push(box 2);
+    q.push(Box::new(1));
+    q.push(Box::new(2));
 }
 
 #[test]
 fn test() {
     let nthreads = 8;
-    let nmsgs = 1000;
+    let nmsgs = if cfg!(miri) { 100 } else { 1000 };
     let q = Queue::new();
     match q.pop() {
         Empty => {}

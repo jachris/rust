@@ -1,8 +1,8 @@
+use crate::attributes;
 use crate::common::Funclet;
 use crate::context::CodegenCx;
 use crate::llvm::{self, BasicBlock, False};
 use crate::llvm::{AtomicOrdering, AtomicRmwBinOp, SynchronizationScope};
-use crate::llvm_util;
 use crate::type_::Type;
 use crate::type_of::LayoutLlvmExt;
 use crate::value::Value;
@@ -27,7 +27,6 @@ use std::ffi::CStr;
 use std::iter;
 use std::ops::Deref;
 use std::ptr;
-use tracing::debug;
 
 // All Builders must have an llfn associated with them
 #[must_use]
@@ -166,9 +165,8 @@ impl<'a, 'll, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'll, 'tcx> {
         Self::append_block(self.cx, self.llfn(), name)
     }
 
-    fn build_sibling_block(&mut self, name: &str) -> Self {
-        let llbb = self.append_sibling_block(name);
-        Self::build(self.cx, llbb)
+    fn switch_to_block(&mut self, llbb: Self::BasicBlock) {
+        *self = Self::build(self.cx, llbb)
     }
 
     fn ret_void(&mut self) {
@@ -464,30 +462,44 @@ impl<'a, 'll, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'll, 'tcx> {
         }
     }
 
+    #[instrument(level = "trace", skip(self))]
     fn load_operand(&mut self, place: PlaceRef<'tcx, &'ll Value>) -> OperandRef<'tcx, &'ll Value> {
-        debug!("PlaceRef::load: {:?}", place);
-
         assert_eq!(place.llextra.is_some(), place.layout.is_unsized());
 
         if place.layout.is_zst() {
             return OperandRef::new_zst(self, place.layout);
         }
 
+        #[instrument(level = "trace", skip(bx))]
         fn scalar_load_metadata<'a, 'll, 'tcx>(
             bx: &mut Builder<'a, 'll, 'tcx>,
             load: &'ll Value,
             scalar: abi::Scalar,
+            layout: TyAndLayout<'tcx>,
+            offset: Size,
         ) {
-            match scalar.value {
+            if !scalar.is_always_valid(bx) {
+                bx.noundef_metadata(load);
+            }
+
+            match scalar.primitive() {
                 abi::Int(..) => {
                     if !scalar.is_always_valid(bx) {
-                        bx.range_metadata(load, scalar.valid_range);
+                        bx.range_metadata(load, scalar.valid_range(bx));
                     }
                 }
-                abi::Pointer if !scalar.valid_range.contains(0) => {
-                    bx.nonnull_metadata(load);
+                abi::Pointer => {
+                    if !scalar.valid_range(bx).contains(0) {
+                        bx.nonnull_metadata(load);
+                    }
+
+                    if let Some(pointee) = layout.pointee_info_at(bx, offset) {
+                        if let Some(_) = pointee.safe {
+                            bx.align_metadata(load, pointee.align);
+                        }
+                    }
                 }
-                _ => {}
+                abi::F32 | abi::F64 => {}
             }
         }
 
@@ -495,36 +507,41 @@ impl<'a, 'll, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'll, 'tcx> {
             OperandValue::Ref(place.llval, Some(llextra), place.align)
         } else if place.layout.is_llvm_immediate() {
             let mut const_llval = None;
+            let llty = place.layout.llvm_type(self);
             unsafe {
                 if let Some(global) = llvm::LLVMIsAGlobalVariable(place.llval) {
                     if llvm::LLVMIsGlobalConstant(global) == llvm::True {
-                        const_llval = llvm::LLVMGetInitializer(global);
+                        if let Some(init) = llvm::LLVMGetInitializer(global) {
+                            if self.val_ty(init) == llty {
+                                const_llval = Some(init);
+                            }
+                        }
                     }
                 }
             }
             let llval = const_llval.unwrap_or_else(|| {
-                let load = self.load(place.layout.llvm_type(self), place.llval, place.align);
+                let load = self.load(llty, place.llval, place.align);
                 if let abi::Abi::Scalar(scalar) = place.layout.abi {
-                    scalar_load_metadata(self, load, scalar);
+                    scalar_load_metadata(self, load, scalar, place.layout, Size::ZERO);
                 }
                 load
             });
             OperandValue::Immediate(self.to_immediate(llval, place.layout))
         } else if let abi::Abi::ScalarPair(a, b) = place.layout.abi {
-            let b_offset = a.value.size(self).align_to(b.value.align(self).abi);
+            let b_offset = a.size(self).align_to(b.align(self).abi);
             let pair_ty = place.layout.llvm_type(self);
 
-            let mut load = |i, scalar: abi::Scalar, align| {
+            let mut load = |i, scalar: abi::Scalar, layout, align, offset| {
                 let llptr = self.struct_gep(pair_ty, place.llval, i as u64);
                 let llty = place.layout.scalar_pair_element_llvm_type(self, i, false);
                 let load = self.load(llty, llptr, align);
-                scalar_load_metadata(self, load, scalar);
+                scalar_load_metadata(self, load, scalar, layout, offset);
                 self.to_immediate_scalar(load, scalar)
             };
 
             OperandValue::Pair(
-                load(0, a, place.align),
-                load(1, b, place.align.restrict_for_offset(b_offset)),
+                load(0, a, place.layout, place.align, Size::ZERO),
+                load(1, b, place.layout, place.align.restrict_for_offset(b_offset), b_offset),
             )
         } else {
             OperandValue::Ref(place.llval, None, place.align)
@@ -544,16 +561,19 @@ impl<'a, 'll, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'll, 'tcx> {
         let start = dest.project_index(&mut self, zero).llval;
         let end = dest.project_index(&mut self, count).llval;
 
-        let mut header_bx = self.build_sibling_block("repeat_loop_header");
-        let mut body_bx = self.build_sibling_block("repeat_loop_body");
-        let next_bx = self.build_sibling_block("repeat_loop_next");
+        let header_bb = self.append_sibling_block("repeat_loop_header");
+        let body_bb = self.append_sibling_block("repeat_loop_body");
+        let next_bb = self.append_sibling_block("repeat_loop_next");
 
-        self.br(header_bx.llbb());
+        self.br(header_bb);
+
+        let mut header_bx = Self::build(self.cx, header_bb);
         let current = header_bx.phi(self.val_ty(start), &[start], &[self.llbb()]);
 
         let keep_going = header_bx.icmp(IntPredicate::IntNE, current, end);
-        header_bx.cond_br(keep_going, body_bx.llbb(), next_bx.llbb());
+        header_bx.cond_br(keep_going, body_bb, next_bb);
 
+        let mut body_bx = Self::build(self.cx, body_bb);
         let align = dest.align.restrict_for_offset(dest.layout.field(self.cx(), 0).size);
         cg_elem
             .val
@@ -564,10 +584,10 @@ impl<'a, 'll, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'll, 'tcx> {
             current,
             &[self.const_usize(1)],
         );
-        body_bx.br(header_bx.llbb());
-        header_bx.add_incoming_to_phi(current, next, body_bx.llbb());
+        body_bx.br(header_bb);
+        header_bx.add_incoming_to_phi(current, next, body_bb);
 
-        next_bx
+        Self::build(self.cx, next_bb)
     }
 
     fn range_metadata(&mut self, load: &'ll Value, range: WrappingRange) {
@@ -601,32 +621,6 @@ impl<'a, 'll, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'll, 'tcx> {
                 llvm::MD_nonnull as c_uint,
                 llvm::LLVMMDNodeInContext(self.cx.llcx, ptr::null(), 0),
             );
-        }
-    }
-
-    fn type_metadata(&mut self, function: &'ll Value, typeid: String) {
-        let typeid_metadata = self.typeid_metadata(typeid);
-        let v = [self.const_usize(0), typeid_metadata];
-        unsafe {
-            llvm::LLVMGlobalSetMetadata(
-                function,
-                llvm::MD_type as c_uint,
-                llvm::LLVMValueAsMetadata(llvm::LLVMMDNodeInContext(
-                    self.cx.llcx,
-                    v.as_ptr(),
-                    v.len() as c_uint,
-                )),
-            )
-        }
-    }
-
-    fn typeid_metadata(&mut self, typeid: String) -> Self::Value {
-        unsafe {
-            llvm::LLVMMDStringInContext(
-                self.cx.llcx,
-                typeid.as_ptr() as *const c_char,
-                typeid.as_bytes().len() as c_uint,
-            )
         }
     }
 
@@ -730,11 +724,11 @@ impl<'a, 'll, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'll, 'tcx> {
         unsafe { llvm::LLVMBuildSExt(self.llbuilder, val, dest_ty, UNNAMED) }
     }
 
-    fn fptoui_sat(&mut self, val: &'ll Value, dest_ty: &'ll Type) -> Option<&'ll Value> {
+    fn fptoui_sat(&mut self, val: &'ll Value, dest_ty: &'ll Type) -> &'ll Value {
         self.fptoint_sat(false, val, dest_ty)
     }
 
-    fn fptosi_sat(&mut self, val: &'ll Value, dest_ty: &'ll Type) -> Option<&'ll Value> {
+    fn fptosi_sat(&mut self, val: &'ll Value, dest_ty: &'ll Type) -> &'ll Value {
         self.fptoint_sat(true, val, dest_ty)
     }
 
@@ -1171,15 +1165,9 @@ impl<'a, 'll, 'tcx> BuilderMethods<'a, 'tcx> for Builder<'a, 'll, 'tcx> {
         unsafe { llvm::LLVMBuildZExt(self.llbuilder, val, dest_ty, UNNAMED) }
     }
 
-    fn apply_attrs_to_cleanup_callsite(&mut self, llret: &'ll Value) {
-        // Cleanup is always the cold path.
-        llvm::Attribute::Cold.apply_callsite(llvm::AttributePlace::Function, llret);
-
-        // In LLVM versions with deferred inlining (currently, system LLVM < 14),
-        // inlining drop glue can lead to exponential size blowup, see #41696 and #92110.
-        if !llvm_util::is_rust_llvm() && llvm_util::get_version() < (14, 0, 0) {
-            llvm::Attribute::NoInline.apply_callsite(llvm::AttributePlace::Function, llret);
-        }
+    fn do_not_inline(&mut self, llret: &'ll Value) {
+        let noinline = llvm::AttributeKind::NoInline.create_attr(self.llcx);
+        attributes::apply_to_callsite(llret, llvm::AttributePlace::Function, &[noinline]);
     }
 }
 
@@ -1204,6 +1192,28 @@ impl<'a, 'll, 'tcx> Builder<'a, 'll, 'tcx> {
     fn position_at_start(&mut self, llbb: &'ll BasicBlock) {
         unsafe {
             llvm::LLVMRustPositionBuilderAtStart(self.llbuilder, llbb);
+        }
+    }
+
+    fn align_metadata(&mut self, load: &'ll Value, align: Align) {
+        unsafe {
+            let v = [self.cx.const_u64(align.bytes())];
+
+            llvm::LLVMSetMetadata(
+                load,
+                llvm::MD_align as c_uint,
+                llvm::LLVMMDNodeInContext(self.cx.llcx, v.as_ptr(), v.len() as c_uint),
+            );
+        }
+    }
+
+    fn noundef_metadata(&mut self, load: &'ll Value) {
+        unsafe {
+            llvm::LLVMSetMetadata(
+                load,
+                llvm::MD_noundef as c_uint,
+                llvm::LLVMMDNodeInContext(self.cx.llcx, ptr::null(), 0),
+            );
         }
     }
 
@@ -1379,7 +1389,7 @@ impl<'a, 'll, 'tcx> Builder<'a, 'll, 'tcx> {
         unsafe { llvm::LLVMBuildVAArg(self.llbuilder, list, ty, UNNAMED) }
     }
 
-    crate fn call_intrinsic(&mut self, intrinsic: &str, args: &[&'ll Value]) -> &'ll Value {
+    pub(crate) fn call_intrinsic(&mut self, intrinsic: &str, args: &[&'ll Value]) -> &'ll Value {
         let (ty, f) = self.cx.get_intrinsic(intrinsic);
         self.call(ty, f, args, None)
     }
@@ -1418,51 +1428,32 @@ impl<'a, 'll, 'tcx> Builder<'a, 'll, 'tcx> {
         }
     }
 
-    fn fptoint_sat_broken_in_llvm(&self) -> bool {
-        match self.tcx.sess.target.arch.as_str() {
-            // FIXME - https://bugs.llvm.org/show_bug.cgi?id=50083
-            "riscv64" => llvm_util::get_version() < (13, 0, 0),
-            _ => false,
-        }
-    }
-
-    fn fptoint_sat(
-        &mut self,
-        signed: bool,
-        val: &'ll Value,
-        dest_ty: &'ll Type,
-    ) -> Option<&'ll Value> {
-        if !self.fptoint_sat_broken_in_llvm() {
-            let src_ty = self.cx.val_ty(val);
-            let (float_ty, int_ty, vector_length) = if self.cx.type_kind(src_ty) == TypeKind::Vector
-            {
-                assert_eq!(self.cx.vector_length(src_ty), self.cx.vector_length(dest_ty));
-                (
-                    self.cx.element_type(src_ty),
-                    self.cx.element_type(dest_ty),
-                    Some(self.cx.vector_length(src_ty)),
-                )
-            } else {
-                (src_ty, dest_ty, None)
-            };
-            let float_width = self.cx.float_width(float_ty);
-            let int_width = self.cx.int_width(int_ty);
-
-            let instr = if signed { "fptosi" } else { "fptoui" };
-            let name = if let Some(vector_length) = vector_length {
-                format!(
-                    "llvm.{}.sat.v{}i{}.v{}f{}",
-                    instr, vector_length, int_width, vector_length, float_width
-                )
-            } else {
-                format!("llvm.{}.sat.i{}.f{}", instr, int_width, float_width)
-            };
-            let f =
-                self.declare_cfn(&name, llvm::UnnamedAddr::No, self.type_func(&[src_ty], dest_ty));
-            Some(self.call(self.type_func(&[src_ty], dest_ty), f, &[val], None))
+    fn fptoint_sat(&mut self, signed: bool, val: &'ll Value, dest_ty: &'ll Type) -> &'ll Value {
+        let src_ty = self.cx.val_ty(val);
+        let (float_ty, int_ty, vector_length) = if self.cx.type_kind(src_ty) == TypeKind::Vector {
+            assert_eq!(self.cx.vector_length(src_ty), self.cx.vector_length(dest_ty));
+            (
+                self.cx.element_type(src_ty),
+                self.cx.element_type(dest_ty),
+                Some(self.cx.vector_length(src_ty)),
+            )
         } else {
-            None
-        }
+            (src_ty, dest_ty, None)
+        };
+        let float_width = self.cx.float_width(float_ty);
+        let int_width = self.cx.int_width(int_ty);
+
+        let instr = if signed { "fptosi" } else { "fptoui" };
+        let name = if let Some(vector_length) = vector_length {
+            format!(
+                "llvm.{}.sat.v{}i{}.v{}f{}",
+                instr, vector_length, int_width, vector_length, float_width
+            )
+        } else {
+            format!("llvm.{}.sat.i{}.f{}", instr, int_width, float_width)
+        };
+        let f = self.declare_cfn(&name, llvm::UnnamedAddr::No, self.type_func(&[src_ty], dest_ty));
+        self.call(self.type_func(&[src_ty], dest_ty), f, &[val], None)
     }
 
     pub(crate) fn landing_pad(

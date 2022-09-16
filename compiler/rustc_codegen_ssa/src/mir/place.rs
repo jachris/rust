@@ -4,7 +4,6 @@ use super::{FunctionCx, LocalRef};
 use crate::common::IntPredicate;
 use crate::glue;
 use crate::traits::*;
-use crate::MemFlags;
 
 use rustc_middle::mir;
 use rustc_middle::mir::tcx::PlaceTy;
@@ -100,7 +99,7 @@ impl<'a, 'tcx, V: CodegenObject> PlaceRef<'tcx, V> {
                     self.llval
                 }
                 Abi::ScalarPair(a, b)
-                    if offset == a.value.size(bx.cx()).align_to(b.value.align(bx.cx()).abi) =>
+                    if offset == a.size(bx.cx()).align_to(b.align(bx.cx()).abi) =>
                 {
                     // Offset matches second field.
                     let ty = bx.backend_type(self.layout);
@@ -149,7 +148,7 @@ impl<'a, 'tcx, V: CodegenObject> PlaceRef<'tcx, V> {
             _ if !field.is_unsized() => return simple(),
             ty::Slice(..) | ty::Str | ty::Foreign(..) => return simple(),
             ty::Adt(def, _) => {
-                if def.repr.packed() {
+                if def.repr().packed() {
                     // FIXME(eddyb) generalize the adjustment when we
                     // start supporting packing to larger alignments.
                     assert_eq!(self.layout.align.abi.bytes(), 1);
@@ -204,6 +203,7 @@ impl<'a, 'tcx, V: CodegenObject> PlaceRef<'tcx, V> {
     }
 
     /// Obtain the actual discriminant of a value.
+    #[instrument(level = "trace", skip(bx))]
     pub fn codegen_get_discr<Bx: BuilderMethods<'a, 'tcx, Value = V>>(
         self,
         bx: &mut Bx,
@@ -234,7 +234,7 @@ impl<'a, 'tcx, V: CodegenObject> PlaceRef<'tcx, V> {
         // Decode the discriminant (specifically if it's niche-encoded).
         match *tag_encoding {
             TagEncoding::Direct => {
-                let signed = match tag_scalar.value {
+                let signed = match tag_scalar.primitive() {
                     // We use `i1` for bytes that are always `0` or `1`,
                     // e.g., `#[repr(i8)] enum E { A, B }`, but we can't
                     // let LLVM interpret the `i1` as signed, because
@@ -244,7 +244,7 @@ impl<'a, 'tcx, V: CodegenObject> PlaceRef<'tcx, V> {
                 };
                 bx.intcast(tag.immediate(), cast_to, signed)
             }
-            TagEncoding::Niche { dataful_variant, ref niche_variants, niche_start } => {
+            TagEncoding::Niche { untagged_variant, ref niche_variants, niche_start } => {
                 // Rebase from niche values to discriminants, and check
                 // whether the result is in range for the niche variants.
                 let niche_llty = bx.cx().immediate_backend_type(tag.layout);
@@ -302,7 +302,7 @@ impl<'a, 'tcx, V: CodegenObject> PlaceRef<'tcx, V> {
                 bx.select(
                     is_niche,
                     niche_discr,
-                    bx.cx().const_uint(cast_to, dataful_variant.as_u32() as u64),
+                    bx.cx().const_uint(cast_to, untagged_variant.as_u32() as u64),
                 )
             }
         }
@@ -337,21 +337,11 @@ impl<'a, 'tcx, V: CodegenObject> PlaceRef<'tcx, V> {
             }
             Variants::Multiple {
                 tag_encoding:
-                    TagEncoding::Niche { dataful_variant, ref niche_variants, niche_start },
+                    TagEncoding::Niche { untagged_variant, ref niche_variants, niche_start },
                 tag_field,
                 ..
             } => {
-                if variant_index != dataful_variant {
-                    if bx.cx().sess().target.arch == "arm"
-                        || bx.cx().sess().target.arch == "aarch64"
-                    {
-                        // FIXME(#34427): as workaround for LLVM bug on ARM,
-                        // use memset of 0 before assigning niche value.
-                        let fill_byte = bx.cx().const_u8(0);
-                        let size = bx.cx().const_usize(self.layout.size.bytes());
-                        bx.memset(self.llval, fill_byte, size, self.align, MemFlags::empty());
-                    }
-
+                if variant_index != untagged_variant {
                     let niche = self.project_field(bx, tag_field);
                     let niche_llty = bx.cx().immediate_backend_type(niche.layout);
                     let niche_value = variant_index.as_u32() - niche_variants.start().as_u32();
@@ -420,12 +410,12 @@ impl<'a, 'tcx, V: CodegenObject> PlaceRef<'tcx, V> {
 }
 
 impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
+    #[instrument(level = "trace", skip(self, bx))]
     pub fn codegen_place(
         &mut self,
         bx: &mut Bx,
         place_ref: mir::PlaceRef<'tcx>,
     ) -> PlaceRef<'tcx, Bx::Value> {
-        debug!("codegen_place(place_ref={:?})", place_ref);
         let cx = self.cx;
         let tcx = self.cx.tcx();
 
@@ -434,25 +424,20 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
             LocalRef::Place(place) => place,
             LocalRef::UnsizedPlace(place) => bx.load_operand(place).deref(cx),
             LocalRef::Operand(..) => {
-                if let Some(elem) = place_ref
-                    .projection
-                    .iter()
-                    .enumerate()
-                    .find(|elem| matches!(elem.1, mir::ProjectionElem::Deref))
-                {
-                    base = elem.0 + 1;
-                    self.codegen_consume(
+                if place_ref.has_deref() {
+                    base = 1;
+                    let cg_base = self.codegen_consume(
                         bx,
-                        mir::PlaceRef { projection: &place_ref.projection[..elem.0], ..place_ref },
-                    )
-                    .deref(bx.cx())
+                        mir::PlaceRef { projection: &place_ref.projection[..0], ..place_ref },
+                    );
+                    cg_base.deref(bx.cx())
                 } else {
                     bug!("using operand local {:?} as place", place_ref);
                 }
             }
         };
         for elem in place_ref.projection[base..].iter() {
-            cg_base = match elem.clone() {
+            cg_base = match *elem {
                 mir::ProjectionElem::Deref => bx.load_operand(cg_base).deref(bx.cx()),
                 mir::ProjectionElem::Field(ref field, _) => {
                     cg_base.project_field(bx, field.index())

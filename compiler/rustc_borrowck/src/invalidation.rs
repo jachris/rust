@@ -1,6 +1,6 @@
 use rustc_data_structures::graph::dominators::Dominators;
 use rustc_middle::mir::visit::Visitor;
-use rustc_middle::mir::{BasicBlock, Body, Location, Place, Rvalue};
+use rustc_middle::mir::{self, BasicBlock, Body, Location, NonDivergingIntrinsic, Place, Rvalue};
 use rustc_middle::mir::{BorrowKind, Mutability, Operand};
 use rustc_middle::mir::{InlineAsmOperand, Terminator, TerminatorKind};
 use rustc_middle::mir::{Statement, StatementKind};
@@ -26,7 +26,7 @@ pub(super) fn generate_invalidates<'tcx>(
 
     if let Some(all_facts) = all_facts {
         let _prof_timer = tcx.prof.generic_activity("polonius_fact_generation");
-        let dominators = body.dominators();
+        let dominators = body.basic_blocks.dominators();
         let mut ig = InvalidationGenerator {
             all_facts,
             borrow_set,
@@ -63,26 +63,24 @@ impl<'cx, 'tcx> Visitor<'tcx> for InvalidationGenerator<'cx, 'tcx> {
             StatementKind::FakeRead(box (_, _)) => {
                 // Only relevant for initialized/liveness/safety checks.
             }
-            StatementKind::SetDiscriminant { place, variant_index: _ } => {
-                self.mutate_place(location, **place, Shallow(None));
+            StatementKind::Intrinsic(box NonDivergingIntrinsic::Assume(op)) => {
+                self.consume_operand(location, op);
             }
-            StatementKind::CopyNonOverlapping(box rustc_middle::mir::CopyNonOverlapping {
+            StatementKind::Intrinsic(box NonDivergingIntrinsic::CopyNonOverlapping(mir::CopyNonOverlapping {
                 ref src,
                 ref dst,
                 ref count,
-            }) => {
+            })) => {
                 self.consume_operand(location, src);
                 self.consume_operand(location, dst);
                 self.consume_operand(location, count);
             }
-            StatementKind::Nop
+            // Only relevant for mir typeck
+            StatementKind::AscribeUserType(..)
+            // Doesn't have any language semantics
             | StatementKind::Coverage(..)
-            | StatementKind::AscribeUserType(..)
-            | StatementKind::Retag { .. }
-            | StatementKind::StorageLive(..) => {
-                // `Nop`, `AscribeUserType`, `Retag`, and `StorageLive` are irrelevant
-                // to borrow check.
-            }
+            // Does not actually affect borrowck
+            | StatementKind::StorageLive(..) => {}
             StatementKind::StorageDead(local) => {
                 self.access_place(
                     location,
@@ -90,6 +88,12 @@ impl<'cx, 'tcx> Visitor<'tcx> for InvalidationGenerator<'cx, 'tcx> {
                     (Shallow(None), Write(WriteKind::StorageDeadOrDrop)),
                     LocalMutationIsAllowed::Yes,
                 );
+            }
+            StatementKind::Nop
+            | StatementKind::Retag { .. }
+            | StatementKind::Deinit(..)
+            | StatementKind::SetDiscriminant { .. } => {
+                bug!("Statement not allowed in this MIR phase")
             }
         }
 
@@ -124,6 +128,7 @@ impl<'cx, 'tcx> Visitor<'tcx> for InvalidationGenerator<'cx, 'tcx> {
                 ref func,
                 ref args,
                 destination,
+                target: _,
                 cleanup: _,
                 from_hir_call: _,
                 fn_span: _,
@@ -132,9 +137,7 @@ impl<'cx, 'tcx> Visitor<'tcx> for InvalidationGenerator<'cx, 'tcx> {
                 for arg in args {
                     self.consume_operand(location, arg);
                 }
-                if let Some((dest, _ /*bb*/)) = destination {
-                    self.mutate_place(location, *dest, Deep);
-                }
+                self.mutate_place(location, *destination, Deep);
             }
             TerminatorKind::Assert { ref cond, expected: _, ref msg, target: _, cleanup: _ } => {
                 self.consume_operand(location, cond);
@@ -290,6 +293,10 @@ impl<'cx, 'tcx> InvalidationGenerator<'cx, 'tcx> {
             | Rvalue::ShallowInitBox(ref operand, _ /*ty*/) => {
                 self.consume_operand(location, operand)
             }
+            Rvalue::CopyForDeref(ref place) => {
+                let op = &Operand::Copy(*place);
+                self.consume_operand(location, op);
+            }
 
             Rvalue::Len(place) | Rvalue::Discriminant(place) => {
                 let af = match *rvalue {
@@ -365,7 +372,7 @@ impl<'cx, 'tcx> InvalidationGenerator<'cx, 'tcx> {
                     // borrow); so don't check if they interfere.
                     //
                     // NOTE: *reservations* do conflict with themselves;
-                    // thus aren't injecting unsoundenss w/ this check.)
+                    // thus aren't injecting unsoundness w/ this check.)
                     (Activation(_, activating), _) if activating == borrow_index => {
                         // Activating a borrow doesn't generate any invalidations, since we
                         // have already taken the reservation

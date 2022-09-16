@@ -1,120 +1,17 @@
-use rustc_errors::ErrorReported;
+use rustc_errors::ErrorGuaranteed;
 use rustc_hir::def_id::{DefId, LocalDefId};
 use rustc_infer::infer::TyCtxtInferExt;
+use rustc_middle::traits::CodegenObligationError;
 use rustc_middle::ty::subst::SubstsRef;
-use rustc_middle::ty::{self, Binder, Instance, Ty, TyCtxt, TypeFoldable, TypeVisitor};
+use rustc_middle::ty::{self, Instance, TyCtxt, TypeVisitable};
 use rustc_span::{sym, DUMMY_SP};
-use rustc_target::spec::abi::Abi;
 use rustc_trait_selection::traits;
 use traits::{translate_substs, Reveal};
 
-use rustc_data_structures::sso::SsoHashSet;
-use std::collections::btree_map::Entry;
-use std::collections::BTreeMap;
-use std::ops::ControlFlow;
-
-use tracing::debug;
-
-// FIXME(#86795): `BoundVarsCollector` here should **NOT** be used
-// outside of `resolve_associated_item`. It's just to address #64494,
-// #83765, and #85848 which are creating bound types/regions that lose
-// their `Binder` *unintentionally*.
-// It's ideal to remove `BoundVarsCollector` and just use
-// `ty::Binder::*` methods but we use this stopgap until we figure out
-// the "real" fix.
-struct BoundVarsCollector<'tcx> {
-    binder_index: ty::DebruijnIndex,
-    vars: BTreeMap<u32, ty::BoundVariableKind>,
-    // We may encounter the same variable at different levels of binding, so
-    // this can't just be `Ty`
-    visited: SsoHashSet<(ty::DebruijnIndex, Ty<'tcx>)>,
-}
-
-impl<'tcx> BoundVarsCollector<'tcx> {
-    fn new() -> Self {
-        BoundVarsCollector {
-            binder_index: ty::INNERMOST,
-            vars: BTreeMap::new(),
-            visited: SsoHashSet::default(),
-        }
-    }
-
-    fn into_vars(self, tcx: TyCtxt<'tcx>) -> &'tcx ty::List<ty::BoundVariableKind> {
-        let max = self.vars.iter().map(|(k, _)| *k).max().unwrap_or(0);
-        for i in 0..max {
-            if let None = self.vars.get(&i) {
-                panic!("Unknown variable: {:?}", i);
-            }
-        }
-
-        tcx.mk_bound_variable_kinds(self.vars.into_iter().map(|(_, v)| v))
-    }
-}
-
-impl<'tcx> TypeVisitor<'tcx> for BoundVarsCollector<'tcx> {
-    type BreakTy = ();
-
-    fn visit_binder<T: TypeFoldable<'tcx>>(
-        &mut self,
-        t: &Binder<'tcx, T>,
-    ) -> ControlFlow<Self::BreakTy> {
-        self.binder_index.shift_in(1);
-        let result = t.super_visit_with(self);
-        self.binder_index.shift_out(1);
-        result
-    }
-
-    fn visit_ty(&mut self, t: Ty<'tcx>) -> ControlFlow<Self::BreakTy> {
-        if t.outer_exclusive_binder() < self.binder_index
-            || !self.visited.insert((self.binder_index, t))
-        {
-            return ControlFlow::CONTINUE;
-        }
-        match *t.kind() {
-            ty::Bound(debruijn, bound_ty) if debruijn == self.binder_index => {
-                match self.vars.entry(bound_ty.var.as_u32()) {
-                    Entry::Vacant(entry) => {
-                        entry.insert(ty::BoundVariableKind::Ty(bound_ty.kind));
-                    }
-                    Entry::Occupied(entry) => match entry.get() {
-                        ty::BoundVariableKind::Ty(_) => {}
-                        _ => bug!("Conflicting bound vars"),
-                    },
-                }
-            }
-
-            _ => (),
-        };
-
-        t.super_visit_with(self)
-    }
-
-    fn visit_region(&mut self, r: ty::Region<'tcx>) -> ControlFlow<Self::BreakTy> {
-        match *r {
-            ty::ReLateBound(index, br) if index == self.binder_index => {
-                match self.vars.entry(br.var.as_u32()) {
-                    Entry::Vacant(entry) => {
-                        entry.insert(ty::BoundVariableKind::Region(br.kind));
-                    }
-                    Entry::Occupied(entry) => match entry.get() {
-                        ty::BoundVariableKind::Region(_) => {}
-                        _ => bug!("Conflicting bound vars"),
-                    },
-                }
-            }
-
-            _ => (),
-        };
-
-        r.super_visit_with(self)
-    }
-}
-
-#[instrument(level = "debug", skip(tcx))]
 fn resolve_instance<'tcx>(
     tcx: TyCtxt<'tcx>,
     key: ty::ParamEnvAnd<'tcx, (DefId, SubstsRef<'tcx>)>,
-) -> Result<Option<Instance<'tcx>>, ErrorReported> {
+) -> Result<Option<Instance<'tcx>>, ErrorGuaranteed> {
     let (param_env, (did, substs)) = key.into_parts();
     if let Some(did) = did.as_local() {
         if let Some(param_did) = tcx.opt_const_param_of(did) {
@@ -128,7 +25,7 @@ fn resolve_instance<'tcx>(
 fn resolve_instance_of_const_arg<'tcx>(
     tcx: TyCtxt<'tcx>,
     key: ty::ParamEnvAnd<'tcx, (LocalDefId, DefId, SubstsRef<'tcx>)>,
-) -> Result<Option<Instance<'tcx>>, ErrorReported> {
+) -> Result<Option<Instance<'tcx>>, ErrorGuaranteed> {
     let (param_env, (did, const_param_did, substs)) = key.into_parts();
     inner_resolve_instance(
         tcx,
@@ -139,11 +36,10 @@ fn resolve_instance_of_const_arg<'tcx>(
     )
 }
 
-#[instrument(level = "debug", skip(tcx))]
 fn inner_resolve_instance<'tcx>(
     tcx: TyCtxt<'tcx>,
     key: ty::ParamEnvAnd<'tcx, (ty::WithOptConstParam<DefId>, SubstsRef<'tcx>)>,
-) -> Result<Option<Instance<'tcx>>, ErrorReported> {
+) -> Result<Option<Instance<'tcx>>, ErrorGuaranteed> {
     let (param_env, (def, substs)) = key.into_parts();
 
     let result = if let Some(trait_def_id) = tcx.trait_of_item(def.did) {
@@ -154,12 +50,7 @@ fn inner_resolve_instance<'tcx>(
         let item_type = tcx.subst_and_normalize_erasing_regions(substs, param_env, ty);
 
         let def = match *item_type.kind() {
-            ty::FnDef(..)
-                if {
-                    let f = item_type.fn_sig(tcx);
-                    f.abi() == Abi::RustIntrinsic || f.abi() == Abi::PlatformIntrinsic
-                } =>
-            {
+            ty::FnDef(def_id, ..) if tcx.is_intrinsic(def_id) => {
                 debug!(" => intrinsic");
                 ty::InstanceDef::Intrinsic(def.did)
             }
@@ -203,16 +94,26 @@ fn resolve_associated_item<'tcx>(
     param_env: ty::ParamEnv<'tcx>,
     trait_id: DefId,
     rcvr_substs: SubstsRef<'tcx>,
-) -> Result<Option<Instance<'tcx>>, ErrorReported> {
+) -> Result<Option<Instance<'tcx>>, ErrorGuaranteed> {
     debug!(?trait_item_id, ?param_env, ?trait_id, ?rcvr_substs, "resolve_associated_item");
 
     let trait_ref = ty::TraitRef::from_method(tcx, trait_id, rcvr_substs);
 
-    // See FIXME on `BoundVarsCollector`.
-    let mut bound_vars_collector = BoundVarsCollector::new();
-    trait_ref.visit_with(&mut bound_vars_collector);
-    let trait_binder = ty::Binder::bind_with_vars(trait_ref, bound_vars_collector.into_vars(tcx));
-    let vtbl = tcx.codegen_fulfill_obligation((param_env, trait_binder))?;
+    let vtbl = match tcx.codegen_select_candidate((param_env, ty::Binder::dummy(trait_ref))) {
+        Ok(vtbl) => vtbl,
+        Err(CodegenObligationError::Ambiguity) => {
+            let reported = tcx.sess.delay_span_bug(
+                tcx.def_span(trait_item_id),
+                &format!(
+                    "encountered ambiguity selecting `{trait_ref:?}` during codegen, presuming due to \
+                     overflow or prior type error",
+                ),
+            );
+            return Err(reported);
+        }
+        Err(CodegenObligationError::Unimplemented) => return Ok(None),
+        Err(CodegenObligationError::FulfillmentError) => return Ok(None),
+    };
 
     // Now that we know which impl is being used, we can dispatch to
     // the actual function:
@@ -270,6 +171,11 @@ fn resolve_associated_item<'tcx>(
                 return Ok(None);
             }
 
+            // If the item does not have a value, then we cannot return an instance.
+            if !leaf_def.item.defaultness(tcx).has_value() {
+                return Ok(None);
+            }
+
             let substs = tcx.erase_regions(substs);
 
             // Check if we just resolved an associated `const` declaration from
@@ -281,7 +187,7 @@ fn resolve_associated_item<'tcx>(
             // we know the error would've been caught (e.g. in an upstream crate).
             //
             // A better approach might be to just introduce a query (returning
-            // `Result<(), ErrorReported>`) for the check that `rustc_typeck`
+            // `Result<(), ErrorGuaranteed>`) for the check that `rustc_typeck`
             // performs (i.e. that the definition's type in the `impl` matches
             // the declaration in the `trait`), so that we can cheaply check
             // here if it failed, instead of approximating it.
@@ -306,9 +212,9 @@ fn resolve_associated_item<'tcx>(
                         resolved_ty,
                     );
                     let span = tcx.def_span(leaf_def.item.def_id);
-                    tcx.sess.delay_span_bug(span, &msg);
+                    let reported = tcx.sess.delay_span_bug(span, &msg);
 
-                    return Err(ErrorReported);
+                    return Err(reported);
                 }
             }
 
@@ -322,12 +228,12 @@ fn resolve_associated_item<'tcx>(
         }),
         traits::ImplSource::Closure(closure_data) => {
             let trait_closure_kind = tcx.fn_trait_kind_from_lang_item(trait_id).unwrap();
-            Some(Instance::resolve_closure(
+            Instance::resolve_closure(
                 tcx,
                 closure_data.closure_def_id,
                 closure_data.substs,
                 trait_closure_kind,
-            ))
+            )
         }
         traits::ImplSource::FnPointer(ref data) => match data.fn_ty.kind() {
             ty::FnDef(..) | ty::FnPtr(..) => Some(Instance {
@@ -337,11 +243,15 @@ fn resolve_associated_item<'tcx>(
             _ => None,
         },
         traits::ImplSource::Object(ref data) => {
-            let index = traits::get_vtable_index_of_object_method(tcx, data, trait_item_id);
-            Some(Instance {
-                def: ty::InstanceDef::Virtual(trait_item_id, index),
-                substs: rcvr_substs,
-            })
+            if let Some(index) = traits::get_vtable_index_of_object_method(tcx, data, trait_item_id)
+            {
+                Some(Instance {
+                    def: ty::InstanceDef::Virtual(trait_item_id, index),
+                    substs: rcvr_substs,
+                })
+            } else {
+                None
+            }
         }
         traits::ImplSource::Builtin(..) => {
             if Some(trait_ref.def_id) == tcx.lang_items().clone_trait() {
@@ -353,7 +263,10 @@ fn resolve_associated_item<'tcx>(
                     let is_copy = self_ty.is_copy_modulo_regions(tcx.at(DUMMY_SP), param_env);
                     match self_ty.kind() {
                         _ if is_copy => (),
-                        ty::Closure(..) | ty::Tuple(..) => {}
+                        ty::Generator(..)
+                        | ty::GeneratorWitness(..)
+                        | ty::Closure(..)
+                        | ty::Tuple(..) => {}
                         _ => return Ok(None),
                     };
 
@@ -378,7 +291,8 @@ fn resolve_associated_item<'tcx>(
         | traits::ImplSource::DiscriminantKind(..)
         | traits::ImplSource::Pointee(..)
         | traits::ImplSource::TraitUpcasting(_)
-        | traits::ImplSource::ConstDrop(_) => None,
+        | traits::ImplSource::ConstDestruct(_)
+        | traits::ImplSource::Tuple => None,
     })
 }
 

@@ -125,16 +125,13 @@ fn should_ignore(line: &str) -> bool {
 
 /// Returns `true` if `line` is allowed to be longer than the normal limit.
 fn long_line_is_ok(extension: &str, is_error_code: bool, max_columns: usize, line: &str) -> bool {
-    if extension != "md" || is_error_code {
-        if line_is_url(is_error_code, max_columns, line) || should_ignore(line) {
-            return true;
-        }
-    } else if extension == "md" {
+    match extension {
+        // fluent files are allowed to be any length
+        "ftl" => true,
         // non-error code markdown is allowed to be any length
-        return true;
+        "md" if !is_error_code => true,
+        _ => line_is_url(is_error_code, max_columns, line) || should_ignore(line),
     }
-
-    false
 }
 
 enum Directive {
@@ -153,9 +150,9 @@ fn contains_ignore_directive(can_contain: bool, contents: &str, check: &str) -> 
         return Directive::Deny;
     }
     // Update `can_contain` when changing this
-    if contents.contains(&format!("// ignore-tidy-{}", check))
-        || contents.contains(&format!("# ignore-tidy-{}", check))
-        || contents.contains(&format!("/* ignore-tidy-{} */", check))
+    if contents.contains(&format!("// ignore-tidy-{check}"))
+        || contents.contains(&format!("# ignore-tidy-{check}"))
+        || contents.contains(&format!("/* ignore-tidy-{check} */"))
     {
         Directive::Ignore(false)
     } else {
@@ -230,7 +227,7 @@ pub fn check(path: &Path, bad: &mut bool) {
     super::walk(path, &mut skip, &mut |entry, contents| {
         let file = entry.path();
         let filename = file.file_name().unwrap().to_string_lossy();
-        let extensions = [".rs", ".py", ".js", ".sh", ".c", ".cpp", ".h", ".md", ".css"];
+        let extensions = [".rs", ".py", ".js", ".sh", ".c", ".cpp", ".h", ".md", ".css", ".ftl"];
         if extensions.iter().all(|e| !filename.ends_with(e)) || filename.starts_with(".#") {
             return;
         }
@@ -294,7 +291,7 @@ pub fn check(path: &Path, bad: &mut bool) {
                 suppressible_tidy_err!(
                     err,
                     skip_line_length,
-                    &format!("line longer than {} chars", max_columns)
+                    &format!("line longer than {max_columns} chars")
                 );
             }
             if !is_style_file && line.contains('\t') {
@@ -381,7 +378,7 @@ pub fn check(path: &Path, bad: &mut bool) {
             n => suppressible_tidy_err!(
                 err,
                 skip_trailing_newlines,
-                &format!("too many trailing newlines ({})", n)
+                &format!("too many trailing newlines ({n})")
             ),
         };
         if lines > LINES {
@@ -395,9 +392,6 @@ pub fn check(path: &Path, bad: &mut bool) {
                 );
             };
             suppressible_tidy_err!(err, skip_file_length, "");
-        } else if lines > (LINES * 7) / 10 {
-            // Just set it to something that doesn't trigger the "unneccessarily ignored" warning.
-            skip_file_length = Directive::Ignore(true);
         }
 
         if let Directive::Ignore(false) = skip_cr {
@@ -405,12 +399,6 @@ pub fn check(path: &Path, bad: &mut bool) {
         }
         if let Directive::Ignore(false) = skip_tab {
             tidy_error!(bad, "{}: ignoring tab characters unnecessarily", file.display());
-        }
-        if let Directive::Ignore(false) = skip_line_length {
-            tidy_error!(bad, "{}: ignoring line length unnecessarily", file.display());
-        }
-        if let Directive::Ignore(false) = skip_file_length {
-            tidy_error!(bad, "{}: ignoring file length unnecessarily", file.display());
         }
         if let Directive::Ignore(false) = skip_end_whitespace {
             tidy_error!(bad, "{}: ignoring trailing whitespace unnecessarily", file.display());
@@ -424,5 +412,9 @@ pub fn check(path: &Path, bad: &mut bool) {
         if let Directive::Ignore(false) = skip_copyright {
             tidy_error!(bad, "{}: ignoring copyright unnecessarily", file.display());
         }
+        // We deliberately do not warn about these being unnecessary,
+        // that would just lead to annoying churn.
+        let _unused = skip_line_length;
+        let _unused = skip_file_length;
     })
 }

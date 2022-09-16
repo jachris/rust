@@ -33,9 +33,11 @@
 
 use rustc_ast::ast;
 use rustc_middle::traits::{ChalkEnvironmentAndGoal, ChalkRustInterner as RustInterner};
-use rustc_middle::ty::fold::TypeFolder;
 use rustc_middle::ty::subst::{GenericArg, GenericArgKind, SubstsRef};
-use rustc_middle::ty::{self, Binder, Region, Ty, TyCtxt, TypeFoldable, TypeVisitor};
+use rustc_middle::ty::{
+    self, Binder, Region, Ty, TyCtxt, TypeFoldable, TypeFolder, TypeSuperFoldable,
+    TypeSuperVisitable, TypeVisitable, TypeVisitor,
+};
 use rustc_span::def_id::DefId;
 
 use chalk_ir::{FnSig, ForeignDefId};
@@ -44,7 +46,7 @@ use std::collections::btree_map::{BTreeMap, Entry};
 use std::ops::ControlFlow;
 
 /// Essentially an `Into` with a `&RustInterner` parameter
-crate trait LowerInto<'tcx, T> {
+pub(crate) trait LowerInto<'tcx, T> {
     /// Lower a rustc construct (e.g., `ty::TraitPredicate`) to a chalk type, consuming `self`.
     fn lower_into(self, interner: RustInterner<'tcx>) -> T;
 }
@@ -105,8 +107,16 @@ impl<'tcx> LowerInto<'tcx, chalk_ir::InEnvironment<chalk_ir::Goal<RustInterner<'
                 ty::PredicateKind::Projection(predicate) => chalk_ir::DomainGoal::Holds(
                     chalk_ir::WhereClause::AliasEq(predicate.lower_into(interner)),
                 ),
-                ty::PredicateKind::WellFormed(..)
-                | ty::PredicateKind::ObjectSafe(..)
+                ty::PredicateKind::WellFormed(arg) => match arg.unpack() {
+                    ty::GenericArgKind::Type(ty) => chalk_ir::DomainGoal::WellFormed(
+                        chalk_ir::WellFormed::Ty(ty.lower_into(interner)),
+                    ),
+                    // FIXME(chalk): we need to change `WellFormed` in Chalk to take a `GenericArg`
+                    _ => chalk_ir::DomainGoal::WellFormed(chalk_ir::WellFormed::Ty(
+                        interner.tcx.types.unit.lower_into(interner),
+                    )),
+                },
+                ty::PredicateKind::ObjectSafe(..)
                 | ty::PredicateKind::ClosureKind(..)
                 | ty::PredicateKind::Subtype(..)
                 | ty::PredicateKind::Coerce(..)
@@ -181,7 +191,7 @@ impl<'tcx> LowerInto<'tcx, chalk_ir::GoalData<RustInterner<'tcx>>> for ty::Predi
                 GenericArgKind::Const(..) => {
                     chalk_ir::GoalData::All(chalk_ir::Goals::empty(interner))
                 }
-                GenericArgKind::Lifetime(lt) => bug!("unexpect well formed predicate: {:?}", lt),
+                GenericArgKind::Lifetime(lt) => bug!("unexpected well formed predicate: {:?}", lt),
             },
 
             ty::PredicateKind::ObjectSafe(t) => chalk_ir::GoalData::DomainGoal(
@@ -316,14 +326,18 @@ impl<'tcx> LowerInto<'tcx, chalk_ir::Ty<RustInterner<'tcx>>> for Ty<'tcx> {
                     )),
                 })
             }
-            ty::Dynamic(predicates, region) => chalk_ir::TyKind::Dyn(chalk_ir::DynTy {
+            // FIXME(dyn-star): handle the dynamic kind (dyn or dyn*)
+            ty::Dynamic(predicates, region, _kind) => chalk_ir::TyKind::Dyn(chalk_ir::DynTy {
                 bounds: predicates.lower_into(interner),
                 lifetime: region.lower_into(interner),
             }),
             ty::Closure(def_id, substs) => {
                 chalk_ir::TyKind::Closure(chalk_ir::ClosureId(def_id), substs.lower_into(interner))
             }
-            ty::Generator(_def_id, _substs, _) => unimplemented!(),
+            ty::Generator(def_id, substs, _) => chalk_ir::TyKind::Generator(
+                chalk_ir::GeneratorId(def_id),
+                substs.lower_into(interner),
+            ),
             ty::GeneratorWitness(_) => unimplemented!(),
             ty::Never => chalk_ir::TyKind::Never,
             ty::Tuple(types) => {
@@ -472,10 +486,6 @@ impl<'tcx> LowerInto<'tcx, chalk_ir::Lifetime<RustInterner<'tcx>>> for Region<'t
                 })
                 .intern(interner)
             }
-            ty::ReEmpty(ui) => {
-                chalk_ir::LifetimeData::Empty(chalk_ir::UniverseIndex { counter: ui.index() })
-                    .intern(interner)
-            }
             ty::ReErased => chalk_ir::LifetimeData::Erased.intern(interner),
         }
     }
@@ -497,8 +507,8 @@ impl<'tcx> LowerInto<'tcx, Region<'tcx>> for &chalk_ir::Lifetime<RustInterner<'t
                 name: ty::BoundRegionKind::BrAnon(p.idx as u32),
             }),
             chalk_ir::LifetimeData::Static => return interner.tcx.lifetimes.re_static,
-            chalk_ir::LifetimeData::Empty(ui) => {
-                ty::ReEmpty(ty::UniverseIndex::from_usize(ui.counter))
+            chalk_ir::LifetimeData::Empty(_) => {
+                bug!("Chalk should not have been passed an empty lifetime.")
             }
             chalk_ir::LifetimeData::Erased => return interner.tcx.lifetimes.re_erased,
             chalk_ir::LifetimeData::Phantom(void, _) => match *void {},
@@ -510,7 +520,7 @@ impl<'tcx> LowerInto<'tcx, Region<'tcx>> for &chalk_ir::Lifetime<RustInterner<'t
 impl<'tcx> LowerInto<'tcx, chalk_ir::Const<RustInterner<'tcx>>> for ty::Const<'tcx> {
     fn lower_into(self, interner: RustInterner<'tcx>) -> chalk_ir::Const<RustInterner<'tcx>> {
         let ty = self.ty().lower_into(interner);
-        let value = match self.val() {
+        let value = match self.kind() {
             ty::ConstKind::Value(val) => {
                 chalk_ir::ConstValue::Concrete(chalk_ir::ConcreteConst { interned: val })
             }
@@ -527,7 +537,7 @@ impl<'tcx> LowerInto<'tcx, ty::Const<'tcx>> for &chalk_ir::Const<RustInterner<'t
     fn lower_into(self, interner: RustInterner<'tcx>) -> ty::Const<'tcx> {
         let data = self.data(interner);
         let ty = data.ty.lower_into(interner);
-        let val = match data.value {
+        let kind = match data.value {
             chalk_ir::ConstValue::BoundVar(var) => ty::ConstKind::Bound(
                 ty::DebruijnIndex::from_u32(var.debruijn.depth()),
                 ty::BoundVar::from_u32(var.index as u32),
@@ -536,7 +546,7 @@ impl<'tcx> LowerInto<'tcx, ty::Const<'tcx>> for &chalk_ir::Const<RustInterner<'t
             chalk_ir::ConstValue::Placeholder(_p) => unimplemented!(),
             chalk_ir::ConstValue::Concrete(c) => ty::ConstKind::Value(c.interned),
         };
-        interner.tcx.mk_const(ty::ConstS { ty, val })
+        interner.tcx.mk_const(ty::ConstS { ty, kind })
     }
 }
 
@@ -833,7 +843,7 @@ impl<'tcx> LowerInto<'tcx, chalk_solve::rust_ir::AliasEqBound<RustInterner<'tcx>
 /// It's important to note that because of prior substitution, we may have
 /// late-bound regions, even outside of fn contexts, since this is the best way
 /// to prep types for chalk lowering.
-crate fn collect_bound_vars<'tcx, T: TypeFoldable<'tcx>>(
+pub(crate) fn collect_bound_vars<'tcx, T: TypeFoldable<'tcx>>(
     interner: RustInterner<'tcx>,
     tcx: TyCtxt<'tcx>,
     ty: Binder<'tcx, T>,
@@ -867,14 +877,14 @@ crate fn collect_bound_vars<'tcx, T: TypeFoldable<'tcx>>(
     (new_ty, binders, named_parameters)
 }
 
-crate struct BoundVarsCollector<'tcx> {
+pub(crate) struct BoundVarsCollector<'tcx> {
     binder_index: ty::DebruijnIndex,
-    crate parameters: BTreeMap<u32, chalk_ir::VariableKind<RustInterner<'tcx>>>,
-    crate named_parameters: Vec<DefId>,
+    pub(crate) parameters: BTreeMap<u32, chalk_ir::VariableKind<RustInterner<'tcx>>>,
+    pub(crate) named_parameters: Vec<DefId>,
 }
 
 impl<'tcx> BoundVarsCollector<'tcx> {
-    crate fn new() -> Self {
+    pub(crate) fn new() -> Self {
         BoundVarsCollector {
             binder_index: ty::INNERMOST,
             parameters: BTreeMap::new(),
@@ -884,7 +894,7 @@ impl<'tcx> BoundVarsCollector<'tcx> {
 }
 
 impl<'tcx> TypeVisitor<'tcx> for BoundVarsCollector<'tcx> {
-    fn visit_binder<T: TypeFoldable<'tcx>>(
+    fn visit_binder<T: TypeVisitable<'tcx>>(
         &mut self,
         t: &Binder<'tcx, T>,
     ) -> ControlFlow<Self::BreakTy> {
@@ -998,17 +1008,17 @@ impl<'a, 'tcx> TypeFolder<'tcx> for NamedBoundVarSubstitutor<'a, 'tcx> {
 
 /// Used to substitute `Param`s with placeholders. We do this since Chalk
 /// have a notion of `Param`s.
-crate struct ParamsSubstitutor<'tcx> {
+pub(crate) struct ParamsSubstitutor<'tcx> {
     tcx: TyCtxt<'tcx>,
     binder_index: ty::DebruijnIndex,
     list: Vec<rustc_middle::ty::ParamTy>,
     next_ty_placeholder: usize,
-    crate params: rustc_data_structures::fx::FxHashMap<usize, rustc_middle::ty::ParamTy>,
-    crate named_regions: BTreeMap<DefId, u32>,
+    pub(crate) params: rustc_data_structures::fx::FxHashMap<usize, rustc_middle::ty::ParamTy>,
+    pub(crate) named_regions: BTreeMap<DefId, u32>,
 }
 
 impl<'tcx> ParamsSubstitutor<'tcx> {
-    crate fn new(tcx: TyCtxt<'tcx>, next_ty_placeholder: usize) -> Self {
+    pub(crate) fn new(tcx: TyCtxt<'tcx>, next_ty_placeholder: usize) -> Self {
         ParamsSubstitutor {
             tcx,
             binder_index: ty::INNERMOST,
@@ -1080,13 +1090,13 @@ impl<'tcx> TypeFolder<'tcx> for ParamsSubstitutor<'tcx> {
     }
 }
 
-crate struct ReverseParamsSubstitutor<'tcx> {
+pub(crate) struct ReverseParamsSubstitutor<'tcx> {
     tcx: TyCtxt<'tcx>,
     params: rustc_data_structures::fx::FxHashMap<usize, rustc_middle::ty::ParamTy>,
 }
 
 impl<'tcx> ReverseParamsSubstitutor<'tcx> {
-    crate fn new(
+    pub(crate) fn new(
         tcx: TyCtxt<'tcx>,
         params: rustc_data_structures::fx::FxHashMap<usize, rustc_middle::ty::ParamTy>,
     ) -> Self {
@@ -1114,14 +1124,14 @@ impl<'tcx> TypeFolder<'tcx> for ReverseParamsSubstitutor<'tcx> {
 }
 
 /// Used to collect `Placeholder`s.
-crate struct PlaceholdersCollector {
+pub(crate) struct PlaceholdersCollector {
     universe_index: ty::UniverseIndex,
-    crate next_ty_placeholder: usize,
-    crate next_anon_region_placeholder: u32,
+    pub(crate) next_ty_placeholder: usize,
+    pub(crate) next_anon_region_placeholder: u32,
 }
 
 impl PlaceholdersCollector {
-    crate fn new() -> Self {
+    pub(crate) fn new() -> Self {
         PlaceholdersCollector {
             universe_index: ty::UniverseIndex::ROOT,
             next_ty_placeholder: 0,

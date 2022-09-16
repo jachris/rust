@@ -16,12 +16,17 @@ declare_clippy_lint! {
     /// the value. Also the code misleads about the intent of the call site.
     ///
     /// ### Example
-    /// ```ignore
-    /// // Bad
-    /// my_vec.push(&mut value)
+    /// ```rust
+    /// # let mut vec = Vec::new();
+    /// # let mut value = 5;
+    /// vec.push(&mut value);
+    /// ```
     ///
-    /// // Good
-    /// my_vec.push(&value)
+    /// Use instead:
+    /// ```rust
+    /// # let mut vec = Vec::new();
+    /// # let value = 5;
+    /// vec.push(&value);
     /// ```
     #[clippy::version = "pre 1.29.0"]
     pub UNNECESSARY_MUT_PASSED,
@@ -38,18 +43,24 @@ impl<'tcx> LateLintPass<'tcx> for UnnecessaryMutPassed {
                 if let ExprKind::Path(ref path) = fn_expr.kind {
                     check_arguments(
                         cx,
-                        arguments,
+                        arguments.iter().collect(),
                         cx.typeck_results().expr_ty(fn_expr),
                         &rustc_hir_pretty::to_string(rustc_hir_pretty::NO_ANN, |s| s.print_qpath(path, false)),
                         "function",
                     );
                 }
             },
-            ExprKind::MethodCall(path, arguments, _) => {
+            ExprKind::MethodCall(path, receiver, arguments, _) => {
                 let def_id = cx.typeck_results().type_dependent_def_id(e.hir_id).unwrap();
                 let substs = cx.typeck_results().node_substs(e.hir_id);
-                let method_type = cx.tcx.type_of(def_id).subst(cx.tcx, substs);
-                check_arguments(cx, arguments, method_type, path.ident.as_str(), "method");
+                let method_type = cx.tcx.bound_type_of(def_id).subst(cx.tcx, substs);
+                check_arguments(
+                    cx,
+                    std::iter::once(receiver).chain(arguments.iter()).collect(),
+                    method_type,
+                    path.ident.as_str(),
+                    "method",
+                );
             },
             _ => (),
         }
@@ -58,7 +69,7 @@ impl<'tcx> LateLintPass<'tcx> for UnnecessaryMutPassed {
 
 fn check_arguments<'tcx>(
     cx: &LateContext<'tcx>,
-    arguments: &[Expr<'_>],
+    arguments: Vec<&Expr<'_>>,
     type_definition: Ty<'tcx>,
     name: &str,
     fn_kind: &str,

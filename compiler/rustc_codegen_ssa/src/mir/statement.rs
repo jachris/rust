@@ -1,4 +1,5 @@
 use rustc_middle::mir;
+use rustc_middle::mir::NonDivergingIntrinsic;
 
 use super::FunctionCx;
 use super::LocalRef;
@@ -6,9 +7,8 @@ use crate::traits::BuilderMethods;
 use crate::traits::*;
 
 impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
+    #[instrument(level = "debug", skip(self, bx))]
     pub fn codegen_statement(&mut self, mut bx: Bx, statement: &mir::Statement<'tcx>) -> Bx {
-        debug!("codegen_statement(statement={:?})", statement);
-
         self.set_debug_loc(&mut bx, statement.source_info);
         match statement.kind {
             mir::StatementKind::Assign(box (ref place, ref rvalue)) => {
@@ -48,6 +48,12 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                     .codegen_set_discr(&mut bx, variant_index);
                 bx
             }
+            mir::StatementKind::Deinit(..) => {
+                // For now, don't codegen this to anything. In the future it may be worth
+                // experimenting with what kind of information we can emit to LLVM without hurting
+                // perf here
+                bx
+            }
             mir::StatementKind::StorageLive(local) => {
                 if let LocalRef::Place(cg_place) = self.locals[local] {
                     cg_place.storage_live(&mut bx);
@@ -68,11 +74,14 @@ impl<'a, 'tcx, Bx: BuilderMethods<'a, 'tcx>> FunctionCx<'a, 'tcx, Bx> {
                 self.codegen_coverage(&mut bx, coverage.clone(), statement.source_info.scope);
                 bx
             }
-            mir::StatementKind::CopyNonOverlapping(box mir::CopyNonOverlapping {
-                ref src,
-                ref dst,
-                ref count,
-            }) => {
+            mir::StatementKind::Intrinsic(box NonDivergingIntrinsic::Assume(ref op)) => {
+                let op_val = self.codegen_operand(&mut bx, op);
+                bx.assume(op_val.immediate());
+                bx
+            }
+            mir::StatementKind::Intrinsic(box NonDivergingIntrinsic::CopyNonOverlapping(
+                mir::CopyNonOverlapping { ref count, ref src, ref dst },
+            )) => {
                 let dst_val = self.codegen_operand(&mut bx, dst);
                 let src_val = self.codegen_operand(&mut bx, src);
                 let count = self.codegen_operand(&mut bx, count).immediate();

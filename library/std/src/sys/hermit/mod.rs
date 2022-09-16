@@ -22,14 +22,13 @@ pub mod alloc;
 pub mod args;
 #[path = "../unix/cmath.rs"]
 pub mod cmath;
-pub mod condvar;
 pub mod env;
 pub mod fd;
 pub mod fs;
+pub mod futex;
 #[path = "../unsupported/io.rs"]
 pub mod io;
 pub mod memchr;
-pub mod mutex;
 pub mod net;
 pub mod os;
 #[path = "../unix/os_str.rs"]
@@ -40,13 +39,22 @@ pub mod path;
 pub mod pipe;
 #[path = "../unsupported/process.rs"]
 pub mod process;
-pub mod rwlock;
 pub mod stdio;
 pub mod thread;
 pub mod thread_local_dtor;
 #[path = "../unsupported/thread_local_key.rs"]
 pub mod thread_local_key;
 pub mod time;
+
+#[path = "../unix/locks"]
+pub mod locks {
+    mod futex_condvar;
+    mod futex_mutex;
+    mod futex_rwlock;
+    pub(crate) use futex_condvar::MovableCondvar;
+    pub(crate) use futex_mutex::{MovableMutex, Mutex};
+    pub(crate) use futex_rwlock::{MovableRwLock, RwLock};
+}
 
 use crate::io::ErrorKind;
 
@@ -62,16 +70,6 @@ pub fn unsupported_err() -> crate::io::Error {
         crate::io::ErrorKind::Unsupported,
         "operation not supported on HermitCore yet",
     )
-}
-
-pub unsafe fn strlen(start: *const c_char) -> usize {
-    let mut str = start;
-
-    while *str != 0 {
-        str = str.offset(1);
-    }
-
-    (str as usize) - (start as usize)
 }
 
 #[no_mangle]
@@ -101,7 +99,7 @@ pub extern "C" fn __rust_abort() {
 
 // SAFETY: must be called only once during runtime initialization.
 // NOTE: this is not guaranteed to run, for example when Rust code is called externally.
-pub unsafe fn init(argc: isize, argv: *const *const u8) {
+pub unsafe fn init(argc: isize, argv: *const *const u8, _sigpipe: u8) {
     let _ = net::init();
     args::init(argc, argv);
 }

@@ -8,14 +8,16 @@
 //! LLVM.
 
 #![doc(html_root_url = "https://doc.rust-lang.org/nightly/nightly-rustc/")]
-#![feature(bool_to_option)]
-#![feature(let_else)]
-#![feature(nll)]
-#![feature(never_type)]
+#![feature(assert_matches)]
 #![feature(associated_type_bounds)]
 #![feature(exhaustive_patterns)]
+#![feature(let_else)]
 #![feature(min_specialization)]
+#![feature(never_type)]
+#![feature(rustc_attrs)]
 #![feature(step_trait)]
+#![deny(rustc::untranslatable_diagnostic)]
+#![deny(rustc::diagnostic_outside_of_impl)]
 
 use std::iter::FromIterator;
 use std::path::{Path, PathBuf};
@@ -28,6 +30,7 @@ extern crate tracing;
 
 pub mod abi;
 pub mod asm;
+pub mod json;
 pub mod spec;
 
 #[cfg(test)]

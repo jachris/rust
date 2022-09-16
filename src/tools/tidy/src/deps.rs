@@ -20,6 +20,7 @@ const LICENSES: &[&str] = &[
     "Unlicense OR MIT",
     "0BSD OR MIT OR Apache-2.0", // adler license
     "Zlib OR Apache-2.0 OR MIT", // tinyvec
+    "MIT OR Zlib OR Apache-2.0", // miniz_oxide
 ];
 
 /// These are exceptions to Rust's permissive licensing policy, and
@@ -30,16 +31,20 @@ const EXCEPTIONS: &[(&str, &str)] = &[
     ("mdbook", "MPL-2.0"),            // mdbook
     ("openssl", "Apache-2.0"),        // cargo, mdbook
     ("colored", "MPL-2.0"),           // rustfmt
-    ("ordslice", "Apache-2.0"),       // rls
-    ("ryu", "Apache-2.0 OR BSL-1.0"), // rls/cargo/... (because of serde)
+    ("ryu", "Apache-2.0 OR BSL-1.0"), // cargo/... (because of serde)
     ("bytesize", "Apache-2.0"),       // cargo
     ("im-rc", "MPL-2.0+"),            // cargo
     ("sized-chunks", "MPL-2.0+"),     // cargo via im-rc
     ("bitmaps", "MPL-2.0+"),          // cargo via im-rc
     ("instant", "BSD-3-Clause"),      // rustc_driver/tracing-subscriber/parking_lot
     ("snap", "BSD-3-Clause"),         // rustc
+    ("fluent-langneg", "Apache-2.0"), // rustc (fluent translations)
+    ("self_cell", "Apache-2.0"),      // rustc (fluent translations)
     // FIXME: this dependency violates the documentation comment above:
     ("fortanix-sgx-abi", "MPL-2.0"), // libstd but only for `sgx` target
+    ("dunce", "CC0-1.0"),            // cargo (dev dependency)
+    ("similar", "Apache-2.0"),       // cargo (dev dependency)
+    ("normalize-line-endings", "Apache-2.0"), // cargo (dev dependency)
 ];
 
 const EXCEPTIONS_CRANELIFT: &[(&str, &str)] = &[
@@ -49,13 +54,18 @@ const EXCEPTIONS_CRANELIFT: &[(&str, &str)] = &[
     ("cranelift-codegen-shared", "Apache-2.0 WITH LLVM-exception"),
     ("cranelift-entity", "Apache-2.0 WITH LLVM-exception"),
     ("cranelift-frontend", "Apache-2.0 WITH LLVM-exception"),
+    ("cranelift-isle", "Apache-2.0 WITH LLVM-exception"),
     ("cranelift-jit", "Apache-2.0 WITH LLVM-exception"),
     ("cranelift-module", "Apache-2.0 WITH LLVM-exception"),
     ("cranelift-native", "Apache-2.0 WITH LLVM-exception"),
     ("cranelift-object", "Apache-2.0 WITH LLVM-exception"),
     ("mach", "BSD-2-Clause"),
-    ("regalloc", "Apache-2.0 WITH LLVM-exception"),
+    ("regalloc2", "Apache-2.0 WITH LLVM-exception"),
     ("target-lexicon", "Apache-2.0 WITH LLVM-exception"),
+];
+
+const EXCEPTIONS_BOOTSTRAP: &[(&str, &str)] = &[
+    ("ryu", "Apache-2.0 OR BSL-1.0"), // through serde
 ];
 
 /// These are the root crates that are part of the runtime. The licenses for
@@ -81,9 +91,6 @@ const PERMITTED_DEPENDENCIES: &[&str] = &[
     "autocfg",
     "bitflags",
     "block-buffer",
-    "block-padding",
-    "byte-tools",
-    "byteorder",
     "cc",
     "cfg-if",
     "chalk-derive",
@@ -91,10 +98,10 @@ const PERMITTED_DEPENDENCIES: &[&str] = &[
     "chalk-ir",
     "chalk-solve",
     "chrono",
-    "cmake",
     "compiler_builtins",
     "cpufeatures",
     "crc32fast",
+    "crossbeam-channel",
     "crossbeam-deque",
     "crossbeam-epoch",
     "crossbeam-utils",
@@ -108,11 +115,13 @@ const PERMITTED_DEPENDENCIES: &[&str] = &[
     "ena",
     "env_logger",
     "expect-test",
-    "fake-simd",
     "fallible-iterator", // dependency of `thorin`
     "filetime",
     "fixedbitset",
     "flate2",
+    "fluent-bundle",
+    "fluent-langneg",
+    "fluent-syntax",
     "fortanix-sgx-abi",
     "generic-array",
     "getopts",
@@ -125,6 +134,8 @@ const PERMITTED_DEPENDENCIES: &[&str] = &[
     "if_chain",
     "indexmap",
     "instant",
+    "intl-memoizer",
+    "intl_pluralrules",
     "itertools",
     "itoa",
     "jobserver",
@@ -147,7 +158,6 @@ const PERMITTED_DEPENDENCIES: &[&str] = &[
     "object",
     "odht",
     "once_cell",
-    "opaque-debug",
     "parking_lot",
     "parking_lot_core",
     "pathdiff",
@@ -157,6 +167,7 @@ const PERMITTED_DEPENDENCIES: &[&str] = &[
     "pkg-config",
     "polonius-engine",
     "ppv-lite86",
+    "proc-macro-hack",
     "proc-macro2",
     "psm",
     "punycode",
@@ -166,7 +177,6 @@ const PERMITTED_DEPENDENCIES: &[&str] = &[
     "rand_chacha",
     "rand_core",
     "rand_hc",
-    "rand_pcg",
     "rand_xorshift",
     "rand_xoshiro",
     "redox_syscall",
@@ -184,6 +194,7 @@ const PERMITTED_DEPENDENCIES: &[&str] = &[
     "ryu",
     "scoped-tls",
     "scopeguard",
+    "self_cell",
     "semver",
     "serde",
     "serde_derive",
@@ -200,21 +211,30 @@ const PERMITTED_DEPENDENCIES: &[&str] = &[
     "tempfile",
     "termcolor",
     "termize",
+    "thiserror",
+    "thiserror-impl",
     "thorin-dwp",
     "thread_local",
     "time",
+    "tinystr",
     "tinyvec",
+    "thin-vec",
     "tracing",
     "tracing-attributes",
     "tracing-core",
     "tracing-log",
     "tracing-subscriber",
     "tracing-tree",
+    "type-map",
     "typenum",
     "unic-char-property",
     "unic-char-range",
     "unic-common",
     "unic-emoji-char",
+    "unic-langid",
+    "unic-langid-impl",
+    "unic-langid-macros",
+    "unic-langid-macros-impl",
     "unic-ucd-version",
     "unicode-normalization",
     "unicode-script",
@@ -222,21 +242,25 @@ const PERMITTED_DEPENDENCIES: &[&str] = &[
     "unicode-width",
     "unicode-xid",
     "vcpkg",
+    "valuable",
     "version_check",
     "wasi",
     "winapi",
     "winapi-i686-pc-windows-gnu",
     "winapi-util",
     "winapi-x86_64-pc-windows-gnu",
-    // this is a false-positive: it's only used by rustfmt, but because it's enabled through a feature, tidy thinks it's used by rustc as well.
+    // this is a false-positive: it's only used by rustfmt, but because it's enabled through a
+    // feature, tidy thinks it's used by rustc as well.
     "yansi-term",
 ];
 
 const PERMITTED_CRANELIFT_DEPENDENCIES: &[&str] = &[
+    "ahash",
     "anyhow",
     "ar",
     "autocfg",
     "bitflags",
+    "byteorder",
     "cfg-if",
     "cranelift-bforest",
     "cranelift-codegen",
@@ -244,11 +268,14 @@ const PERMITTED_CRANELIFT_DEPENDENCIES: &[&str] = &[
     "cranelift-codegen-shared",
     "cranelift-entity",
     "cranelift-frontend",
+    "cranelift-isle",
     "cranelift-jit",
     "cranelift-module",
     "cranelift-native",
     "cranelift-object",
     "crc32fast",
+    "fxhash",
+    "getrandom",
     "gimli",
     "hashbrown",
     "indexmap",
@@ -258,14 +285,23 @@ const PERMITTED_CRANELIFT_DEPENDENCIES: &[&str] = &[
     "mach",
     "memchr",
     "object",
-    "regalloc",
+    "once_cell",
+    "regalloc2",
     "region",
-    "rustc-hash",
+    "slice-group-by",
     "smallvec",
     "target-lexicon",
+    "version_check",
+    "wasi",
     "winapi",
     "winapi-i686-pc-windows-gnu",
     "winapi-x86_64-pc-windows-gnu",
+    "windows-sys",
+    "windows_aarch64_msvc",
+    "windows_i686_gnu",
+    "windows_i686_msvc",
+    "windows_x86_64_gnu",
+    "windows_x86_64_msvc",
 ];
 
 const FORBIDDEN_TO_HAVE_DUPLICATES: &[&str] = &[
@@ -287,7 +323,13 @@ pub fn check(root: &Path, cargo: &Path, bad: &mut bool) {
     let metadata = t!(cmd.exec());
     let runtime_ids = compute_runtime_crates(&metadata);
     check_exceptions(&metadata, EXCEPTIONS, runtime_ids, bad);
-    check_dependencies(&metadata, PERMITTED_DEPENDENCIES, RESTRICTED_DEPENDENCY_CRATES, bad);
+    check_dependencies(
+        &metadata,
+        "main workspace",
+        PERMITTED_DEPENDENCIES,
+        RESTRICTED_DEPENDENCY_CRATES,
+        bad,
+    );
     check_crate_duplicate(&metadata, FORBIDDEN_TO_HAVE_DUPLICATES, bad);
     check_rustfix(&metadata, bad);
 
@@ -301,11 +343,20 @@ pub fn check(root: &Path, cargo: &Path, bad: &mut bool) {
     check_exceptions(&metadata, EXCEPTIONS_CRANELIFT, runtime_ids, bad);
     check_dependencies(
         &metadata,
+        "cranelift",
         PERMITTED_CRANELIFT_DEPENDENCIES,
         &["rustc_codegen_cranelift"],
         bad,
     );
     check_crate_duplicate(&metadata, &[], bad);
+
+    let mut cmd = cargo_metadata::MetadataCommand::new();
+    cmd.cargo_path(cargo)
+        .manifest_path(root.join("src/bootstrap/Cargo.toml"))
+        .features(cargo_metadata::CargoOpt::AllFeatures);
+    let metadata = t!(cmd.exec());
+    let runtime_ids = HashSet::new();
+    check_exceptions(&metadata, EXCEPTIONS_BOOTSTRAP, runtime_ids, bad);
 }
 
 /// Check that all licenses are in the valid list in `LICENSES`.
@@ -340,8 +391,8 @@ fn check_exceptions(
                 }
                 Some(pkg_license) => {
                     if pkg_license.as_str() != *license {
-                        println!("dependency exception `{}` license has changed", name);
-                        println!("    previously `{}` now `{}`", license, pkg_license);
+                        println!("dependency exception `{name}` license has changed");
+                        println!("    previously `{license}` now `{pkg_license}`");
                         println!("    update EXCEPTIONS for the new license");
                         *bad = true;
                     }
@@ -387,6 +438,7 @@ fn check_exceptions(
 /// Specifically, this checks that the dependencies are on the `PERMITTED_DEPENDENCIES`.
 fn check_dependencies(
     metadata: &Metadata,
+    descr: &str,
     permitted_dependencies: &[&'static str],
     restricted_dependency_crates: &[&'static str],
     bad: &mut bool,
@@ -416,9 +468,9 @@ fn check_dependencies(
     }
 
     if !unapproved.is_empty() {
-        tidy_error!(bad, "Dependencies not explicitly permitted:");
+        tidy_error!(bad, "Dependencies for {} not explicitly permitted:", descr);
         for dep in unapproved {
-            println!("* {}", dep);
+            println!("* {dep}");
         }
     }
 }
@@ -501,7 +553,7 @@ fn deps_of<'a>(metadata: &'a Metadata, pkg_id: &'a PackageId) -> Vec<&'a Package
         .nodes
         .iter()
         .find(|n| &n.id == pkg_id)
-        .unwrap_or_else(|| panic!("could not find `{}` in resolve", pkg_id));
+        .unwrap_or_else(|| panic!("could not find `{pkg_id}` in resolve"));
     node.deps
         .iter()
         .map(|dep| {
@@ -516,8 +568,8 @@ fn deps_of<'a>(metadata: &'a Metadata, pkg_id: &'a PackageId) -> Vec<&'a Package
 fn pkg_from_name<'a>(metadata: &'a Metadata, name: &'static str) -> &'a Package {
     let mut i = metadata.packages.iter().filter(|p| p.name == name);
     let result =
-        i.next().unwrap_or_else(|| panic!("could not find package `{}` in package list", name));
-    assert!(i.next().is_none(), "more than one package found for `{}`", name);
+        i.next().unwrap_or_else(|| panic!("could not find package `{name}` in package list"));
+    assert!(i.next().is_none(), "more than one package found for `{name}`");
     result
 }
 
@@ -545,7 +597,7 @@ fn normal_deps_of_r<'a>(
         .nodes
         .iter()
         .find(|n| &n.id == pkg_id)
-        .unwrap_or_else(|| panic!("could not find `{}` in resolve", pkg_id));
+        .unwrap_or_else(|| panic!("could not find `{pkg_id}` in resolve"));
     for dep in &node.deps {
         normal_deps_of_r(resolve, &dep.pkg, result);
     }

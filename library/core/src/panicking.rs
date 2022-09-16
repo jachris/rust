@@ -39,7 +39,7 @@ use crate::panic::{Location, PanicInfo};
 #[rustc_const_unstable(feature = "core_panic", issue = "none")]
 #[lang = "panic"] // needed by codegen for panic on overflow and other `Assert` MIR terminators
 pub const fn panic(expr: &'static str) -> ! {
-    // Use Arguments::new_v1 instead of format_args!("{}", expr) to potentially
+    // Use Arguments::new_v1 instead of format_args!("{expr}") to potentially
     // reduce size overhead. The format_args! macro uses str's Display trait to
     // write expr, which calls Formatter::pad, which must accommodate string
     // truncation and padding (even though none is used here). Using
@@ -56,7 +56,6 @@ pub const fn panic_str(expr: &str) -> ! {
     panic_display(&expr);
 }
 
-#[cfg(not(bootstrap))]
 #[inline]
 #[track_caller]
 #[rustc_diagnostic_item = "unreachable_display"] // needed for `non-fmt-panics` lint
@@ -82,10 +81,11 @@ fn panic_bounds_check(index: usize, len: usize) -> ! {
         super::intrinsics::abort()
     }
 
-    panic!("index out of bounds: the len is {} but the index is {}", len, index)
+    panic!("index out of bounds: the len is {len} but the index is {index}")
 }
 
-#[cfg(not(bootstrap))]
+// This function is called directly by the codegen backend, and must not have
+// any extra arguments (including those synthesized by track_caller).
 #[cold]
 #[inline(never)]
 #[lang = "panic_no_unwind"] // needed by codegen for panic in nounwind function
@@ -190,11 +190,11 @@ pub fn assert_matches_failed<T: fmt::Debug + ?Sized>(
     right: &str,
     args: Option<fmt::Arguments<'_>>,
 ) -> ! {
-    // Use the Display implementation to display the pattern.
+    // The pattern is a string so it can be displayed directly.
     struct Pattern<'a>(&'a str);
     impl fmt::Debug for Pattern<'_> {
         fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-            fmt::Display::fmt(self.0, f)
+            f.write_str(self.0)
         }
     }
     assert_failed_inner(AssertKind::Match, &left, &Pattern(right), args);

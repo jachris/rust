@@ -1,9 +1,11 @@
+use crate::array;
 use crate::cmp::{self, Ordering};
 use crate::ops::{ChangeOutputType, ControlFlow, FromResidual, Residual, Try};
 
 use super::super::try_process;
+use super::super::ByRefSized;
 use super::super::TrustedRandomAccessNoCoerce;
-use super::super::{Chain, Cloned, Copied, Cycle, Enumerate, Filter, FilterMap, Fuse};
+use super::super::{ArrayChunks, Chain, Cloned, Copied, Cycle, Enumerate, Filter, FilterMap, Fuse};
 use super::super::{FlatMap, Flatten};
 use super::super::{FromIterator, Intersperse, IntersperseWith, Product, Sum, Zip};
 use super::super::{
@@ -33,6 +35,15 @@ fn _assert_is_object_safe(_: &dyn Iterator<Item = ()>) {}
         label = "if you meant to iterate until a value (including it), add a starting value",
         note = "`..=end` is a `RangeToInclusive`, which cannot be iterated on; you might have meant \
               to have a bounded `RangeInclusive`: `0..=end`"
+    ),
+    on(
+        _Self = "[]",
+        label = "`{Self}` is not an iterator; try calling `.into_iter()` or `.iter()`"
+    ),
+    on(_Self = "&[]", label = "`{Self}` is not an iterator; try calling `.iter()`"),
+    on(
+        _Self = "std::vec::Vec<T, A>",
+        label = "`{Self}` is not an iterator; try calling `.into_iter()` or `.iter()`"
     ),
     on(
         _Self = "&str",
@@ -92,6 +103,47 @@ pub trait Iterator {
     #[stable(feature = "rust1", since = "1.0.0")]
     fn next(&mut self) -> Option<Self::Item>;
 
+    /// Advances the iterator and returns an array containing the next `N` values.
+    ///
+    /// If there are not enough elements to fill the array then `Err` is returned
+    /// containing an iterator over the remaining elements.
+    ///
+    /// # Examples
+    ///
+    /// Basic usage:
+    ///
+    /// ```
+    /// #![feature(iter_next_chunk)]
+    ///
+    /// let mut iter = "lorem".chars();
+    ///
+    /// assert_eq!(iter.next_chunk().unwrap(), ['l', 'o']);              // N is inferred as 2
+    /// assert_eq!(iter.next_chunk().unwrap(), ['r', 'e', 'm']);         // N is inferred as 3
+    /// assert_eq!(iter.next_chunk::<4>().unwrap_err().as_slice(), &[]); // N is explicitly 4
+    /// ```
+    ///
+    /// Split a string and get the first three items.
+    ///
+    /// ```
+    /// #![feature(iter_next_chunk)]
+    ///
+    /// let quote = "not all those who wander are lost";
+    /// let [first, second, third] = quote.split_whitespace().next_chunk().unwrap();
+    /// assert_eq!(first, "not");
+    /// assert_eq!(second, "all");
+    /// assert_eq!(third, "those");
+    /// ```
+    #[inline]
+    #[unstable(feature = "iter_next_chunk", reason = "recently added", issue = "98326")]
+    fn next_chunk<const N: usize>(
+        &mut self,
+    ) -> Result<[Self::Item; N], array::IntoIter<Self::Item, N>>
+    where
+        Self: Sized,
+    {
+        array::iter_next_chunk(self)
+    }
+
     /// Returns the bounds on the remaining length of the iterator.
     ///
     /// Specifically, `size_hint()` returns a tuple where the first element
@@ -125,9 +177,11 @@ pub trait Iterator {
     ///
     /// ```
     /// let a = [1, 2, 3];
-    /// let iter = a.iter();
+    /// let mut iter = a.iter();
     ///
     /// assert_eq!((3, Some(3)), iter.size_hint());
+    /// let _ = iter.next();
+    /// assert_eq!((2, Some(2)), iter.size_hint());
     /// ```
     ///
     /// A more complex example:
@@ -464,6 +518,10 @@ pub trait Iterator {
     /// it will first try to advance the first iterator at most one time and if it still yielded an item
     /// try to advance the second iterator at most one time.
     ///
+    /// To 'undo' the result of zipping up two iterators, see [`unzip`].
+    ///
+    /// [`unzip`]: Iterator::unzip
+    ///
     /// # Examples
     ///
     /// Basic usage:
@@ -704,13 +762,13 @@ pub trait Iterator {
     /// ```
     /// # #![allow(unused_must_use)]
     /// // don't do this:
-    /// (0..5).map(|x| println!("{}", x));
+    /// (0..5).map(|x| println!("{x}"));
     ///
     /// // it won't even execute, as it is lazy. Rust will warn you about this.
     ///
     /// // Instead, use for:
     /// for x in 0..5 {
-    ///     println!("{}", x);
+    ///     println!("{x}");
     /// }
     /// ```
     #[inline]
@@ -756,7 +814,7 @@ pub trait Iterator {
     /// (0..5).flat_map(|x| x * 100 .. x * 110)
     ///       .enumerate()
     ///       .filter(|&(i, x)| (i + x) % 3 == 0)
-    ///       .for_each(|(i, x)| println!("{}:{}", i, x));
+    ///       .for_each(|(i, x)| println!("{i}:{x}"));
     /// ```
     #[inline]
     #[stable(feature = "iterator_for_each", since = "1.21.0")]
@@ -1570,17 +1628,17 @@ pub trait Iterator {
     ///     .filter(|x| x % 2 == 0)
     ///     .fold(0, |sum, i| sum + i);
     ///
-    /// println!("{}", sum);
+    /// println!("{sum}");
     ///
     /// // let's add some inspect() calls to investigate what's happening
     /// let sum = a.iter()
     ///     .cloned()
-    ///     .inspect(|x| println!("about to filter: {}", x))
+    ///     .inspect(|x| println!("about to filter: {x}"))
     ///     .filter(|x| x % 2 == 0)
-    ///     .inspect(|x| println!("made it through filter: {}", x))
+    ///     .inspect(|x| println!("made it through filter: {x}"))
     ///     .fold(0, |sum, i| sum + i);
     ///
-    /// println!("{}", sum);
+    /// println!("{sum}");
     /// ```
     ///
     /// This will print:
@@ -1606,13 +1664,13 @@ pub trait Iterator {
     ///     .map(|line| line.parse::<i32>())
     ///     .inspect(|num| {
     ///         if let Err(ref e) = *num {
-    ///             println!("Parsing error: {}", e);
+    ///             println!("Parsing error: {e}");
     ///         }
     ///     })
     ///     .filter_map(Result::ok)
     ///     .sum();
     ///
-    /// println!("Sum: {}", sum);
+    /// println!("Sum: {sum}");
     /// ```
     ///
     /// This will print:
@@ -1856,7 +1914,78 @@ pub trait Iterator {
         <<Self as Iterator>::Item as Try>::Residual: Residual<B>,
         B: FromIterator<<Self::Item as Try>::Output>,
     {
-        try_process(self, |i| i.collect())
+        try_process(ByRefSized(self), |i| i.collect())
+    }
+
+    /// Collects all the items from an iterator into a collection.
+    ///
+    /// This method consumes the iterator and adds all its items to the
+    /// passed collection. The collection is then returned, so the call chain
+    /// can be continued.
+    ///
+    /// This is useful when you already have a collection and wants to add
+    /// the iterator items to it.
+    ///
+    /// This method is a convenience method to call [Extend::extend](trait.Extend.html),
+    /// but instead of being called on a collection, it's called on an iterator.
+    ///
+    /// # Examples
+    ///
+    /// Basic usage:
+    ///
+    /// ```
+    /// #![feature(iter_collect_into)]
+    ///
+    /// let a = [1, 2, 3];
+    /// let mut vec: Vec::<i32> = vec![0, 1];
+    ///
+    /// a.iter().map(|&x| x * 2).collect_into(&mut vec);
+    /// a.iter().map(|&x| x * 10).collect_into(&mut vec);
+    ///
+    /// assert_eq!(vec![0, 1, 2, 4, 6, 10, 20, 30], vec);
+    /// ```
+    ///
+    /// `Vec` can have a manual set capacity to avoid reallocating it:
+    ///
+    /// ```
+    /// #![feature(iter_collect_into)]
+    ///
+    /// let a = [1, 2, 3];
+    /// let mut vec: Vec::<i32> = Vec::with_capacity(6);
+    ///
+    /// a.iter().map(|&x| x * 2).collect_into(&mut vec);
+    /// a.iter().map(|&x| x * 10).collect_into(&mut vec);
+    ///
+    /// assert_eq!(6, vec.capacity());
+    /// println!("{:?}", vec);
+    /// ```
+    ///
+    /// The returned mutable reference can be used to continue the call chain:
+    ///
+    /// ```
+    /// #![feature(iter_collect_into)]
+    ///
+    /// let a = [1, 2, 3];
+    /// let mut vec: Vec::<i32> = Vec::with_capacity(6);
+    ///
+    /// let count = a.iter().collect_into(&mut vec).iter().count();
+    ///
+    /// assert_eq!(count, vec.len());
+    /// println!("Vec len is {}", count);
+    ///
+    /// let count = a.iter().collect_into(&mut vec).iter().count();
+    ///
+    /// assert_eq!(count, vec.len());
+    /// println!("Vec len now is {}", count);
+    /// ```
+    #[inline]
+    #[unstable(feature = "iter_collect_into", reason = "new API", issue = "94780")]
+    fn collect_into<E: Extend<Self::Item>>(self, collection: &mut E) -> &mut E
+    where
+        Self: Sized,
+    {
+        collection.extend(self);
+        collection
     }
 
     /// Consumes an iterator, creating two collections from it.
@@ -1877,9 +2006,9 @@ pub trait Iterator {
     /// ```
     /// let a = [1, 2, 3];
     ///
-    /// let (even, odd): (Vec<i32>, Vec<i32>) = a
-    ///     .iter()
-    ///     .partition(|&n| n % 2 == 0);
+    /// let (even, odd): (Vec<_>, Vec<_>) = a
+    ///     .into_iter()
+    ///     .partition(|n| n % 2 == 0);
     ///
     /// assert_eq!(even, vec![2]);
     /// assert_eq!(odd, vec![1, 3]);
@@ -2129,7 +2258,7 @@ pub trait Iterator {
     ///
     /// let data = ["no_tea.txt", "stale_bread.json", "torrential_rain.png"];
     ///
-    /// let res = data.iter().try_for_each(|x| writeln!(stdout(), "{}", x));
+    /// let res = data.iter().try_for_each(|x| writeln!(stdout(), "{x}"));
     /// assert!(res.is_ok());
     ///
     /// let mut it = data.iter().cloned();
@@ -2243,7 +2372,7 @@ pub trait Iterator {
     /// let zero = "0".to_string();
     ///
     /// let result = numbers.iter().fold(zero, |acc, &x| {
-    ///     format!("({} + {})", acc, x)
+    ///     format!("({acc} + {x})")
     /// });
     ///
     /// assert_eq!(result, "(((((0 + 1) + 2) + 3) + 4) + 5)");
@@ -3112,6 +3241,10 @@ pub trait Iterator {
     /// This is useful when you have an iterator over `&T`, but you need an
     /// iterator over `T`.
     ///
+    /// There is no guarantee whatsoever about the `clone` method actually
+    /// being called *or* optimized away. So code should not depend on
+    /// either.
+    ///
     /// [`clone`]: Clone::clone
     ///
     /// # Examples
@@ -3128,6 +3261,18 @@ pub trait Iterator {
     ///
     /// assert_eq!(v_cloned, vec![1, 2, 3]);
     /// assert_eq!(v_map, vec![1, 2, 3]);
+    /// ```
+    ///
+    /// To get the best performance, try to clone late:
+    ///
+    /// ```
+    /// let a = [vec![0_u8, 1, 2], vec![3, 4], vec![23]];
+    /// // don't do this:
+    /// let slower: Vec<_> = a.iter().cloned().filter(|s| s.len() == 1).collect();
+    /// assert_eq!(&[vec![23]], &slower[..]);
+    /// // instead call `cloned` late
+    /// let faster: Vec<_> = a.iter().filter(|s| s.len() == 1).cloned().collect();
+    /// assert_eq!(&[vec![23]], &faster[..]);
     /// ```
     #[stable(feature = "rust1", since = "1.0.0")]
     fn cloned<'a, T: 'a>(self) -> Cloned<Self>
@@ -3169,6 +3314,49 @@ pub trait Iterator {
         Self: Sized + Clone,
     {
         Cycle::new(self)
+    }
+
+    /// Returns an iterator over `N` elements of the iterator at a time.
+    ///
+    /// The chunks do not overlap. If `N` does not divide the length of the
+    /// iterator, then the last up to `N-1` elements will be omitted and can be
+    /// retrieved from the [`.into_remainder()`][ArrayChunks::into_remainder]
+    /// function of the iterator.
+    ///
+    /// # Panics
+    ///
+    /// Panics if `N` is 0.
+    ///
+    /// # Examples
+    ///
+    /// Basic usage:
+    ///
+    /// ```
+    /// #![feature(iter_array_chunks)]
+    ///
+    /// let mut iter = "lorem".chars().array_chunks();
+    /// assert_eq!(iter.next(), Some(['l', 'o']));
+    /// assert_eq!(iter.next(), Some(['r', 'e']));
+    /// assert_eq!(iter.next(), None);
+    /// assert_eq!(iter.into_remainder().unwrap().as_slice(), &['m']);
+    /// ```
+    ///
+    /// ```
+    /// #![feature(iter_array_chunks)]
+    ///
+    /// let data = [1, 1, 2, -2, 6, 0, 3, 1];
+    /// //          ^-----^  ^------^
+    /// for [x, y, z] in data.iter().array_chunks() {
+    ///     assert_eq!(x + y + z, 4);
+    /// }
+    /// ```
+    #[track_caller]
+    #[unstable(feature = "iter_array_chunks", reason = "recently added", issue = "100450")]
+    fn array_chunks<const N: usize>(self) -> ArrayChunks<Self, N>
+    where
+        Self: Sized,
+    {
+        ArrayChunks::new(self)
     }
 
     /// Sums the elements of an iterator.

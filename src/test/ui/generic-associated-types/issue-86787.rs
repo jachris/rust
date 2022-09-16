@@ -1,4 +1,3 @@
-#![feature(generic_associated_types)]
 // check-fail
 
 enum Either<L, R> {
@@ -21,13 +20,10 @@ where
     Right: HasChildrenOf,
 {
     type T = Either<Left::T, Right::T>;
-    // We used to error below because the where clause doesn't match the trait.
-    // Now, we error early on the trait itself.
-    type TRef<'a>
+    type TRef<'a> = Either<&'a Left::T, &'a Right::T>
     where
-    <Left as HasChildrenOf>::T: 'a,
-    <Right as HasChildrenOf>::T: 'a
-    = Either<&'a Left::T, &'a Right::T>;
+        <Left as HasChildrenOf>::T: 'a,
+        <Right as HasChildrenOf>::T: 'a;
 
     fn ref_children<'a>(&'a self) -> Vec<Self::TRef<'a>> {
         todo!()

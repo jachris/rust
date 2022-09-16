@@ -1,4 +1,5 @@
 use clippy_utils::diagnostics::{span_lint_and_help, span_lint_and_note};
+use clippy_utils::is_span_if;
 use clippy_utils::source::snippet_opt;
 use if_chain::if_chain;
 use rustc_ast::ast::{BinOpKind, Block, Expr, ExprKind, StmtKind, UnOp};
@@ -36,12 +37,18 @@ declare_clippy_lint! {
     /// This is either a typo in the binary operator or confusing.
     ///
     /// ### Example
-    /// ```rust,ignore
-    /// if foo <- 30 { // this should be `foo < -30` but looks like a different operator
-    /// }
+    /// ```rust
+    /// # let foo = true;
+    /// # let bar = false;
+    /// // &&! looks like a different operator
+    /// if foo &&! bar {}
+    /// ```
     ///
-    /// if foo &&! bar { // this should be `foo && !bar` but looks like a different operator
-    /// }
+    /// Use instead:
+    /// ```rust
+    /// # let foo = true;
+    /// # let bar = false;
+    /// if foo && !bar {}
     /// ```
     #[clippy::version = "1.40.0"]
     pub SUSPICIOUS_UNARY_OP_FORMATTING,
@@ -291,12 +298,11 @@ fn check_array(cx: &EarlyContext<'_>, expr: &Expr) {
 fn check_missing_else(cx: &EarlyContext<'_>, first: &Expr, second: &Expr) {
     if_chain! {
         if !first.span.from_expansion() && !second.span.from_expansion();
-        if let ExprKind::If(cond_expr, ..) = &first.kind;
+        if matches!(first.kind, ExprKind::If(..));
         if is_block(second) || is_if(second);
 
         // Proc-macros can give weird spans. Make sure this is actually an `if`.
-        if let Some(if_snip) = snippet_opt(cx, first.span.until(cond_expr.span));
-        if if_snip.starts_with("if");
+        if is_span_if(cx, first.span);
 
         // If there is a line break between the two expressions, don't lint.
         // If there is a non-whitespace character, this span came from a proc-macro.

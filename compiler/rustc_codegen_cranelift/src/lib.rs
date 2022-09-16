@@ -1,9 +1,10 @@
-#![feature(rustc_private, decl_macro)]
-#![cfg_attr(feature = "jit", feature(never_type, vec_into_raw_parts, once_cell))]
+#![feature(rustc_private)]
+// Note: please avoid adding other feature gates where possible
 #![warn(rust_2018_idioms)]
 #![warn(unused_lifetimes)]
 #![warn(unreachable_pub)]
 
+extern crate jobserver;
 #[macro_use]
 extern crate rustc_middle;
 extern crate rustc_ast;
@@ -25,11 +26,13 @@ extern crate rustc_target;
 extern crate rustc_driver;
 
 use std::any::Any;
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
+use std::sync::Arc;
 
 use rustc_codegen_ssa::traits::CodegenBackend;
 use rustc_codegen_ssa::CodegenResults;
-use rustc_errors::ErrorReported;
+use rustc_data_structures::profiling::SelfProfilerRef;
+use rustc_errors::ErrorGuaranteed;
 use rustc_metadata::EncodedMetadata;
 use rustc_middle::dep_graph::{WorkProduct, WorkProductId};
 use rustc_session::config::OutputFilenames;
@@ -51,11 +54,13 @@ mod cast;
 mod codegen_i128;
 mod common;
 mod compiler_builtins;
+mod concurrency_limiter;
 mod config;
 mod constant;
 mod debuginfo;
 mod discriminant;
 mod driver;
+mod global_asm;
 mod inline_asm;
 mod intrinsics;
 mod linkage;
@@ -79,7 +84,7 @@ mod prelude {
     pub(crate) use rustc_middle::ty::layout::{self, LayoutOf, TyAndLayout};
     pub(crate) use rustc_middle::ty::{
         self, FloatTy, Instance, InstanceDef, IntTy, ParamEnv, Ty, TyCtxt, TypeAndMut,
-        TypeFoldable, UintTy,
+        TypeFoldable, TypeVisitable, UintTy,
     };
     pub(crate) use rustc_target::abi::{Abi, Scalar, Size, VariantIdx};
 
@@ -105,7 +110,6 @@ mod prelude {
     pub(crate) use crate::common::*;
     pub(crate) use crate::debuginfo::{DebugContext, UnwindContext};
     pub(crate) use crate::pointer::Pointer;
-    pub(crate) use crate::trap::*;
     pub(crate) use crate::value_and_place::{CPlace, CPlaceInner, CValue};
 }
 
@@ -120,19 +124,20 @@ impl<F: Fn() -> String> Drop for PrintOnPanic<F> {
 
 /// The codegen context holds any information shared between the codegen of individual functions
 /// inside a single codegen unit with the exception of the Cranelift [`Module`](cranelift_module::Module).
-struct CodegenCx<'tcx> {
-    tcx: TyCtxt<'tcx>,
+struct CodegenCx {
+    profiler: SelfProfilerRef,
+    output_filenames: Arc<OutputFilenames>,
+    should_write_ir: bool,
     global_asm: String,
     inline_asm_index: Cell<usize>,
-    cached_context: Context,
-    debug_context: Option<DebugContext<'tcx>>,
+    debug_context: Option<DebugContext>,
     unwind_context: UnwindContext,
     cgu_name: Symbol,
 }
 
-impl<'tcx> CodegenCx<'tcx> {
+impl CodegenCx {
     fn new(
-        tcx: TyCtxt<'tcx>,
+        tcx: TyCtxt<'_>,
         backend_config: BackendConfig,
         isa: &dyn TargetIsa,
         debug_info: bool,
@@ -142,12 +147,17 @@ impl<'tcx> CodegenCx<'tcx> {
 
         let unwind_context =
             UnwindContext::new(isa, matches!(backend_config.codegen_mode, CodegenMode::Aot));
-        let debug_context = if debug_info { Some(DebugContext::new(tcx, isa)) } else { None };
+        let debug_context = if debug_info && !tcx.sess.target.options.is_like_windows {
+            Some(DebugContext::new(tcx, isa))
+        } else {
+            None
+        };
         CodegenCx {
-            tcx,
+            profiler: tcx.prof.clone(),
+            output_filenames: tcx.output_filenames(()).clone(),
+            should_write_ir: crate::pretty_clif::should_write_ir(tcx),
             global_asm: String::new(),
             inline_asm_index: Cell::new(0),
-            cached_context: Context::new(),
             debug_context,
             unwind_context,
             cgu_name,
@@ -156,7 +166,7 @@ impl<'tcx> CodegenCx<'tcx> {
 }
 
 pub struct CraneliftCodegenBackend {
-    pub config: Option<BackendConfig>,
+    pub config: RefCell<Option<BackendConfig>>,
 }
 
 impl CodegenBackend for CraneliftCodegenBackend {
@@ -166,9 +176,16 @@ impl CodegenBackend for CraneliftCodegenBackend {
             Lto::No | Lto::ThinLocal => {}
             Lto::Thin | Lto::Fat => sess.warn("LTO is not supported. You may get a linker error."),
         }
+
+        let mut config = self.config.borrow_mut();
+        if config.is_none() {
+            let new_config = BackendConfig::from_opts(&sess.opts.cg.llvm_args)
+                .unwrap_or_else(|err| sess.fatal(&err));
+            *config = Some(new_config);
+        }
     }
 
-    fn target_features(&self, _sess: &Session) -> Vec<rustc_span::Symbol> {
+    fn target_features(&self, _sess: &Session, _allow_unstable: bool) -> Vec<rustc_span::Symbol> {
         vec![]
     }
 
@@ -183,20 +200,12 @@ impl CodegenBackend for CraneliftCodegenBackend {
         need_metadata_module: bool,
     ) -> Box<dyn Any> {
         tcx.sess.abort_if_errors();
-        let config = if let Some(config) = self.config.clone() {
-            config
-        } else {
-            if !tcx.sess.unstable_options() && !tcx.sess.opts.cg.llvm_args.is_empty() {
-                tcx.sess.fatal("`-Z unstable-options` must be passed to allow configuring cg_clif");
-            }
-            BackendConfig::from_opts(&tcx.sess.opts.cg.llvm_args)
-                .unwrap_or_else(|err| tcx.sess.fatal(&err))
-        };
+        let config = self.config.borrow().clone().unwrap();
         match config.codegen_mode {
             CodegenMode::Aot => driver::aot::run_aot(tcx, config, metadata, need_metadata_module),
             CodegenMode::Jit | CodegenMode::JitLazy => {
                 #[cfg(feature = "jit")]
-                let _: ! = driver::jit::run_jit(tcx, config);
+                driver::jit::run_jit(tcx, config);
 
                 #[cfg(not(feature = "jit"))]
                 tcx.sess.fatal("jit support was disabled when compiling rustc_codegen_cranelift");
@@ -207,12 +216,13 @@ impl CodegenBackend for CraneliftCodegenBackend {
     fn join_codegen(
         &self,
         ongoing_codegen: Box<dyn Any>,
-        _sess: &Session,
+        sess: &Session,
         _outputs: &OutputFilenames,
-    ) -> Result<(CodegenResults, FxHashMap<WorkProductId, WorkProduct>), ErrorReported> {
-        Ok(*ongoing_codegen
-            .downcast::<(CodegenResults, FxHashMap<WorkProductId, WorkProduct>)>()
-            .unwrap())
+    ) -> Result<(CodegenResults, FxHashMap<WorkProductId, WorkProduct>), ErrorGuaranteed> {
+        Ok(ongoing_codegen
+            .downcast::<driver::aot::OngoingCodegen>()
+            .unwrap()
+            .join(sess, self.config.borrow().as_ref().unwrap()))
     }
 
     fn link(
@@ -220,10 +230,10 @@ impl CodegenBackend for CraneliftCodegenBackend {
         sess: &Session,
         codegen_results: CodegenResults,
         outputs: &OutputFilenames,
-    ) -> Result<(), ErrorReported> {
+    ) -> Result<(), ErrorGuaranteed> {
         use rustc_codegen_ssa::back::link::link_binary;
 
-        link_binary::<crate::archive::ArArchiveBuilder<'_>>(sess, &codegen_results, outputs)
+        link_binary(sess, &crate::archive::ArArchiveBuilderBuilder, &codegen_results, outputs)
     }
 }
 
@@ -244,6 +254,7 @@ fn build_isa(sess: &Session, backend_config: &BackendConfig) -> Box<dyn isa::Tar
     flags_builder.set("enable_probestack", "false").unwrap(); // __cranelift_probestack is not provided
     let enable_verifier = if backend_config.enable_verifier { "true" } else { "false" };
     flags_builder.set("enable_verifier", enable_verifier).unwrap();
+    flags_builder.set("regalloc_checker", enable_verifier).unwrap();
 
     let tls_model = match target_triple.binary_format {
         BinaryFormat::Elf => "elf_gd",
@@ -256,8 +267,6 @@ fn build_isa(sess: &Session, backend_config: &BackendConfig) -> Box<dyn isa::Tar
     flags_builder.set("enable_simd", "true").unwrap();
 
     flags_builder.set("enable_llvm_abi_extensions", "true").unwrap();
-
-    flags_builder.set("regalloc", &backend_config.regalloc).unwrap();
 
     use rustc_session::config::OptLevel;
     match sess.opts.optimize {
@@ -301,11 +310,14 @@ fn build_isa(sess: &Session, backend_config: &BackendConfig) -> Box<dyn isa::Tar
         }
     };
 
-    isa_builder.finish(flags)
+    match isa_builder.finish(flags) {
+        Ok(target_isa) => target_isa,
+        Err(err) => sess.fatal(&format!("failed to build TargetIsa: {}", err)),
+    }
 }
 
 /// This is the entrypoint for a hot plugged rustc_codegen_cranelift
 #[no_mangle]
 pub fn __rustc_codegen_backend() -> Box<dyn CodegenBackend> {
-    Box::new(CraneliftCodegenBackend { config: None })
+    Box::new(CraneliftCodegenBackend { config: RefCell::new(None) })
 }

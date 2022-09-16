@@ -43,7 +43,7 @@ jobs:
           - name: mingw-check
             os: ubuntu-20.04-xl
             env: {}
-          - name: x86_64-gnu-llvm-12
+          - name: x86_64-gnu-llvm-13
             os: ubuntu-20.04-xl
             env: {}
           - name: x86_64-gnu-tools
@@ -56,7 +56,7 @@ jobs:
       - name: disable git crlf conversion
         run: git config --global core.autocrlf false
       - name: checkout the source code
-        uses: actions/checkout@v2
+        uses: actions/checkout@v3
         with:
           fetch-depth: 2
       - name: configure the PR in which the error message will be posted
@@ -79,7 +79,7 @@ jobs:
         uses: rust-lang/simpleinfra/github-actions/cancel-outdated-builds@master
         with:
           github_token: "${{ secrets.github_token }}"
-        if: "success() && !env.SKIP_JOB && github.ref != 'refs/heads/try'"
+        if: "success() && !env.SKIP_JOB && github.ref != 'refs/heads/try' && github.ref != 'refs/heads/try-perf'"
       - name: collect CPU statistics
         run: src/ci/scripts/collect-cpu-stats.sh
         if: success() && !env.SKIP_JOB
@@ -98,11 +98,11 @@ jobs:
       - name: install WIX
         run: src/ci/scripts/install-wix.sh
         if: success() && !env.SKIP_JOB
-      - name: ensure the build happens on a partition with enough space
-        run: src/ci/scripts/symlink-build-dir.sh
-        if: success() && !env.SKIP_JOB
       - name: disable git crlf conversion
         run: src/ci/scripts/disable-git-crlf-conversion.sh
+        if: success() && !env.SKIP_JOB
+      - name: checkout submodules
+        run: src/ci/scripts/checkout-submodules.sh
         if: success() && !env.SKIP_JOB
       - name: install MSYS2
         run: src/ci/scripts/install-msys2.sh
@@ -118,9 +118,6 @@ jobs:
         if: success() && !env.SKIP_JOB
       - name: disable git crlf conversion
         run: src/ci/scripts/disable-git-crlf-conversion.sh
-        if: success() && !env.SKIP_JOB
-      - name: checkout submodules
-        run: src/ci/scripts/checkout-submodules.sh
         if: success() && !env.SKIP_JOB
       - name: ensure line endings are correct
         run: src/ci/scripts/verify-line-endings.sh
@@ -277,7 +274,11 @@ jobs:
           - name: x86_64-gnu-distcheck
             os: ubuntu-20.04-xl
             env: {}
-          - name: x86_64-gnu-llvm-12
+          - name: x86_64-gnu-llvm-13
+            env:
+              RUST_BACKTRACE: 1
+            os: ubuntu-20.04-xl
+          - name: x86_64-gnu-llvm-13-stage1
             env:
               RUST_BACKTRACE: 1
             os: ubuntu-20.04-xl
@@ -388,32 +389,36 @@ jobs:
             os: windows-latest-xl
           - name: i686-mingw-1
             env:
-              RUST_CONFIGURE_ARGS: "--build=i686-pc-windows-gnu"
+              RUST_CONFIGURE_ARGS: "--build=i686-pc-windows-gnu --set llvm.allow-old-toolchain"
               SCRIPT: make ci-mingw-subset-1
+              NO_DOWNLOAD_CI_LLVM: 1
               CUSTOM_MINGW: 1
             os: windows-latest-xl
           - name: i686-mingw-2
             env:
-              RUST_CONFIGURE_ARGS: "--build=i686-pc-windows-gnu"
+              RUST_CONFIGURE_ARGS: "--build=i686-pc-windows-gnu --set llvm.allow-old-toolchain"
               SCRIPT: make ci-mingw-subset-2
+              NO_DOWNLOAD_CI_LLVM: 1
               CUSTOM_MINGW: 1
             os: windows-latest-xl
           - name: x86_64-mingw-1
             env:
               SCRIPT: make ci-mingw-subset-1
-              RUST_CONFIGURE_ARGS: "--build=x86_64-pc-windows-gnu --enable-profiler"
+              RUST_CONFIGURE_ARGS: "--build=x86_64-pc-windows-gnu --enable-profiler --set llvm.allow-old-toolchain"
+              NO_DOWNLOAD_CI_LLVM: 1
               CUSTOM_MINGW: 1
             os: windows-latest-xl
           - name: x86_64-mingw-2
             env:
               SCRIPT: make ci-mingw-subset-2
-              RUST_CONFIGURE_ARGS: "--build=x86_64-pc-windows-gnu --enable-profiler"
+              RUST_CONFIGURE_ARGS: "--build=x86_64-pc-windows-gnu --enable-profiler --set llvm.allow-old-toolchain"
+              NO_DOWNLOAD_CI_LLVM: 1
               CUSTOM_MINGW: 1
             os: windows-latest-xl
           - name: dist-x86_64-msvc
             env:
               RUST_CONFIGURE_ARGS: "--build=x86_64-pc-windows-msvc --host=x86_64-pc-windows-msvc --target=x86_64-pc-windows-msvc --enable-full-tools --enable-profiler"
-              SCRIPT: python x.py dist
+              SCRIPT: PGO_HOST=x86_64-pc-windows-msvc src/ci/pgo.sh python x.py dist
               DIST_REQUIRE_ALL_TOOLS: 1
             os: windows-latest-xl
           - name: dist-i686-msvc
@@ -426,12 +431,13 @@ jobs:
             env:
               RUST_CONFIGURE_ARGS: "--build=x86_64-pc-windows-msvc --host=aarch64-pc-windows-msvc --enable-full-tools --enable-profiler"
               SCRIPT: python x.py dist
-              DIST_REQUIRE_ALL_TOOLS: 0
+              DIST_REQUIRE_ALL_TOOLS: 1
               WINDOWS_SDK_20348_HACK: 1
             os: windows-latest-xl
           - name: dist-i686-mingw
             env:
-              RUST_CONFIGURE_ARGS: "--build=i686-pc-windows-gnu --enable-full-tools --enable-profiler"
+              RUST_CONFIGURE_ARGS: "--build=i686-pc-windows-gnu --enable-full-tools --enable-profiler --set llvm.allow-old-toolchain"
+              NO_DOWNLOAD_CI_LLVM: 1
               SCRIPT: python x.py dist
               CUSTOM_MINGW: 1
               DIST_REQUIRE_ALL_TOOLS: 1
@@ -439,7 +445,8 @@ jobs:
           - name: dist-x86_64-mingw
             env:
               SCRIPT: python x.py dist
-              RUST_CONFIGURE_ARGS: "--build=x86_64-pc-windows-gnu --enable-full-tools --enable-profiler"
+              RUST_CONFIGURE_ARGS: "--build=x86_64-pc-windows-gnu --enable-full-tools --enable-profiler --set llvm.allow-old-toolchain"
+              NO_DOWNLOAD_CI_LLVM: 1
               CUSTOM_MINGW: 1
               DIST_REQUIRE_ALL_TOOLS: 1
             os: windows-latest-xl
@@ -454,7 +461,7 @@ jobs:
       - name: disable git crlf conversion
         run: git config --global core.autocrlf false
       - name: checkout the source code
-        uses: actions/checkout@v2
+        uses: actions/checkout@v3
         with:
           fetch-depth: 2
       - name: configure the PR in which the error message will be posted
@@ -477,7 +484,7 @@ jobs:
         uses: rust-lang/simpleinfra/github-actions/cancel-outdated-builds@master
         with:
           github_token: "${{ secrets.github_token }}"
-        if: "success() && !env.SKIP_JOB && github.ref != 'refs/heads/try'"
+        if: "success() && !env.SKIP_JOB && github.ref != 'refs/heads/try' && github.ref != 'refs/heads/try-perf'"
       - name: collect CPU statistics
         run: src/ci/scripts/collect-cpu-stats.sh
         if: success() && !env.SKIP_JOB
@@ -496,11 +503,11 @@ jobs:
       - name: install WIX
         run: src/ci/scripts/install-wix.sh
         if: success() && !env.SKIP_JOB
-      - name: ensure the build happens on a partition with enough space
-        run: src/ci/scripts/symlink-build-dir.sh
-        if: success() && !env.SKIP_JOB
       - name: disable git crlf conversion
         run: src/ci/scripts/disable-git-crlf-conversion.sh
+        if: success() && !env.SKIP_JOB
+      - name: checkout submodules
+        run: src/ci/scripts/checkout-submodules.sh
         if: success() && !env.SKIP_JOB
       - name: install MSYS2
         run: src/ci/scripts/install-msys2.sh
@@ -516,9 +523,6 @@ jobs:
         if: success() && !env.SKIP_JOB
       - name: disable git crlf conversion
         run: src/ci/scripts/disable-git-crlf-conversion.sh
-        if: success() && !env.SKIP_JOB
-      - name: checkout submodules
-        run: src/ci/scripts/checkout-submodules.sh
         if: success() && !env.SKIP_JOB
       - name: ensure line endings are correct
         run: src/ci/scripts/verify-line-endings.sh
@@ -567,7 +571,7 @@ jobs:
       - name: disable git crlf conversion
         run: git config --global core.autocrlf false
       - name: checkout the source code
-        uses: actions/checkout@v2
+        uses: actions/checkout@v3
         with:
           fetch-depth: 2
       - name: configure the PR in which the error message will be posted
@@ -590,7 +594,7 @@ jobs:
         uses: rust-lang/simpleinfra/github-actions/cancel-outdated-builds@master
         with:
           github_token: "${{ secrets.github_token }}"
-        if: "success() && !env.SKIP_JOB && github.ref != 'refs/heads/try'"
+        if: "success() && !env.SKIP_JOB && github.ref != 'refs/heads/try' && github.ref != 'refs/heads/try-perf'"
       - name: collect CPU statistics
         run: src/ci/scripts/collect-cpu-stats.sh
         if: success() && !env.SKIP_JOB
@@ -609,11 +613,11 @@ jobs:
       - name: install WIX
         run: src/ci/scripts/install-wix.sh
         if: success() && !env.SKIP_JOB
-      - name: ensure the build happens on a partition with enough space
-        run: src/ci/scripts/symlink-build-dir.sh
-        if: success() && !env.SKIP_JOB
       - name: disable git crlf conversion
         run: src/ci/scripts/disable-git-crlf-conversion.sh
+        if: success() && !env.SKIP_JOB
+      - name: checkout submodules
+        run: src/ci/scripts/checkout-submodules.sh
         if: success() && !env.SKIP_JOB
       - name: install MSYS2
         run: src/ci/scripts/install-msys2.sh
@@ -629,9 +633,6 @@ jobs:
         if: success() && !env.SKIP_JOB
       - name: disable git crlf conversion
         run: src/ci/scripts/disable-git-crlf-conversion.sh
-        if: success() && !env.SKIP_JOB
-      - name: checkout submodules
-        run: src/ci/scripts/checkout-submodules.sh
         if: success() && !env.SKIP_JOB
       - name: ensure line endings are correct
         run: src/ci/scripts/verify-line-endings.sh
@@ -670,7 +671,7 @@ jobs:
     if: "github.event_name == 'push' && github.ref == 'refs/heads/master' && github.repository == 'rust-lang-ci/rust'"
     steps:
       - name: checkout the source code
-        uses: actions/checkout@v2
+        uses: actions/checkout@v3
         with:
           fetch-depth: 2
       - name: publish toolstate

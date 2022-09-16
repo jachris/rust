@@ -1,6 +1,6 @@
 use crate::clean::*;
 
-crate trait DocVisitor: Sized {
+pub(crate) trait DocVisitor: Sized {
     fn visit_item(&mut self, item: &Item) {
         self.visit_item_recur(item)
     }
@@ -11,7 +11,6 @@ crate trait DocVisitor: Sized {
             StrippedItem(..) => unreachable!(),
             ModuleItem(i) => {
                 self.visit_mod(i);
-                return;
             }
             StructItem(i) => i.fields.iter().for_each(|x| self.visit_item(x)),
             UnionItem(i) => i.fields.iter().for_each(|x| self.visit_item(x)),
@@ -21,12 +20,12 @@ crate trait DocVisitor: Sized {
             VariantItem(i) => match i {
                 Variant::Struct(j) => j.fields.iter().for_each(|x| self.visit_item(x)),
                 Variant::Tuple(fields) => fields.iter().for_each(|x| self.visit_item(x)),
-                Variant::CLike => {}
+                Variant::CLike(_) => {}
             },
             ExternCrateItem { src: _ }
             | ImportItem(_)
             | FunctionItem(_)
-            | TypedefItem(_, _)
+            | TypedefItem(_)
             | OpaqueTyItem(_)
             | StaticItem(_)
             | ConstantItem(_)
@@ -40,9 +39,11 @@ crate trait DocVisitor: Sized {
             | MacroItem(_)
             | ProcMacroItem(_)
             | PrimitiveItem(_)
-            | AssocConstItem(_, _)
-            | AssocTypeItem(_, _)
-            | KeywordItem(_) => {}
+            | TyAssocConstItem(..)
+            | AssocConstItem(..)
+            | TyAssocTypeItem(..)
+            | AssocTypeItem(..)
+            | KeywordItem => {}
         }
     }
 

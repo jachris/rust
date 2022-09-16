@@ -1,5 +1,6 @@
 use super::Error;
 use crate::fmt;
+use core::any::Demand;
 
 #[derive(Debug, PartialEq)]
 struct A;
@@ -130,7 +131,7 @@ Stack backtrace:
     error.backtrace = Some(trace);
     let report = Report::new(error).pretty(true).show_backtrace(true);
 
-    println!("Error: {}", report);
+    println!("Error: {report}");
     assert_eq!(expected.trim_end(), report.to_string());
 }
 
@@ -155,7 +156,7 @@ Stack backtrace:
     let error = GenericError::new_with_source("Error with two sources", error);
     let report = Report::new(error).pretty(true).show_backtrace(true);
 
-    println!("Error: {}", report);
+    println!("Error: {report}");
     assert_eq!(expected.trim_end(), report.to_string());
 }
 
@@ -198,8 +199,8 @@ where
         self.source.as_deref()
     }
 
-    fn backtrace(&self) -> Option<&Backtrace> {
-        self.backtrace.as_ref()
+    fn provide<'a>(&'a self, req: &mut Demand<'a>) {
+        self.backtrace.as_ref().map(|bt| req.provide_ref::<Backtrace>(bt));
     }
 }
 
@@ -355,7 +356,7 @@ Caused by:
    1: The message goes on and on.";
 
     let actual = report.to_string();
-    println!("{}", actual);
+    println!("{actual}");
     assert_eq!(expected, actual);
 }
 

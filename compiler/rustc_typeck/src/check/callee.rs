@@ -1,11 +1,11 @@
 use super::method::MethodCallee;
-use super::{Expectation, FnCtxt, TupleArgumentsFlag};
+use super::{DefIdOrName, Expectation, FnCtxt, TupleArgumentsFlag};
 use crate::type_error_struct;
 
-use rustc_errors::{struct_span_err, Applicability, DiagnosticBuilder};
+use rustc_errors::{struct_span_err, Applicability, Diagnostic};
 use rustc_hir as hir;
-use rustc_hir::def::{Namespace, Res};
-use rustc_hir::def_id::{DefId, LOCAL_CRATE};
+use rustc_hir::def::{self, Namespace, Res};
+use rustc_hir::def_id::DefId;
 use rustc_infer::{
     infer,
     traits::{self, Obligation},
@@ -18,12 +18,15 @@ use rustc_middle::ty::adjustment::{
     Adjust, Adjustment, AllowTwoPhase, AutoBorrow, AutoBorrowMutability,
 };
 use rustc_middle::ty::subst::{Subst, SubstsRef};
-use rustc_middle::ty::{self, Ty, TyCtxt, TypeFoldable};
+use rustc_middle::ty::{self, Ty, TyCtxt, TypeVisitable};
+use rustc_span::def_id::LocalDefId;
 use rustc_span::symbol::{sym, Ident};
 use rustc_span::Span;
 use rustc_target::spec::abi;
 use rustc_trait_selection::autoderef::Autoderef;
-use rustc_trait_selection::traits::query::evaluate_obligation::InferCtxtExt;
+use rustc_trait_selection::infer::InferCtxtExt as _;
+use rustc_trait_selection::traits::query::evaluate_obligation::InferCtxtExt as _;
+
 use std::iter;
 
 /// Checks that it is legal to call methods of the trait corresponding
@@ -43,7 +46,7 @@ pub fn check_legal_trait_for_method_call(
         let (sp, suggestion) = receiver
             .and_then(|s| tcx.sess.source_map().span_to_snippet(s).ok())
             .filter(|snippet| !snippet.is_empty())
-            .map(|snippet| (expr_span, format!("drop({})", snippet)))
+            .map(|snippet| (expr_span, format!("drop({snippet})")))
             .unwrap_or_else(|| (span, "drop".to_string()));
 
         err.span_suggestion(
@@ -59,7 +62,7 @@ pub fn check_legal_trait_for_method_call(
 
 enum CallStep<'tcx> {
     Builtin(Ty<'tcx>),
-    DeferredClosure(ty::FnSig<'tcx>),
+    DeferredClosure(LocalDefId, ty::FnSig<'tcx>),
     /// E.g., enum variant constructors.
     Overloaded(MethodCallee<'tcx>),
 }
@@ -107,8 +110,8 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 self.confirm_builtin_call(call_expr, callee_expr, callee_ty, arg_exprs, expected)
             }
 
-            Some(CallStep::DeferredClosure(fn_sig)) => {
-                self.confirm_deferred_closure_call(call_expr, arg_exprs, expected, fn_sig)
+            Some(CallStep::DeferredClosure(def_id, fn_sig)) => {
+                self.confirm_deferred_closure_call(call_expr, arg_exprs, expected, def_id, fn_sig)
             }
 
             Some(CallStep::Overloaded(method_callee)) => {
@@ -117,7 +120,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         };
 
         // we must check that return type of called functions is WF:
-        self.register_wf_obligation(output.into(), call_expr.span, traits::MiscObligation);
+        self.register_wf_obligation(output.into(), call_expr.span, traits::WellFormed(None));
 
         output
     }
@@ -145,20 +148,18 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             }
 
             ty::Closure(def_id, substs) => {
-                assert_eq!(def_id.krate, LOCAL_CRATE);
+                let def_id = def_id.expect_local();
 
                 // Check whether this is a call to a closure where we
                 // haven't yet decided on whether the closure is fn vs
                 // fnmut vs fnonce. If so, we have to defer further processing.
                 if self.closure_kind(substs).is_none() {
                     let closure_sig = substs.as_closure().sig();
-                    let closure_sig = self
-                        .replace_bound_vars_with_fresh_vars(
-                            call_expr.span,
-                            infer::FnCall,
-                            closure_sig,
-                        )
-                        .0;
+                    let closure_sig = self.replace_bound_vars_with_fresh_vars(
+                        call_expr.span,
+                        infer::FnCall,
+                        closure_sig,
+                    );
                     let adjustments = self.adjust_steps(autoderef);
                     self.record_deferred_call_resolution(
                         def_id,
@@ -171,7 +172,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                             closure_substs: substs,
                         },
                     );
-                    return Some(CallStep::DeferredClosure(closure_sig));
+                    return Some(CallStep::DeferredClosure(def_id, closure_sig));
                 }
             }
 
@@ -277,19 +278,42 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     /// likely intention is to call the closure, suggest `(||{})()`. (#55851)
     fn identify_bad_closure_def_and_call(
         &self,
-        err: &mut DiagnosticBuilder<'a>,
+        err: &mut Diagnostic,
         hir_id: hir::HirId,
         callee_node: &hir::ExprKind<'_>,
         callee_span: Span,
     ) {
-        let hir_id = self.tcx.hir().get_parent_node(hir_id);
-        let parent_node = self.tcx.hir().get(hir_id);
+        let hir = self.tcx.hir();
+        let parent_hir_id = hir.get_parent_node(hir_id);
+        let parent_node = hir.get(parent_hir_id);
         if let (
-            hir::Node::Expr(hir::Expr { kind: hir::ExprKind::Closure(_, _, _, sp, ..), .. }),
+            hir::Node::Expr(hir::Expr {
+                kind: hir::ExprKind::Closure(&hir::Closure { fn_decl_span, body, .. }),
+                ..
+            }),
             hir::ExprKind::Block(..),
         ) = (parent_node, callee_node)
         {
-            let start = sp.shrink_to_lo();
+            let fn_decl_span = if hir.body(body).generator_kind
+                == Some(hir::GeneratorKind::Async(hir::AsyncGeneratorKind::Closure))
+            {
+                // Actually need to unwrap a few more layers of HIR to get to
+                // the _real_ closure...
+                let async_closure = hir.get_parent_node(hir.get_parent_node(parent_hir_id));
+                if let hir::Node::Expr(hir::Expr {
+                    kind: hir::ExprKind::Closure(&hir::Closure { fn_decl_span, .. }),
+                    ..
+                }) = hir.get(async_closure)
+                {
+                    fn_decl_span
+                } else {
+                    return;
+                }
+            } else {
+                fn_decl_span
+            };
+
+            let start = fn_decl_span.shrink_to_lo();
             let end = callee_span.shrink_to_hi();
             err.multipart_suggestion(
                 "if you meant to create this closure and immediately call it, surround the \
@@ -304,7 +328,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     /// likely intention is to create an array containing tuples.
     fn maybe_suggest_bad_array_definition(
         &self,
-        err: &mut DiagnosticBuilder<'a>,
+        err: &mut Diagnostic,
         call_expr: &'tcx hir::Expr<'tcx>,
         callee_expr: &'tcx hir::Expr<'tcx>,
     ) -> bool {
@@ -315,17 +339,16 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             hir::ExprKind::Tup(exp),
             hir::ExprKind::Call(_, args),
         ) = (parent_node, &callee_expr.kind, &call_expr.kind)
+            && args.len() == exp.len()
         {
-            if args.len() == exp.len() {
-                let start = callee_expr.span.shrink_to_hi();
-                err.span_suggestion(
-                    start,
-                    "consider separating array elements with a comma",
-                    ",".to_string(),
-                    Applicability::MaybeIncorrect,
-                );
-                return true;
-            }
+            let start = callee_expr.span.shrink_to_hi();
+            err.span_suggestion(
+                start,
+                "consider separating array elements with a comma",
+                ",",
+                Applicability::MaybeIncorrect,
+            );
+            return true;
         }
         false
     }
@@ -340,7 +363,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
     ) -> Ty<'tcx> {
         let (fn_sig, def_id) = match *callee_ty.kind() {
             ty::FnDef(def_id, subst) => {
-                let fn_sig = self.tcx.fn_sig(def_id).subst(self.tcx, subst);
+                let fn_sig = self.tcx.bound_fn_sig(def_id).subst(self.tcx, subst);
 
                 // Unit testing: function items annotated with
                 // `#[rustc_evaluate_where_clauses]` trigger special output
@@ -356,7 +379,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                             self.param_env,
                             *predicate,
                         );
-                        let result = self.infcx.evaluate_obligation(&obligation);
+                        let result = self.evaluate_obligation(&obligation);
                         self.tcx
                             .sess
                             .struct_span_err(
@@ -370,18 +393,22 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 (fn_sig, Some(def_id))
             }
             ty::FnPtr(sig) => (sig, None),
-            ref t => {
+            _ => {
                 let mut unit_variant = None;
-                let mut removal_span = call_expr.span;
-                if let ty::Adt(adt_def, ..) = t {
-                    if adt_def.is_enum() {
-                        if let hir::ExprKind::Call(expr, _) = call_expr.kind {
-                            removal_span =
-                                expr.span.shrink_to_hi().to(call_expr.span.shrink_to_hi());
-                            unit_variant =
-                                self.tcx.sess.source_map().span_to_snippet(expr.span).ok();
-                        }
-                    }
+                if let hir::ExprKind::Path(qpath) = &callee_expr.kind
+                    && let Res::Def(def::DefKind::Ctor(kind, def::CtorKind::Const), _)
+                        = self.typeck_results.borrow().qpath_res(qpath, callee_expr.hir_id)
+                    // Only suggest removing parens if there are no arguments
+                    && arg_exprs.is_empty()
+                {
+                    let descr = match kind {
+                        def::CtorOf::Struct => "struct",
+                        def::CtorOf::Variant => "enum variant",
+                    };
+                    let removal_span =
+                        callee_expr.span.shrink_to_hi().to(call_expr.span.shrink_to_hi());
+                    unit_variant =
+                        Some((removal_span, descr, rustc_hir_pretty::qpath_to_string(qpath)));
                 }
 
                 let callee_ty = self.resolve_vars_if_possible(callee_ty);
@@ -391,9 +418,9 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     callee_ty,
                     E0618,
                     "expected function, found {}",
-                    match unit_variant {
-                        Some(ref path) => format!("enum variant `{}`", path),
-                        None => format!("`{}`", callee_ty),
+                    match &unit_variant {
+                        Some((_, kind, path)) => format!("{kind} `{path}`"),
+                        None => format!("`{callee_ty}`"),
                     }
                 );
 
@@ -404,14 +431,13 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                     callee_expr.span,
                 );
 
-                if let Some(ref path) = unit_variant {
+                if let Some((removal_span, kind, path)) = &unit_variant {
                     err.span_suggestion_verbose(
-                        removal_span,
+                        *removal_span,
                         &format!(
-                            "`{}` is a unit variant, you need to write it without the parentheses",
-                            path
+                            "`{path}` is a unit {kind}, and does not take parentheses to be constructed",
                         ),
-                        String::new(),
+                        "",
                         Applicability::MachineApplicable,
                     );
                 }
@@ -431,7 +457,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                             err.span_suggestion(
                                 callee_expr.span.shrink_to_hi(),
                                 "consider using a semicolon here",
-                                ";".to_owned(),
+                                ";",
                                 Applicability::MaybeIncorrect,
                             );
                         }
@@ -446,20 +472,38 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                 };
 
                 if !self.maybe_suggest_bad_array_definition(&mut err, call_expr, callee_expr) {
-                    err.span_label(call_expr.span, "call expression requires function");
+                    if let Some((maybe_def, output_ty, _)) = self.extract_callable_info(callee_expr, callee_ty)
+                        && !self.type_is_sized_modulo_regions(self.param_env, output_ty, callee_expr.span)
+                    {
+                        let descr = match maybe_def {
+                            DefIdOrName::DefId(def_id) => self.tcx.def_kind(def_id).descr(def_id),
+                            DefIdOrName::Name(name) => name,
+                        };
+                        err.span_label(
+                            callee_expr.span,
+                            format!("this {descr} returns an unsized value `{output_ty}`, so it cannot be called")
+                        );
+                        if let DefIdOrName::DefId(def_id) = maybe_def
+                            && let Some(def_span) = self.tcx.hir().span_if_local(def_id)
+                        {
+                            err.span_label(def_span, "the callable type is defined here");
+                        }
+                    } else {
+                        err.span_label(call_expr.span, "call expression requires function");
+                    }
                 }
 
                 if let Some(span) = self.tcx.hir().res_span(def) {
                     let callee_ty = callee_ty.to_string();
                     let label = match (unit_variant, inner_callee_path) {
-                        (Some(path), _) => Some(format!("`{}` defined here", path)),
+                        (Some((_, kind, path)), _) => Some(format!("{kind} `{path}` defined here")),
                         (_, Some(hir::QPath::Resolved(_, path))) => self
                             .tcx
                             .sess
                             .source_map()
                             .span_to_snippet(path.span)
                             .ok()
-                            .map(|p| format!("`{}` defined here returns `{}`", p, callee_ty)),
+                            .map(|p| format!("`{p}` defined here returns `{callee_ty}`")),
                         _ => {
                             match def {
                                 // Emit a different diagnostic for local variables, as they are not
@@ -475,7 +519,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
                                         self.tcx.def_path_str(def_id),
                                     ))
                                 }
-                                _ => Some(format!("`{}` defined here", callee_ty)),
+                                _ => Some(format!("`{callee_ty}` defined here")),
                             }
                         }
                     };
@@ -506,8 +550,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         // renormalize the associated types at this point, since they
         // previously appeared within a `Binder<>` and hence would not
         // have been normalized before.
-        let fn_sig =
-            self.replace_bound_vars_with_fresh_vars(call_expr.span, infer::FnCall, fn_sig).0;
+        let fn_sig = self.replace_bound_vars_with_fresh_vars(call_expr.span, infer::FnCall, fn_sig);
         let fn_sig = self.normalize_associated_types_in(call_expr.span, fn_sig);
 
         // Call the generic checker.
@@ -536,9 +579,10 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
         call_expr: &'tcx hir::Expr<'tcx>,
         arg_exprs: &'tcx [hir::Expr<'tcx>],
         expected: Expectation<'tcx>,
+        closure_def_id: LocalDefId,
         fn_sig: ty::FnSig<'tcx>,
     ) -> Ty<'tcx> {
-        // `fn_sig` is the *signature* of the cosure being called. We
+        // `fn_sig` is the *signature* of the closure being called. We
         // don't know the full details yet (`Fn` vs `FnMut` etc), but we
         // do know the types expected for each argument and the return
         // type.
@@ -558,7 +602,7 @@ impl<'a, 'tcx> FnCtxt<'a, 'tcx> {
             arg_exprs,
             fn_sig.c_variadic,
             TupleArgumentsFlag::TupleArguments,
-            None,
+            Some(closure_def_id.to_def_id()),
         );
 
         fn_sig.output()

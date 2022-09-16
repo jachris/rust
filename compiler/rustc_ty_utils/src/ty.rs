@@ -3,15 +3,14 @@ use rustc_hir as hir;
 use rustc_hir::def_id::DefId;
 use rustc_middle::ty::subst::Subst;
 use rustc_middle::ty::{self, Binder, Predicate, PredicateKind, ToPredicate, Ty, TyCtxt};
-use rustc_span::{sym, Span};
 use rustc_trait_selection::traits;
 
 fn sized_constraint_for_ty<'tcx>(
     tcx: TyCtxt<'tcx>,
-    adtdef: &ty::AdtDef,
+    adtdef: ty::AdtDef<'tcx>,
     ty: Ty<'tcx>,
 ) -> Vec<Ty<'tcx>> {
-    use ty::TyKind::*;
+    use rustc_type_ir::sty::TyKind::*;
 
     let result = match ty.kind() {
         Bool | Char | Int(..) | Uint(..) | Float(..) | RawPtr(..) | Ref(..) | FnDef(..)
@@ -32,8 +31,9 @@ fn sized_constraint_for_ty<'tcx>(
             let adt_tys = adt.sized_constraint(tcx);
             debug!("sized_constraint_for_ty({:?}) intermediate = {:?}", ty, adt_tys);
             adt_tys
+                .0
                 .iter()
-                .map(|ty| ty.subst(tcx, substs))
+                .map(|ty| adt_tys.rebind(*ty).subst(tcx, substs))
                 .flat_map(|ty| sized_constraint_for_ty(tcx, adtdef, ty))
                 .collect()
         }
@@ -56,7 +56,7 @@ fn sized_constraint_for_ty<'tcx>(
             })
             .without_const()
             .to_predicate(tcx);
-            let predicates = tcx.predicates_of(adtdef.did).predicates;
+            let predicates = tcx.predicates_of(adtdef.did()).predicates;
             if predicates.iter().any(|(p, _)| *p == sized_predicate) { vec![] } else { vec![ty] }
         }
 
@@ -69,20 +69,13 @@ fn sized_constraint_for_ty<'tcx>(
 }
 
 fn impl_defaultness(tcx: TyCtxt<'_>, def_id: DefId) -> hir::Defaultness {
-    let item = tcx.hir().expect_item(def_id.expect_local());
-    if let hir::ItemKind::Impl(impl_) = &item.kind {
-        impl_.defaultness
-    } else {
-        bug!("`impl_defaultness` called on {:?}", item);
-    }
-}
-
-fn impl_constness(tcx: TyCtxt<'_>, def_id: DefId) -> hir::Constness {
-    let item = tcx.hir().expect_item(def_id.expect_local());
-    if let hir::ItemKind::Impl(impl_) = &item.kind {
-        impl_.constness
-    } else {
-        bug!("`impl_constness` called on {:?}", item);
+    match tcx.hir().get_by_def_id(def_id.expect_local()) {
+        hir::Node::Item(hir::Item { kind: hir::ItemKind::Impl(impl_), .. }) => impl_.defaultness,
+        hir::Node::ImplItem(hir::ImplItem { defaultness, .. })
+        | hir::Node::TraitItem(hir::TraitItem { defaultness, .. }) => *defaultness,
+        node => {
+            bug!("`impl_defaultness` called on {:?}", node);
+        }
     }
 }
 
@@ -99,7 +92,7 @@ fn adt_sized_constraint(tcx: TyCtxt<'_>, def_id: DefId) -> ty::AdtSizedConstrain
     let def = tcx.adt_def(def_id);
 
     let result = tcx.mk_type_list(
-        def.variants
+        def.variants()
             .iter()
             .flat_map(|v| v.fields.last())
             .flat_map(|f| sized_constraint_for_ty(tcx, def, tcx.type_of(f.did))),
@@ -110,23 +103,7 @@ fn adt_sized_constraint(tcx: TyCtxt<'_>, def_id: DefId) -> ty::AdtSizedConstrain
     ty::AdtSizedConstraint(result)
 }
 
-fn def_ident_span(tcx: TyCtxt<'_>, def_id: DefId) -> Option<Span> {
-    tcx.hir()
-        .get_if_local(def_id)
-        .and_then(|node| match node {
-            // A `Ctor` doesn't have an identifier itself, but its parent
-            // struct/variant does. Compare with `hir::Map::opt_span`.
-            hir::Node::Ctor(ctor) => ctor
-                .ctor_hir_id()
-                .and_then(|ctor_id| tcx.hir().find(tcx.hir().get_parent_node(ctor_id)))
-                .and_then(|parent| parent.ident()),
-            _ => node.ident(),
-        })
-        .map(|ident| ident.span)
-}
-
 /// See `ParamEnv` struct definition for details.
-#[instrument(level = "debug", skip(tcx))]
 fn param_env(tcx: TyCtxt<'_>, def_id: DefId) -> ty::ParamEnv<'_> {
     // The param_env of an impl Trait type is its defining function's param_env
     if let Some(parent) = ty::is_impl_trait_defn(tcx, def_id) {
@@ -149,7 +126,7 @@ fn param_env(tcx: TyCtxt<'_>, def_id: DefId) -> ty::ParamEnv<'_> {
     // are any errors at that point, so outside of type inference you can be
     // sure that this will succeed without errors anyway.
 
-    if tcx.sess.opts.debugging_opts.chalk {
+    if tcx.sess.opts.unstable_opts.chalk {
         let environment = well_formed_types_in_env(tcx, def_id);
         predicates.extend(environment);
     }
@@ -160,7 +137,7 @@ fn param_env(tcx: TyCtxt<'_>, def_id: DefId) -> ty::ParamEnv<'_> {
     let constness = match hir_id {
         Some(hir_id) => match tcx.hir().get(hir_id) {
             hir::Node::TraitItem(hir::TraitItem { kind: hir::TraitItemKind::Fn(..), .. })
-                if tcx.has_attr(def_id, sym::default_method_body_is_const) =>
+                if tcx.is_const_default_method(def_id) =>
             {
                 hir::Constness::Const
             }
@@ -230,11 +207,16 @@ fn param_env(tcx: TyCtxt<'_>, def_id: DefId) -> ty::ParamEnv<'_> {
         constness,
     );
 
-    let body_id = hir_id.map_or(hir::CRATE_HIR_ID, |id| {
-        tcx.hir().maybe_body_owned_by(id).map_or(id, |body| body.hir_id)
-    });
+    let body_id =
+        local_did.and_then(|id| tcx.hir().maybe_body_owned_by(id).map(|body| body.hir_id));
+    let body_id = match body_id {
+        Some(id) => id,
+        None if hir_id.is_some() => hir_id.unwrap(),
+        _ => hir::CRATE_HIR_ID,
+    };
+
     let cause = traits::ObligationCause::misc(tcx.def_span(def_id), body_id);
-    traits::normalize_param_env_or_error(tcx, def_id, unnormalized_env, cause)
+    traits::normalize_param_env_or_error(tcx, unnormalized_env, cause)
 }
 
 /// Elaborate the environment.
@@ -365,7 +347,7 @@ fn instance_def_size_estimate<'tcx>(
     match instance_def {
         InstanceDef::Item(..) | InstanceDef::DropGlue(..) => {
             let mir = tcx.instance_mir(instance_def);
-            mir.basic_blocks().iter().map(|bb| bb.statements.len() + 1).sum()
+            mir.basic_blocks.iter().map(|bb| bb.statements.len() + 1).sum()
         }
         // Estimate the size of other compiler-generated shims to be 1.
         _ => 1,
@@ -407,7 +389,7 @@ fn issue33140_self_ty(tcx: TyCtxt<'_>, def_id: DefId) -> Option<Ty<'_>> {
 
     let self_ty = trait_ref.self_ty();
     let self_ty_matches = match self_ty.kind() {
-        ty::Dynamic(ref data, re) if re.is_static() => data.principal().is_none(),
+        ty::Dynamic(ref data, re, _) if re.is_static() => data.principal().is_none(),
         _ => false,
     };
 
@@ -423,16 +405,10 @@ fn issue33140_self_ty(tcx: TyCtxt<'_>, def_id: DefId) -> Option<Ty<'_>> {
 /// Check if a function is async.
 fn asyncness(tcx: TyCtxt<'_>, def_id: DefId) -> hir::IsAsync {
     let node = tcx.hir().get_by_def_id(def_id.expect_local());
-
-    let fn_kind = node.fn_kind().unwrap_or_else(|| {
-        bug!("asyncness: expected fn-like node but got `{:?}`", def_id);
-    });
-
-    fn_kind.asyncness()
+    if let Some(fn_kind) = node.fn_kind() { fn_kind.asyncness() } else { hir::IsAsync::NotAsync }
 }
 
 /// Don't call this directly: use ``tcx.conservative_is_privately_uninhabited`` instead.
-#[instrument(level = "debug", skip(tcx))]
 pub fn conservative_is_privately_uninhabited_raw<'tcx>(
     tcx: TyCtxt<'tcx>,
     param_env_and: ty::ParamEnvAnd<'tcx, Ty<'tcx>>,
@@ -454,9 +430,9 @@ pub fn conservative_is_privately_uninhabited_raw<'tcx>(
             // (a) It has no variants (i.e. an empty `enum`);
             // (b) Each of its variants (a single one in the case of a `struct`) has at least
             //     one uninhabited field.
-            def.variants.iter().all(|var| {
+            def.variants().iter().all(|var| {
                 var.fields.iter().any(|field| {
-                    let ty = tcx.type_of(field.did).subst(tcx, substs);
+                    let ty = tcx.bound_type_of(field.did).subst(tcx, substs);
                     tcx.conservative_is_privately_uninhabited(param_env.and(ty))
                 })
             })
@@ -492,13 +468,11 @@ pub fn provide(providers: &mut ty::query::Providers) {
     *providers = ty::query::Providers {
         asyncness,
         adt_sized_constraint,
-        def_ident_span,
         param_env,
         param_env_reveal_all_normalized,
         instance_def_size_estimate,
         issue33140_self_ty,
         impl_defaultness,
-        impl_constness,
         conservative_is_privately_uninhabited: conservative_is_privately_uninhabited_raw,
         ..*providers
     };

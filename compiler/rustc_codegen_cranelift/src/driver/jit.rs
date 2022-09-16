@@ -3,7 +3,6 @@
 
 use std::cell::RefCell;
 use std::ffi::CString;
-use std::lazy::SyncOnceCell;
 use std::os::raw::{c_char, c_int};
 use std::sync::{mpsc, Mutex};
 
@@ -13,6 +12,9 @@ use rustc_session::Session;
 use rustc_span::Symbol;
 
 use cranelift_jit::{JITBuilder, JITModule};
+
+// FIXME use std::sync::OnceLock once it stabilizes
+use once_cell::sync::OnceCell;
 
 use crate::{prelude::*, BackendConfig};
 use crate::{CodegenCx, CodegenMode};
@@ -27,8 +29,7 @@ thread_local! {
 }
 
 /// The Sender owned by the rustc thread
-static GLOBAL_MESSAGE_SENDER: SyncOnceCell<Mutex<mpsc::Sender<UnsafeMessage>>> =
-    SyncOnceCell::new();
+static GLOBAL_MESSAGE_SENDER: OnceCell<Mutex<mpsc::Sender<UnsafeMessage>>> = OnceCell::new();
 
 /// A message that is sent from the jitted runtime to the rustc thread.
 /// Senders are responsible for upholding `Send` semantics.
@@ -60,11 +61,11 @@ impl UnsafeMessage {
     }
 }
 
-fn create_jit_module<'tcx>(
-    tcx: TyCtxt<'tcx>,
+fn create_jit_module(
+    tcx: TyCtxt<'_>,
     backend_config: &BackendConfig,
     hotswap: bool,
-) -> (JITModule, CodegenCx<'tcx>) {
+) -> (JITModule, CodegenCx) {
     let crate_info = CrateInfo::new(tcx, "dummy_target_cpu".to_string());
     let imported_symbols = load_imported_symbols_for_jit(tcx.sess, crate_info);
 
@@ -73,6 +74,7 @@ fn create_jit_module<'tcx>(
     jit_builder.hotswap(hotswap);
     crate::compiler_builtins::register_functions_for_jit(&mut jit_builder);
     jit_builder.symbols(imported_symbols);
+    jit_builder.symbol("__clif_jit_fn", clif_jit_fn as *const u8);
     let mut jit_module = JITModule::new(jit_builder);
 
     let mut cx = crate::CodegenCx::new(
@@ -109,6 +111,7 @@ pub(crate) fn run_jit(tcx: TyCtxt<'_>, backend_config: BackendConfig) -> ! {
         &backend_config,
         matches!(backend_config.codegen_mode, CodegenMode::JitLazy),
     );
+    let mut cached_context = Context::new();
 
     let (_, cgus) = tcx.collect_and_partition_mono_items(());
     let mono_items = cgus
@@ -126,11 +129,19 @@ pub(crate) fn run_jit(tcx: TyCtxt<'_>, backend_config: BackendConfig) -> ! {
                 MonoItem::Fn(inst) => match backend_config.codegen_mode {
                     CodegenMode::Aot => unreachable!(),
                     CodegenMode::Jit => {
-                        cx.tcx.sess.time("codegen fn", || {
-                            crate::base::codegen_fn(&mut cx, &mut jit_module, inst)
+                        tcx.sess.time("codegen fn", || {
+                            crate::base::codegen_and_compile_fn(
+                                tcx,
+                                &mut cx,
+                                &mut cached_context,
+                                &mut jit_module,
+                                inst,
+                            )
                         });
                     }
-                    CodegenMode::JitLazy => codegen_shim(&mut cx, &mut jit_module, inst),
+                    CodegenMode::JitLazy => {
+                        codegen_shim(tcx, &mut cx, &mut cached_context, &mut jit_module, inst)
+                    }
                 },
                 MonoItem::Static(def_id) => {
                     crate::constant::codegen_static(tcx, &mut jit_module, def_id);
@@ -209,8 +220,7 @@ pub(crate) fn run_jit(tcx: TyCtxt<'_>, backend_config: BackendConfig) -> ! {
     }
 }
 
-#[no_mangle]
-extern "C" fn __clif_jit_fn(
+extern "C" fn clif_jit_fn(
     instance_ptr: *const Instance<'static>,
     trampoline_ptr: *const u8,
 ) -> *const u8 {
@@ -258,7 +268,15 @@ fn jit_fn(instance_ptr: *const Instance<'static>, trampoline_ptr: *const u8) -> 
                 false,
                 Symbol::intern("dummy_cgu_name"),
             );
-            tcx.sess.time("codegen fn", || crate::base::codegen_fn(&mut cx, jit_module, instance));
+            tcx.sess.time("codegen fn", || {
+                crate::base::codegen_and_compile_fn(
+                    tcx,
+                    &mut cx,
+                    &mut Context::new(),
+                    jit_module,
+                    instance,
+                )
+            });
 
             assert!(cx.global_asm.is_empty());
             jit_module.finalize_definitions();
@@ -287,8 +305,8 @@ fn load_imported_symbols_for_jit(
         match data[cnum.as_usize() - 1] {
             Linkage::NotLinked | Linkage::IncludedFromDylib => {}
             Linkage::Static => {
-                let name = &crate_info.crate_name[&cnum];
-                let mut err = sess.struct_err(&format!("Can't load static lib {}", name.as_str()));
+                let name = crate_info.crate_name[&cnum];
+                let mut err = sess.struct_err(&format!("Can't load static lib {}", name));
                 err.note("rustc_codegen_cranelift can only load dylibs in JIT mode.");
                 err.emit();
             }
@@ -333,9 +351,13 @@ fn load_imported_symbols_for_jit(
     imported_symbols
 }
 
-fn codegen_shim<'tcx>(cx: &mut CodegenCx<'tcx>, module: &mut JITModule, inst: Instance<'tcx>) {
-    let tcx = cx.tcx;
-
+fn codegen_shim<'tcx>(
+    tcx: TyCtxt<'tcx>,
+    cx: &mut CodegenCx,
+    cached_context: &mut Context,
+    module: &mut JITModule,
+    inst: Instance<'tcx>,
+) {
     let pointer_type = module.target_config().pointer_type();
 
     let name = tcx.symbol_name(inst).name;
@@ -356,8 +378,9 @@ fn codegen_shim<'tcx>(cx: &mut CodegenCx<'tcx>, module: &mut JITModule, inst: In
         )
         .unwrap();
 
-    cx.cached_context.clear();
-    let trampoline = &mut cx.cached_context.func;
+    let context = cached_context;
+    context.clear();
+    let trampoline = &mut context.func;
     trampoline.signature = sig.clone();
 
     let mut builder_ctx = FunctionBuilderContext::new();
@@ -380,5 +403,6 @@ fn codegen_shim<'tcx>(cx: &mut CodegenCx<'tcx>, module: &mut JITModule, inst: In
     let ret_vals = trampoline_builder.func.dfg.inst_results(call_inst).to_vec();
     trampoline_builder.ins().return_(&ret_vals);
 
-    module.define_function(func_id, &mut cx.cached_context).unwrap();
+    module.define_function(func_id, context).unwrap();
+    cx.unwind_context.add_function(func_id, context, module.isa());
 }

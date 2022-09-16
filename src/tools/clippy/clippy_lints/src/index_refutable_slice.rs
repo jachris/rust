@@ -14,7 +14,6 @@ use rustc_middle::ty;
 use rustc_semver::RustcVersion;
 use rustc_session::{declare_tool_lint, impl_lint_pass};
 use rustc_span::{symbol::Ident, Span};
-use std::convert::TryInto;
 
 declare_clippy_lint! {
     /// ### What it does
@@ -46,7 +45,7 @@ declare_clippy_lint! {
     ///     println!("{}", first);
     /// }
     /// ```
-    #[clippy::version = "1.58.0"]
+    #[clippy::version = "1.59.0"]
     pub INDEX_REFUTABLE_SLICE,
     nursery,
     "avoid indexing on slices which could be destructed"
@@ -75,7 +74,7 @@ impl<'tcx> LateLintPass<'tcx> for IndexRefutableSlice {
             if !expr.span.from_expansion() || is_expn_of(expr.span, "if_chain").is_some();
             if let Some(IfLet {let_pat, if_then, ..}) = IfLet::hir(cx, expr);
             if !is_lint_allowed(cx, INDEX_REFUTABLE_SLICE, expr.hir_id);
-            if meets_msrv(self.msrv.as_ref(), &msrvs::SLICE_PATTERNS);
+            if meets_msrv(self.msrv, msrvs::SLICE_PATTERNS);
 
             let found_slices = find_slice_values(cx, let_pat);
             if !found_slices.is_empty();
@@ -96,12 +95,14 @@ fn find_slice_values(cx: &LateContext<'_>, pat: &hir::Pat<'_>) -> FxIndexMap<hir
     let mut removed_pat: FxHashSet<hir::HirId> = FxHashSet::default();
     let mut slices: FxIndexMap<hir::HirId, SliceLintInformation> = FxIndexMap::default();
     pat.walk_always(|pat| {
-        if let hir::PatKind::Binding(binding, value_hir_id, ident, sub_pat) = pat.kind {
-            // We'll just ignore mut and ref mut for simplicity sake right now
-            if let hir::BindingAnnotation::Mutable | hir::BindingAnnotation::RefMut = binding {
-                return;
-            }
-
+        // We'll just ignore mut and ref mut for simplicity sake right now
+        if let hir::PatKind::Binding(
+            hir::BindingAnnotation(by_ref, hir::Mutability::Not),
+            value_hir_id,
+            ident,
+            sub_pat,
+        ) = pat.kind
+        {
             // This block catches bindings with sub patterns. It would be hard to build a correct suggestion
             // for them and it's likely that the user knows what they are doing in such a case.
             if removed_pat.contains(&value_hir_id) {
@@ -116,8 +117,8 @@ fn find_slice_values(cx: &LateContext<'_>, pat: &hir::Pat<'_>) -> FxIndexMap<hir
             let bound_ty = cx.typeck_results().node_type(pat.hir_id);
             if let ty::Slice(inner_ty) | ty::Array(inner_ty, _) = bound_ty.peel_refs().kind() {
                 // The values need to use the `ref` keyword if they can't be copied.
-                // This will need to be adjusted if the lint want to support multable access in the future
-                let src_is_ref = bound_ty.is_ref() && binding != hir::BindingAnnotation::Ref;
+                // This will need to be adjusted if the lint want to support mutable access in the future
+                let src_is_ref = bound_ty.is_ref() && by_ref != hir::ByRef::Yes;
                 let needs_ref = !(src_is_ref || is_copy(cx, *inner_ty));
 
                 let slice_info = slices

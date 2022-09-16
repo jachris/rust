@@ -1,7 +1,7 @@
 use rustc_ast::ast::{Lit, LitFloatType, LitIntType, LitKind};
 use std::iter;
 
-#[derive(Debug, PartialEq, Copy, Clone)]
+#[derive(Debug, PartialEq, Eq, Copy, Clone)]
 pub enum Radix {
     Binary,
     Octal,
@@ -57,7 +57,7 @@ impl<'a> NumericLiteral<'a> {
                 .trim_start()
                 .chars()
                 .next()
-                .map_or(false, |c| c.is_digit(10))
+                .map_or(false, |c| c.is_ascii_digit())
         {
             let (unsuffixed, suffix) = split_suffix(src, lit_kind);
             let float = matches!(lit_kind, LitKind::Float(..));
@@ -223,10 +223,12 @@ impl<'a> NumericLiteral<'a> {
 
 fn split_suffix<'a>(src: &'a str, lit_kind: &LitKind) -> (&'a str, Option<&'a str>) {
     debug_assert!(lit_kind.is_numeric());
-    lit_suffix_length(lit_kind).map_or((src, None), |suffix_length| {
-        let (unsuffixed, suffix) = src.split_at(src.len() - suffix_length);
-        (unsuffixed, Some(suffix))
-    })
+    lit_suffix_length(lit_kind)
+        .and_then(|suffix_length| src.len().checked_sub(suffix_length))
+        .map_or((src, None), |split_pos| {
+            let (unsuffixed, suffix) = src.split_at(split_pos);
+            (unsuffixed, Some(suffix))
+        })
 }
 
 fn lit_suffix_length(lit_kind: &LitKind) -> Option<usize> {

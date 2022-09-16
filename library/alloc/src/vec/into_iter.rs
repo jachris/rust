@@ -1,12 +1,16 @@
+#[cfg(not(no_global_oom_handling))]
+use super::AsVecIntoIter;
 use crate::alloc::{Allocator, Global};
 use crate::raw_vec::RawVec;
+use core::array;
 use core::fmt;
-use core::intrinsics::arith_offset;
 use core::iter::{
     FusedIterator, InPlaceIterable, SourceIter, TrustedLen, TrustedRandomAccessNoCoerce,
 };
 use core::marker::PhantomData;
-use core::mem::{self};
+use core::mem::{self, ManuallyDrop, MaybeUninit};
+#[cfg(not(no_global_oom_handling))]
+use core::ops::Deref;
 use core::ptr::{self, NonNull};
 use core::slice::{self};
 
@@ -30,7 +34,9 @@ pub struct IntoIter<
     pub(super) buf: NonNull<T>,
     pub(super) phantom: PhantomData<T>,
     pub(super) cap: usize,
-    pub(super) alloc: A,
+    // the drop impl reconstructs a RawVec from buf, cap and alloc
+    // to avoid dropping the allocator twice we need to wrap it into ManuallyDrop
+    pub(super) alloc: ManuallyDrop<A>,
     pub(super) ptr: *const T,
     pub(super) end: *const T,
 }
@@ -97,6 +103,9 @@ impl<T, A: Allocator> IntoIter<T, A> {
     /// (&mut into_iter).for_each(core::mem::drop);
     /// unsafe { core::ptr::write(&mut into_iter, Vec::new().into_iter()); }
     /// ```
+    ///
+    /// This method is used by in-place iteration, refer to the vec::in_place_collect
+    /// documentation for an overview.
     #[cfg(not(no_global_oom_handling))]
     pub(super) fn forget_allocation_drop_remaining(&mut self) {
         let remaining = self.as_raw_mut_slice();
@@ -112,6 +121,11 @@ impl<T, A: Allocator> IntoIter<T, A> {
         unsafe {
             ptr::drop_in_place(remaining);
         }
+    }
+
+    /// Forgets to Drop the remaining elements while still allowing the backing allocation to be freed.
+    pub(crate) fn forget_remaining_elements(&mut self) {
+        self.ptr = self.end;
     }
 }
 
@@ -133,19 +147,19 @@ impl<T, A: Allocator> Iterator for IntoIter<T, A> {
 
     #[inline]
     fn next(&mut self) -> Option<T> {
-        if self.ptr as *const _ == self.end {
+        if self.ptr == self.end {
             None
         } else if mem::size_of::<T>() == 0 {
             // purposefully don't use 'ptr.offset' because for
             // vectors with 0-size elements this would return the
             // same pointer.
-            self.ptr = unsafe { arith_offset(self.ptr as *const i8, 1) as *mut T };
+            self.ptr = self.ptr.wrapping_byte_add(1);
 
             // Make up a value of this ZST.
             Some(unsafe { mem::zeroed() })
         } else {
             let old = self.ptr;
-            self.ptr = unsafe { self.ptr.offset(1) };
+            self.ptr = unsafe { self.ptr.add(1) };
 
             Some(unsafe { ptr::read(old) })
         }
@@ -154,9 +168,9 @@ impl<T, A: Allocator> Iterator for IntoIter<T, A> {
     #[inline]
     fn size_hint(&self) -> (usize, Option<usize>) {
         let exact = if mem::size_of::<T>() == 0 {
-            (self.end as usize).wrapping_sub(self.ptr as usize)
+            self.end.addr().wrapping_sub(self.ptr.addr())
         } else {
-            unsafe { self.end.offset_from(self.ptr) as usize }
+            unsafe { self.end.sub_ptr(self.ptr) }
         };
         (exact, Some(exact))
     }
@@ -169,7 +183,7 @@ impl<T, A: Allocator> Iterator for IntoIter<T, A> {
             // SAFETY: due to unchecked casts of unsigned amounts to signed offsets the wraparound
             // effectively results in unsigned pointers representing positions 0..usize::MAX,
             // which is valid for ZSTs.
-            self.ptr = unsafe { arith_offset(self.ptr as *const i8, step_size as isize) as *mut T }
+            self.ptr = self.ptr.wrapping_byte_add(step_size);
         } else {
             // SAFETY: the min() above ensures that step_size is in bounds
             self.ptr = unsafe { self.ptr.add(step_size) };
@@ -189,7 +203,43 @@ impl<T, A: Allocator> Iterator for IntoIter<T, A> {
         self.len()
     }
 
-    #[doc(hidden)]
+    #[inline]
+    fn next_chunk<const N: usize>(&mut self) -> Result<[T; N], core::array::IntoIter<T, N>> {
+        let mut raw_ary = MaybeUninit::uninit_array();
+
+        let len = self.len();
+
+        if mem::size_of::<T>() == 0 {
+            if len < N {
+                self.forget_remaining_elements();
+                // Safety: ZSTs can be conjured ex nihilo, only the amount has to be correct
+                return Err(unsafe { array::IntoIter::new_unchecked(raw_ary, 0..len) });
+            }
+
+            self.ptr = self.ptr.wrapping_byte_add(N);
+            // Safety: ditto
+            return Ok(unsafe { MaybeUninit::array_assume_init(raw_ary) });
+        }
+
+        if len < N {
+            // Safety: `len` indicates that this many elements are available and we just checked that
+            // it fits into the array.
+            unsafe {
+                ptr::copy_nonoverlapping(self.ptr, raw_ary.as_mut_ptr() as *mut T, len);
+                self.forget_remaining_elements();
+                return Err(array::IntoIter::new_unchecked(raw_ary, 0..len));
+            }
+        }
+
+        // Safety: `len` is larger than the array size. Copy a fixed amount here to fully initialize
+        // the array.
+        return unsafe {
+            ptr::copy_nonoverlapping(self.ptr, raw_ary.as_mut_ptr() as *mut T, N);
+            self.ptr = self.ptr.add(N);
+            Ok(MaybeUninit::array_assume_init(raw_ary))
+        };
+    }
+
     unsafe fn __iterator_get_unchecked(&mut self, i: usize) -> Self::Item
     where
         Self: TrustedRandomAccessNoCoerce,
@@ -216,12 +266,12 @@ impl<T, A: Allocator> DoubleEndedIterator for IntoIter<T, A> {
             None
         } else if mem::size_of::<T>() == 0 {
             // See above for why 'ptr.offset' isn't used
-            self.end = unsafe { arith_offset(self.end as *const i8, -1) as *mut T };
+            self.end = self.end.wrapping_byte_sub(1);
 
             // Make up a value of this ZST.
             Some(unsafe { mem::zeroed() })
         } else {
-            self.end = unsafe { self.end.offset(-1) };
+            self.end = unsafe { self.end.sub(1) };
 
             Some(unsafe { ptr::read(self.end) })
         }
@@ -232,12 +282,10 @@ impl<T, A: Allocator> DoubleEndedIterator for IntoIter<T, A> {
         let step_size = self.len().min(n);
         if mem::size_of::<T>() == 0 {
             // SAFETY: same as for advance_by()
-            self.end = unsafe {
-                arith_offset(self.end as *const i8, step_size.wrapping_neg() as isize) as *mut T
-            }
+            self.end = self.end.wrapping_byte_sub(step_size);
         } else {
             // SAFETY: same as for advance_by()
-            self.end = unsafe { self.end.offset(step_size.wrapping_neg() as isize) };
+            self.end = unsafe { self.end.sub(step_size) };
         }
         let to_drop = ptr::slice_from_raw_parts_mut(self.end as *mut T, step_size);
         // SAFETY: same as for advance_by()
@@ -290,11 +338,11 @@ where
 impl<T: Clone, A: Allocator + Clone> Clone for IntoIter<T, A> {
     #[cfg(not(test))]
     fn clone(&self) -> Self {
-        self.as_slice().to_vec_in(self.alloc.clone()).into_iter()
+        self.as_slice().to_vec_in(self.alloc.deref().clone()).into_iter()
     }
     #[cfg(test)]
     fn clone(&self) -> Self {
-        crate::slice::to_vec(self.as_slice(), self.alloc.clone()).into_iter()
+        crate::slice::to_vec(self.as_slice(), self.alloc.deref().clone()).into_iter()
     }
 }
 
@@ -306,8 +354,8 @@ unsafe impl<#[may_dangle] T, A: Allocator> Drop for IntoIter<T, A> {
         impl<T, A: Allocator> Drop for DropGuard<'_, T, A> {
             fn drop(&mut self) {
                 unsafe {
-                    // `IntoIter::alloc` is not used anymore after this
-                    let alloc = ptr::read(&self.0.alloc);
+                    // `IntoIter::alloc` is not used anymore after this and will be dropped by RawVec
+                    let alloc = ManuallyDrop::take(&mut self.0.alloc);
                     // RawVec handles deallocation
                     let _ = RawVec::from_raw_parts_in(self.0.buf.as_ptr(), self.0.cap, alloc);
                 }
@@ -323,6 +371,8 @@ unsafe impl<#[may_dangle] T, A: Allocator> Drop for IntoIter<T, A> {
     }
 }
 
+// In addition to the SAFETY invariants of the following three unsafe traits
+// also refer to the vec::in_place_collect module documentation to get an overview
 #[unstable(issue = "none", feature = "inplace_iteration")]
 #[doc(hidden)]
 unsafe impl<T, A: Allocator> InPlaceIterable for IntoIter<T, A> {}
@@ -338,14 +388,8 @@ unsafe impl<T, A: Allocator> SourceIter for IntoIter<T, A> {
     }
 }
 
-// internal helper trait for in-place iteration specialization.
-#[rustc_specialization_trait]
-pub(crate) trait AsIntoIter {
-    type Item;
-    fn as_into_iter(&mut self) -> &mut IntoIter<Self::Item>;
-}
-
-impl<T> AsIntoIter for IntoIter<T> {
+#[cfg(not(no_global_oom_handling))]
+unsafe impl<T> AsVecIntoIter for IntoIter<T> {
     type Item = T;
 
     fn as_into_iter(&mut self) -> &mut IntoIter<Self::Item> {

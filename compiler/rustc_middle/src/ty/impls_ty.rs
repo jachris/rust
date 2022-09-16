@@ -4,13 +4,13 @@
 use crate::middle::region;
 use crate::mir;
 use crate::ty;
+use crate::ty::fast_reject::SimplifiedType;
 use rustc_data_structures::fingerprint::Fingerprint;
 use rustc_data_structures::fx::FxHashMap;
 use rustc_data_structures::stable_hasher::HashingControls;
 use rustc_data_structures::stable_hasher::{HashStable, StableHasher, ToStableHashKey};
 use rustc_query_system::ich::StableHashingContext;
 use std::cell::RefCell;
-use std::mem;
 
 impl<'a, 'tcx, T> HashStable<StableHashingContext<'a>> for &'tcx ty::List<T>
 where
@@ -55,6 +55,18 @@ where
     }
 }
 
+impl<'a> ToStableHashKey<StableHashingContext<'a>> for SimplifiedType {
+    type KeyType = Fingerprint;
+
+    #[inline]
+    fn to_stable_hash_key(&self, hcx: &StableHashingContext<'a>) -> Fingerprint {
+        let mut hasher = StableHasher::new();
+        let mut hcx: StableHashingContext<'a> = hcx.clone();
+        self.hash_stable(&mut hcx, &mut hasher);
+        hasher.finish()
+    }
+}
+
 impl<'a, 'tcx> HashStable<StableHashingContext<'a>> for ty::subst::GenericArg<'tcx> {
     fn hash_stable(&self, hcx: &mut StableHashingContext<'a>, hasher: &mut StableHasher) {
         self.unpack().hash_stable(hcx, hasher);
@@ -73,92 +85,19 @@ impl<'a, 'tcx> HashStable<StableHashingContext<'a>> for ty::subst::GenericArgKin
             //
             // In order to make it very unlikely for the sequence of bytes being hashed for
             // a `GenericArgKind::Type` to be the same as the sequence of bytes being
-            // hashed for one of the other variants, we hash a `0xFF` byte before hashing
-            // their discriminant (since the discriminant of `TyKind` is unlikely to ever start
-            // with 0xFF).
+            // hashed for one of the other variants, we hash some very high number instead
+            // of their actual discriminant since `TyKind` should never start with anything
+            // that high.
             ty::subst::GenericArgKind::Type(ty) => ty.hash_stable(hcx, hasher),
             ty::subst::GenericArgKind::Const(ct) => {
-                0xFFu8.hash_stable(hcx, hasher);
-                mem::discriminant(self).hash_stable(hcx, hasher);
+                0xF3u8.hash_stable(hcx, hasher);
                 ct.hash_stable(hcx, hasher);
             }
             ty::subst::GenericArgKind::Lifetime(lt) => {
-                0xFFu8.hash_stable(hcx, hasher);
-                mem::discriminant(self).hash_stable(hcx, hasher);
+                0xF5u8.hash_stable(hcx, hasher);
                 lt.hash_stable(hcx, hasher);
             }
         }
-    }
-}
-
-impl<'a> HashStable<StableHashingContext<'a>> for ty::RegionKind {
-    fn hash_stable(&self, hcx: &mut StableHashingContext<'a>, hasher: &mut StableHasher) {
-        mem::discriminant(self).hash_stable(hcx, hasher);
-        match *self {
-            ty::ReErased | ty::ReStatic => {
-                // No variant fields to hash for these ...
-            }
-            ty::ReEmpty(universe) => {
-                universe.hash_stable(hcx, hasher);
-            }
-            ty::ReLateBound(db, ty::BoundRegion { kind: ty::BrAnon(i), .. }) => {
-                db.hash_stable(hcx, hasher);
-                i.hash_stable(hcx, hasher);
-            }
-            ty::ReLateBound(db, ty::BoundRegion { kind: ty::BrNamed(def_id, name), .. }) => {
-                db.hash_stable(hcx, hasher);
-                def_id.hash_stable(hcx, hasher);
-                name.hash_stable(hcx, hasher);
-            }
-            ty::ReLateBound(db, ty::BoundRegion { kind: ty::BrEnv, .. }) => {
-                db.hash_stable(hcx, hasher);
-            }
-            ty::ReEarlyBound(ty::EarlyBoundRegion { def_id, index, name }) => {
-                def_id.hash_stable(hcx, hasher);
-                index.hash_stable(hcx, hasher);
-                name.hash_stable(hcx, hasher);
-            }
-            ty::ReFree(ref free_region) => {
-                free_region.hash_stable(hcx, hasher);
-            }
-            ty::RePlaceholder(p) => {
-                p.hash_stable(hcx, hasher);
-            }
-            ty::ReVar(..) => {
-                bug!("StableHasher: unexpected region {:?}", *self)
-            }
-        }
-    }
-}
-
-impl<'a> HashStable<StableHashingContext<'a>> for ty::RegionVid {
-    #[inline]
-    fn hash_stable(&self, hcx: &mut StableHashingContext<'a>, hasher: &mut StableHasher) {
-        self.index().hash_stable(hcx, hasher);
-    }
-}
-
-impl<'a, 'tcx> HashStable<StableHashingContext<'a>> for ty::ConstVid<'tcx> {
-    #[inline]
-    fn hash_stable(&self, hcx: &mut StableHashingContext<'a>, hasher: &mut StableHasher) {
-        self.index.hash_stable(hcx, hasher);
-    }
-}
-
-impl<'tcx> HashStable<StableHashingContext<'tcx>> for ty::BoundVar {
-    #[inline]
-    fn hash_stable(&self, hcx: &mut StableHashingContext<'tcx>, hasher: &mut StableHasher) {
-        self.index().hash_stable(hcx, hasher);
-    }
-}
-
-impl<'a, 'tcx, T> HashStable<StableHashingContext<'a>> for ty::Binder<'tcx, T>
-where
-    T: HashStable<StableHashingContext<'a>>,
-{
-    fn hash_stable(&self, hcx: &mut StableHashingContext<'a>, hasher: &mut StableHasher) {
-        self.as_ref().skip_binder().hash_stable(hcx, hasher);
-        self.bound_vars().hash_stable(hcx, hasher);
     }
 }
 
@@ -168,15 +107,15 @@ impl<'a> HashStable<StableHashingContext<'a>> for mir::interpret::AllocId {
         ty::tls::with_opt(|tcx| {
             trace!("hashing {:?}", *self);
             let tcx = tcx.expect("can't hash AllocIds during hir lowering");
-            tcx.get_global_alloc(*self).hash_stable(hcx, hasher);
+            tcx.try_get_global_alloc(*self).hash_stable(hcx, hasher);
         });
     }
 }
 
 // `Relocations` with default type parameters is a sorted map.
-impl<'a, Tag> HashStable<StableHashingContext<'a>> for mir::interpret::Relocations<Tag>
+impl<'a, Prov> HashStable<StableHashingContext<'a>> for mir::interpret::ProvenanceMap<Prov>
 where
-    Tag: HashStable<StableHashingContext<'a>>,
+    Prov: HashStable<StableHashingContext<'a>>,
 {
     fn hash_stable(&self, hcx: &mut StableHashingContext<'a>, hasher: &mut StableHasher) {
         self.len().hash_stable(hcx, hasher);

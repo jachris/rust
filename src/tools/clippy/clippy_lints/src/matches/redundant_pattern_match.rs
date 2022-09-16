@@ -2,91 +2,32 @@ use super::REDUNDANT_PATTERN_MATCHING;
 use clippy_utils::diagnostics::span_lint_and_then;
 use clippy_utils::source::snippet;
 use clippy_utils::sugg::Sugg;
-use clippy_utils::ty::{implements_trait, is_type_diagnostic_item, is_type_lang_item, match_type};
-use clippy_utils::{higher, match_def_path};
-use clippy_utils::{is_lang_ctor, is_trait_method, paths};
+use clippy_utils::ty::{is_type_diagnostic_item, needs_ordered_drop};
+use clippy_utils::visitors::any_temporaries_need_ordered_drop;
+use clippy_utils::{higher, is_lang_ctor, is_trait_method};
 use if_chain::if_chain;
 use rustc_ast::ast::LitKind;
-use rustc_data_structures::fx::FxHashSet;
 use rustc_errors::Applicability;
-use rustc_hir::LangItem::{OptionNone, PollPending};
-use rustc_hir::{
-    intravisit::{walk_expr, Visitor},
-    Arm, Block, Expr, ExprKind, LangItem, MatchSource, Node, Pat, PatKind, QPath, UnOp,
-};
+use rustc_hir::LangItem::{self, OptionSome, OptionNone, PollPending, PollReady, ResultOk, ResultErr};
+use rustc_hir::{Arm, Expr, ExprKind, Node, Pat, PatKind, QPath, UnOp};
 use rustc_lint::LateContext;
 use rustc_middle::ty::{self, subst::GenericArgKind, DefIdTree, Ty};
-use rustc_span::sym;
+use rustc_span::{sym, Symbol};
 
-pub fn check<'tcx>(cx: &LateContext<'tcx>, expr: &'tcx Expr<'_>) {
-    if let Some(higher::IfLet {
-        if_else,
-        let_pat,
-        let_expr,
-        ..
-    }) = higher::IfLet::hir(cx, expr)
-    {
-        find_sugg_for_if_let(cx, expr, let_pat, let_expr, "if", if_else.is_some());
-    }
-    if let ExprKind::Match(op, arms, MatchSource::Normal) = &expr.kind {
-        find_sugg_for_match(cx, expr, op, arms);
-    }
+pub(super) fn check<'tcx>(cx: &LateContext<'tcx>, expr: &'tcx Expr<'_>) {
     if let Some(higher::WhileLet { let_pat, let_expr, .. }) = higher::WhileLet::hir(expr) {
         find_sugg_for_if_let(cx, expr, let_pat, let_expr, "while", false);
     }
 }
 
-/// Checks if the drop order for a type matters. Some std types implement drop solely to
-/// deallocate memory. For these types, and composites containing them, changing the drop order
-/// won't result in any observable side effects.
-fn type_needs_ordered_drop<'tcx>(cx: &LateContext<'tcx>, ty: Ty<'tcx>) -> bool {
-    type_needs_ordered_drop_inner(cx, ty, &mut FxHashSet::default())
-}
-
-fn type_needs_ordered_drop_inner<'tcx>(cx: &LateContext<'tcx>, ty: Ty<'tcx>, seen: &mut FxHashSet<Ty<'tcx>>) -> bool {
-    if !seen.insert(ty) {
-        return false;
-    }
-    if !ty.needs_drop(cx.tcx, cx.param_env) {
-        false
-    } else if !cx
-        .tcx
-        .lang_items()
-        .drop_trait()
-        .map_or(false, |id| implements_trait(cx, ty, id, &[]))
-    {
-        // This type doesn't implement drop, so no side effects here.
-        // Check if any component type has any.
-        match ty.kind() {
-            ty::Tuple(fields) => fields.iter().any(|ty| type_needs_ordered_drop_inner(cx, ty, seen)),
-            &ty::Array(ty, _) => type_needs_ordered_drop_inner(cx, ty, seen),
-            ty::Adt(adt, subs) => adt
-                .all_fields()
-                .map(|f| f.ty(cx.tcx, subs))
-                .any(|ty| type_needs_ordered_drop_inner(cx, ty, seen)),
-            _ => true,
-        }
-    }
-    // Check for std types which implement drop, but only for memory allocation.
-    else if is_type_diagnostic_item(cx, ty, sym::Vec)
-        || is_type_lang_item(cx, ty, LangItem::OwnedBox)
-        || is_type_diagnostic_item(cx, ty, sym::Rc)
-        || is_type_diagnostic_item(cx, ty, sym::Arc)
-        || is_type_diagnostic_item(cx, ty, sym::cstring_type)
-        || is_type_diagnostic_item(cx, ty, sym::BTreeMap)
-        || is_type_diagnostic_item(cx, ty, sym::LinkedList)
-        || match_type(cx, ty, &paths::WEAK_RC)
-        || match_type(cx, ty, &paths::WEAK_ARC)
-    {
-        // Check all of the generic arguments.
-        if let ty::Adt(_, subs) = ty.kind() {
-            subs.types().any(|ty| type_needs_ordered_drop_inner(cx, ty, seen))
-        } else {
-            true
-        }
-    } else {
-        true
-    }
+pub(super) fn check_if_let<'tcx>(
+    cx: &LateContext<'tcx>,
+    expr: &'tcx Expr<'_>,
+    pat: &'tcx Pat<'_>,
+    scrutinee: &'tcx Expr<'_>,
+    has_else: bool,
+) {
+    find_sugg_for_if_let(cx, expr, pat, scrutinee, "if", has_else);
 }
 
 // Extract the generic arguments out of a type
@@ -101,79 +42,6 @@ fn try_get_generic_ty(ty: Ty<'_>, index: usize) -> Option<Ty<'_>> {
             None
         }
     }
-}
-
-// Checks if there are any temporaries created in the given expression for which drop order
-// matters.
-fn temporaries_need_ordered_drop<'tcx>(cx: &LateContext<'tcx>, expr: &'tcx Expr<'tcx>) -> bool {
-    struct V<'a, 'tcx> {
-        cx: &'a LateContext<'tcx>,
-        res: bool,
-    }
-    impl<'a, 'tcx> Visitor<'tcx> for V<'a, 'tcx> {
-        fn visit_expr(&mut self, expr: &'tcx Expr<'tcx>) {
-            match expr.kind {
-                // Taking the reference of a value leaves a temporary
-                // e.g. In `&String::new()` the string is a temporary value.
-                // Remaining fields are temporary values
-                // e.g. In `(String::new(), 0).1` the string is a temporary value.
-                ExprKind::AddrOf(_, _, expr) | ExprKind::Field(expr, _) => {
-                    if !matches!(expr.kind, ExprKind::Path(_)) {
-                        if type_needs_ordered_drop(self.cx, self.cx.typeck_results().expr_ty(expr)) {
-                            self.res = true;
-                        } else {
-                            self.visit_expr(expr);
-                        }
-                    }
-                },
-                // the base type is alway taken by reference.
-                // e.g. In `(vec![0])[0]` the vector is a temporary value.
-                ExprKind::Index(base, index) => {
-                    if !matches!(base.kind, ExprKind::Path(_)) {
-                        if type_needs_ordered_drop(self.cx, self.cx.typeck_results().expr_ty(base)) {
-                            self.res = true;
-                        } else {
-                            self.visit_expr(base);
-                        }
-                    }
-                    self.visit_expr(index);
-                },
-                // Method calls can take self by reference.
-                // e.g. In `String::new().len()` the string is a temporary value.
-                ExprKind::MethodCall(_, [self_arg, args @ ..], _) => {
-                    if !matches!(self_arg.kind, ExprKind::Path(_)) {
-                        let self_by_ref = self
-                            .cx
-                            .typeck_results()
-                            .type_dependent_def_id(expr.hir_id)
-                            .map_or(false, |id| self.cx.tcx.fn_sig(id).skip_binder().inputs()[0].is_ref());
-                        if self_by_ref && type_needs_ordered_drop(self.cx, self.cx.typeck_results().expr_ty(self_arg)) {
-                            self.res = true;
-                        } else {
-                            self.visit_expr(self_arg);
-                        }
-                    }
-                    args.iter().for_each(|arg| self.visit_expr(arg));
-                },
-                // Either explicitly drops values, or changes control flow.
-                ExprKind::DropTemps(_)
-                | ExprKind::Ret(_)
-                | ExprKind::Break(..)
-                | ExprKind::Yield(..)
-                | ExprKind::Block(Block { expr: None, .. }, _)
-                | ExprKind::Loop(..) => (),
-
-                // Only consider the final expression.
-                ExprKind::Block(Block { expr: Some(expr), .. }, _) => self.visit_expr(expr),
-
-                _ => walk_expr(self, expr),
-            }
-        }
-    }
-
-    let mut v = V { cx, res: false };
-    v.visit_expr(expr);
-    v.res
 }
 
 fn find_sugg_for_if_let<'tcx>(
@@ -197,7 +65,7 @@ fn find_sugg_for_if_let<'tcx>(
         PatKind::TupleStruct(ref qpath, [sub_pat], _) => {
             if let PatKind::Wild = sub_pat.kind {
                 let res = cx.typeck_results().qpath_res(qpath, check_pat.hir_id);
-                let Some(id) = res.opt_def_id().and_then(|ctor_id| cx.tcx.parent(ctor_id)) else { return };
+                let Some(id) = res.opt_def_id().map(|ctor_id| cx.tcx.parent(ctor_id)) else { return };
                 let lang_items = cx.tcx.lang_items();
                 if Some(id) == lang_items.result_ok_variant() {
                     ("is_ok()", try_get_generic_ty(op_ty, 0).unwrap_or(op_ty))
@@ -207,9 +75,9 @@ fn find_sugg_for_if_let<'tcx>(
                     ("is_some()", op_ty)
                 } else if Some(id) == lang_items.poll_ready_variant() {
                     ("is_ready()", op_ty)
-                } else if match_def_path(cx, id, &paths::IPADDR_V4) {
+                } else if is_pat_variant(cx, check_pat, qpath, Item::Diag(sym::IpAddr, sym!(V4))) {
                     ("is_ipv4()", op_ty)
-                } else if match_def_path(cx, id, &paths::IPADDR_V6) {
+                } else if is_pat_variant(cx, check_pat, qpath, Item::Diag(sym::IpAddr, sym!(V6))) {
                     ("is_ipv6()", op_ty)
                 } else {
                     return;
@@ -247,12 +115,12 @@ fn find_sugg_for_if_let<'tcx>(
     // scrutinee would be, so they have to be considered as well.
     // e.g. in `if let Some(x) = foo.lock().unwrap().baz.as_ref() { .. }` the lock will be held
     // for the duration if body.
-    let needs_drop = type_needs_ordered_drop(cx, check_ty) || temporaries_need_ordered_drop(cx, let_expr);
+    let needs_drop = needs_ordered_drop(cx, check_ty) || any_temporaries_need_ordered_drop(cx, let_expr);
 
     // check that `while_let_on_iterator` lint does not trigger
     if_chain! {
         if keyword == "while";
-        if let ExprKind::MethodCall(method_path, _, _) = let_expr.kind;
+        if let ExprKind::MethodCall(method_path, ..) = let_expr.kind;
         if method_path.ident.name == sym::next;
         if is_trait_method(cx, let_expr, sym::Iterator);
         then {
@@ -304,7 +172,7 @@ fn find_sugg_for_if_let<'tcx>(
     );
 }
 
-fn find_sugg_for_match<'tcx>(cx: &LateContext<'tcx>, expr: &'tcx Expr<'_>, op: &Expr<'_>, arms: &[Arm<'_>]) {
+pub(super) fn check_match<'tcx>(cx: &LateContext<'tcx>, expr: &'tcx Expr<'_>, op: &Expr<'_>, arms: &[Arm<'_>]) {
     if arms.len() == 2 {
         let node_pair = (&arms[0].pat.kind, &arms[1].pat.kind);
 
@@ -319,8 +187,8 @@ fn find_sugg_for_match<'tcx>(cx: &LateContext<'tcx>, expr: &'tcx Expr<'_>, op: &
                         arms,
                         path_left,
                         path_right,
-                        &paths::RESULT_OK,
-                        &paths::RESULT_ERR,
+                        Item::Lang(ResultOk),
+                        Item::Lang(ResultErr),
                         "is_ok()",
                         "is_err()",
                     )
@@ -330,8 +198,8 @@ fn find_sugg_for_match<'tcx>(cx: &LateContext<'tcx>, expr: &'tcx Expr<'_>, op: &
                             arms,
                             path_left,
                             path_right,
-                            &paths::IPADDR_V4,
-                            &paths::IPADDR_V6,
+                            Item::Diag(sym::IpAddr, sym!(V4)),
+                            Item::Diag(sym::IpAddr, sym!(V6)),
                             "is_ipv4()",
                             "is_ipv6()",
                         )
@@ -345,13 +213,14 @@ fn find_sugg_for_match<'tcx>(cx: &LateContext<'tcx>, expr: &'tcx Expr<'_>, op: &
                 if patterns.len() == 1 =>
             {
                 if let PatKind::Wild = patterns[0].kind {
+
                     find_good_method_for_match(
                         cx,
                         arms,
                         path_left,
                         path_right,
-                        &paths::OPTION_SOME,
-                        &paths::OPTION_NONE,
+                        Item::Lang(OptionSome),
+                        Item::Lang(OptionNone),
                         "is_some()",
                         "is_none()",
                     )
@@ -361,8 +230,8 @@ fn find_sugg_for_match<'tcx>(cx: &LateContext<'tcx>, expr: &'tcx Expr<'_>, op: &
                             arms,
                             path_left,
                             path_right,
-                            &paths::POLL_READY,
-                            &paths::POLL_PENDING,
+                            Item::Lang(PollReady),
+                            Item::Lang(PollPending),
                             "is_ready()",
                             "is_pending()",
                         )
@@ -398,29 +267,62 @@ fn find_sugg_for_match<'tcx>(cx: &LateContext<'tcx>, expr: &'tcx Expr<'_>, op: &
     }
 }
 
-#[allow(clippy::too_many_arguments)]
+#[derive(Clone, Copy)]
+enum Item {
+  Lang(LangItem),
+  Diag(Symbol, Symbol),
+}
+
+fn is_pat_variant(cx: &LateContext<'_>, pat: &Pat<'_>, path: &QPath<'_>, expected_item: Item) -> bool {
+    let Some(id) = cx.typeck_results().qpath_res(path, pat.hir_id).opt_def_id() else { return false };
+
+    match expected_item {
+        Item::Lang(expected_lang_item) => {
+            let expected_id = cx.tcx.lang_items().require(expected_lang_item).unwrap();
+            cx.tcx.parent(id) == expected_id
+        },
+        Item::Diag(expected_ty, expected_variant) => {
+            let ty = cx.typeck_results().pat_ty(pat);
+
+            if is_type_diagnostic_item(cx, ty, expected_ty) {
+                let variant = ty.ty_adt_def()
+                    .expect("struct pattern type is not an ADT")
+                    .variant_of_res(cx.qpath_res(path, pat.hir_id));
+
+                return variant.name == expected_variant
+            }
+
+            false
+        }
+    }
+}
+
+#[expect(clippy::too_many_arguments)]
 fn find_good_method_for_match<'a>(
     cx: &LateContext<'_>,
     arms: &[Arm<'_>],
     path_left: &QPath<'_>,
     path_right: &QPath<'_>,
-    expected_left: &[&str],
-    expected_right: &[&str],
+    expected_item_left: Item,
+    expected_item_right: Item,
     should_be_left: &'a str,
     should_be_right: &'a str,
 ) -> Option<&'a str> {
-    let left_id = cx
-        .typeck_results()
-        .qpath_res(path_left, arms[0].pat.hir_id)
-        .opt_def_id()?;
-    let right_id = cx
-        .typeck_results()
-        .qpath_res(path_right, arms[1].pat.hir_id)
-        .opt_def_id()?;
-    let body_node_pair = if match_def_path(cx, left_id, expected_left) && match_def_path(cx, right_id, expected_right) {
-        (&(*arms[0].body).kind, &(*arms[1].body).kind)
-    } else if match_def_path(cx, right_id, expected_left) && match_def_path(cx, right_id, expected_right) {
-        (&(*arms[1].body).kind, &(*arms[0].body).kind)
+    let pat_left = arms[0].pat;
+    let pat_right = arms[1].pat;
+
+    let body_node_pair = if (
+        is_pat_variant(cx, pat_left, path_left, expected_item_left)
+    ) && (
+        is_pat_variant(cx, pat_right, path_right, expected_item_right)
+    ) {
+        (&arms[0].body.kind, &arms[1].body.kind)
+    } else if (
+        is_pat_variant(cx, pat_left, path_left, expected_item_right)
+    ) && (
+        is_pat_variant(cx, pat_right, path_right, expected_item_left)
+    ) {
+        (&arms[1].body.kind, &arms[0].body.kind)
     } else {
         return None;
     };

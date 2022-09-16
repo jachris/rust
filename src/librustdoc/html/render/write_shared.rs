@@ -1,15 +1,16 @@
 use std::ffi::OsStr;
-use std::fmt::Write;
 use std::fs::{self, File};
 use std::io::prelude::*;
 use std::io::{self, BufReader};
-use std::lazy::SyncLazy as Lazy;
 use std::path::{Component, Path, PathBuf};
+use std::rc::Rc;
+use std::sync::LazyLock as Lazy;
 
 use itertools::Itertools;
 use rustc_data_structures::flock;
 use rustc_data_structures::fx::{FxHashMap, FxHashSet};
-use serde::Serialize;
+use serde::ser::SerializeSeq;
+use serde::{Serialize, Serializer};
 
 use super::{collect_paths_for_type, ensure_trailing_slash, Context, BASIC_KEYWORDS};
 use crate::clean::Crate;
@@ -21,27 +22,18 @@ use crate::{try_err, try_none};
 
 static FILES_UNVERSIONED: Lazy<FxHashMap<&str, &[u8]>> = Lazy::new(|| {
     map! {
-        "FiraSans-Regular.woff2" => static_files::fira_sans::REGULAR2,
-        "FiraSans-Medium.woff2" => static_files::fira_sans::MEDIUM2,
-        "FiraSans-Regular.woff" => static_files::fira_sans::REGULAR,
-        "FiraSans-Medium.woff" => static_files::fira_sans::MEDIUM,
+        "FiraSans-Regular.woff2" => static_files::fira_sans::REGULAR,
+        "FiraSans-Medium.woff2" => static_files::fira_sans::MEDIUM,
         "FiraSans-LICENSE.txt" => static_files::fira_sans::LICENSE,
-        "SourceSerif4-Regular.ttf.woff2" => static_files::source_serif_4::REGULAR2,
-        "SourceSerif4-Bold.ttf.woff2" => static_files::source_serif_4::BOLD2,
-        "SourceSerif4-It.ttf.woff2" => static_files::source_serif_4::ITALIC2,
-        "SourceSerif4-Regular.ttf.woff" => static_files::source_serif_4::REGULAR,
-        "SourceSerif4-Bold.ttf.woff" => static_files::source_serif_4::BOLD,
-        "SourceSerif4-It.ttf.woff" => static_files::source_serif_4::ITALIC,
+        "SourceSerif4-Regular.ttf.woff2" => static_files::source_serif_4::REGULAR,
+        "SourceSerif4-Bold.ttf.woff2" => static_files::source_serif_4::BOLD,
+        "SourceSerif4-It.ttf.woff2" => static_files::source_serif_4::ITALIC,
         "SourceSerif4-LICENSE.md" => static_files::source_serif_4::LICENSE,
-        "SourceCodePro-Regular.ttf.woff2" => static_files::source_code_pro::REGULAR2,
-        "SourceCodePro-Semibold.ttf.woff2" => static_files::source_code_pro::SEMIBOLD2,
-        "SourceCodePro-It.ttf.woff2" => static_files::source_code_pro::ITALIC2,
-        "SourceCodePro-Regular.ttf.woff" => static_files::source_code_pro::REGULAR,
-        "SourceCodePro-Semibold.ttf.woff" => static_files::source_code_pro::SEMIBOLD,
-        "SourceCodePro-It.ttf.woff" => static_files::source_code_pro::ITALIC,
+        "SourceCodePro-Regular.ttf.woff2" => static_files::source_code_pro::REGULAR,
+        "SourceCodePro-Semibold.ttf.woff2" => static_files::source_code_pro::SEMIBOLD,
+        "SourceCodePro-It.ttf.woff2" => static_files::source_code_pro::ITALIC,
         "SourceCodePro-LICENSE.txt" => static_files::source_code_pro::LICENSE,
-        "NanumBarunGothic.ttf.woff2" => static_files::nanum_barun_gothic::REGULAR2,
-        "NanumBarunGothic.ttf.woff" => static_files::nanum_barun_gothic::REGULAR,
+        "NanumBarunGothic.ttf.woff2" => static_files::nanum_barun_gothic::REGULAR,
         "NanumBarunGothic-LICENSE.txt" => static_files::nanum_barun_gothic::LICENSE,
         "LICENSE-MIT.txt" => static_files::LICENSE_MIT,
         "LICENSE-APACHE.txt" => static_files::LICENSE_APACHE,
@@ -130,11 +122,13 @@ impl Context<'_> {
         if minify {
             let contents = contents.as_ref();
             let contents = if resource.extension() == Some(OsStr::new("css")) {
-                minifier::css::minify(contents).map_err(|e| {
-                    Error::new(format!("failed to minify CSS file: {}", e), resource.path(self))
-                })?
+                minifier::css::minify(contents)
+                    .map_err(|e| {
+                        Error::new(format!("failed to minify CSS file: {}", e), resource.path(self))
+                    })?
+                    .to_string()
             } else {
-                minifier::js::minify(contents)
+                minifier::js::minify(contents).to_string()
             };
             self.write_shared(resource, contents, emit)
         } else {
@@ -144,7 +138,7 @@ impl Context<'_> {
 }
 
 pub(super) fn write_shared(
-    cx: &Context<'_>,
+    cx: &mut Context<'_>,
     krate: &Crate,
     search_index: String,
     options: &RenderOptions,
@@ -247,7 +241,6 @@ pub(super) fn write_shared(
         write_toolchain("favicon-16x16.png", static_files::RUST_FAVICON_PNG_16)?;
         write_toolchain("favicon-32x32.png", static_files::RUST_FAVICON_PNG_32)?;
     }
-    write_toolchain("brush.svg", static_files::BRUSH_SVG)?;
     write_toolchain("wheel.svg", static_files::WHEEL_SVG)?;
     write_toolchain("clipboard.svg", static_files::CLIPBOARD_SVG)?;
     write_toolchain("down-arrow.svg", static_files::DOWN_ARROW_SVG)?;
@@ -291,25 +284,43 @@ pub(super) fn write_shared(
         cx.write_shared(SharedResource::Unversioned { name }, contents, &options.emit)?;
     }
 
-    fn collect(path: &Path, krate: &str, key: &str) -> io::Result<(Vec<String>, Vec<String>)> {
+    /// Read a file and return all lines that match the `"{crate}":{data},` format,
+    /// and return a tuple `(Vec<DataString>, Vec<CrateNameString>)`.
+    ///
+    /// This forms the payload of files that look like this:
+    ///
+    /// ```javascript
+    /// var data = {
+    /// "{crate1}":{data},
+    /// "{crate2}":{data}
+    /// };
+    /// use_data(data);
+    /// ```
+    ///
+    /// The file needs to be formatted so that *only crate data lines start with `"`*.
+    fn collect(path: &Path, krate: &str) -> io::Result<(Vec<String>, Vec<String>)> {
         let mut ret = Vec::new();
         let mut krates = Vec::new();
 
         if path.exists() {
-            let prefix = format!(r#"{}["{}"]"#, key, krate);
+            let prefix = format!("\"{}\"", krate);
             for line in BufReader::new(File::open(path)?).lines() {
                 let line = line?;
-                if !line.starts_with(key) {
+                if !line.starts_with('"') {
                     continue;
                 }
                 if line.starts_with(&prefix) {
                     continue;
                 }
-                ret.push(line.to_string());
+                if line.ends_with(',') {
+                    ret.push(line[..line.len() - 1].to_string());
+                } else {
+                    // No comma (it's the case for the last added crate line)
+                    ret.push(line.to_string());
+                }
                 krates.push(
-                    line[key.len() + 2..]
-                        .split('"')
-                        .next()
+                    line.split('"')
+                        .find(|s| !s.is_empty())
                         .map(|s| s.to_owned())
                         .unwrap_or_else(String::new),
                 );
@@ -318,6 +329,20 @@ pub(super) fn write_shared(
         Ok((ret, krates))
     }
 
+    /// Read a file and return all lines that match the <code>"{crate}":{data},\</code> format,
+    /// and return a tuple `(Vec<DataString>, Vec<CrateNameString>)`.
+    ///
+    /// This forms the payload of files that look like this:
+    ///
+    /// ```javascript
+    /// var data = JSON.parse('{\
+    /// "{crate1}":{data},\
+    /// "{crate2}":{data}\
+    /// }');
+    /// use_data(data);
+    /// ```
+    ///
+    /// The file needs to be formatted so that *only crate data lines start with `"`*.
     fn collect_json(path: &Path, krate: &str) -> io::Result<(Vec<String>, Vec<String>)> {
         let mut ret = Vec::new();
         let mut krates = Vec::new();
@@ -373,13 +398,15 @@ pub(super) fn write_shared(
                 .collect::<Vec<_>>();
             files.sort_unstable();
             let subs = subs.iter().map(|s| s.to_json_string()).collect::<Vec<_>>().join(",");
-            let dirs =
-                if subs.is_empty() { String::new() } else { format!(",\"dirs\":[{}]", subs) };
+            let dirs = if subs.is_empty() && files.is_empty() {
+                String::new()
+            } else {
+                format!(",[{}]", subs)
+            };
             let files = files.join(",");
-            let files =
-                if files.is_empty() { String::new() } else { format!(",\"files\":[{}]", files) };
+            let files = if files.is_empty() { String::new() } else { format!(",[{}]", files) };
             format!(
-                "{{\"name\":\"{name}\"{dirs}{files}}}",
+                "[\"{name}\"{dirs}{files}]",
                 name = self.elem.to_str().expect("invalid osstring conversion"),
                 dirs = dirs,
                 files = files
@@ -418,18 +445,23 @@ pub(super) fn write_shared(
         let dst = cx.dst.join(&format!("source-files{}.js", cx.shared.resource_suffix));
         let make_sources = || {
             let (mut all_sources, _krates) =
-                try_err!(collect(&dst, krate.name(cx.tcx()).as_str(), "sourcesIndex"), &dst);
+                try_err!(collect_json(&dst, krate.name(cx.tcx()).as_str()), &dst);
             all_sources.push(format!(
-                "sourcesIndex[\"{}\"] = {};",
+                r#""{}":{}"#,
                 &krate.name(cx.tcx()),
-                hierarchy.to_json_string()
+                hierarchy
+                    .to_json_string()
+                    // All these `replace` calls are because we have to go through JS string for JSON content.
+                    .replace('\\', r"\\")
+                    .replace('\'', r"\'")
+                    // We need to escape double quotes for the JSON.
+                    .replace("\\\"", "\\\\\"")
             ));
             all_sources.sort();
-            Ok(format!(
-                "var N = null;var sourcesIndex = {{}};\n{}\ncreateSourceSidebar();\n",
-                all_sources.join("\n")
-            )
-            .into_bytes())
+            let mut v = String::from("var sourcesIndex = JSON.parse('{\\\n");
+            v.push_str(&all_sources.join(",\\\n"));
+            v.push_str("\\\n}');\ncreateSourceSidebar();\n");
+            Ok(v.into_bytes())
         };
         write_crate("source-files.js", &make_sources)?;
     }
@@ -448,7 +480,13 @@ pub(super) fn write_shared(
     write_crate("search-index.js", &|| {
         let mut v = String::from("var searchIndex = JSON.parse('{\\\n");
         v.push_str(&all_indexes.join(",\\\n"));
-        v.push_str("\\\n}');\nif (window.initSearch) {window.initSearch(searchIndex)};");
+        v.push_str(
+            r#"\
+}');
+if (typeof window !== 'undefined' && window.initSearch) {window.initSearch(searchIndex)};
+if (typeof exports !== 'undefined') {exports.searchIndex = searchIndex};
+"#,
+        );
         Ok(v.into_bytes())
     })?;
 
@@ -466,17 +504,16 @@ pub(super) fn write_shared(
             crate::markdown::render(&index_page, md_opts, cx.shared.edition())
                 .map_err(|e| Error::new(e, &index_page))?;
         } else {
+            let shared = Rc::clone(&cx.shared);
             let dst = cx.dst.join("index.html");
             let page = layout::Page {
                 title: "Index of crates",
                 css_class: "mod",
                 root_path: "./",
-                static_root_path: cx.shared.static_root_path.as_deref(),
+                static_root_path: shared.static_root_path.as_deref(),
                 description: "List of crates",
                 keywords: BASIC_KEYWORDS,
-                resource_suffix: &cx.shared.resource_suffix,
-                extra_scripts: &[],
-                static_extra_scripts: &[],
+                resource_suffix: &shared.resource_suffix,
             };
 
             let content = format!(
@@ -494,8 +531,8 @@ pub(super) fn write_shared(
                     })
                     .collect::<String>()
             );
-            let v = layout::render(&cx.shared.layout, &page, "", content, &cx.shared.style_files);
-            cx.shared.fs.write(dst, v)?;
+            let v = layout::render(&shared.layout, &page, "", content, &shared.style_files);
+            shared.fs.write(dst, v)?;
         }
     }
 
@@ -510,19 +547,36 @@ pub(super) fn write_shared(
         //
         // FIXME: this is a vague explanation for why this can't be a `get`, in
         //        theory it should be...
-        let &(ref remote_path, remote_item_type) = match cache.paths.get(&did) {
-            Some(p) => p,
+        let (remote_path, remote_item_type) = match cache.exact_paths.get(&did) {
+            Some(p) => match cache.paths.get(&did).or_else(|| cache.external_paths.get(&did)) {
+                Some((_, t)) => (p, t),
+                None => continue,
+            },
             None => match cache.external_paths.get(&did) {
-                Some(p) => p,
+                Some((p, t)) => (p, t),
                 None => continue,
             },
         };
 
-        #[derive(Serialize)]
         struct Implementor {
             text: String,
             synthetic: bool,
             types: Vec<String>,
+        }
+
+        impl Serialize for Implementor {
+            fn serialize<S>(&self, serializer: S) -> Result<S::Ok, S::Error>
+            where
+                S: Serializer,
+            {
+                let mut seq = serializer.serialize_seq(None)?;
+                seq.serialize_element(&self.text)?;
+                if self.synthetic {
+                    seq.serialize_element(&1)?;
+                    seq.serialize_element(&self.types)?;
+                }
+                seq.end()
+            }
         }
 
         let implementors = imps
@@ -535,7 +589,7 @@ pub(super) fn write_shared(
                 //
                 // If the implementation is from another crate then that crate
                 // should add it.
-                if imp.impl_item.def_id.krate() == did.krate || !imp.impl_item.def_id.is_local() {
+                if imp.impl_item.item_id.krate() == did.krate || !imp.impl_item.item_id.is_local() {
                     None
                 } else {
                     Some(Implementor {
@@ -555,9 +609,9 @@ pub(super) fn write_shared(
         }
 
         let implementors = format!(
-            r#"implementors["{}"] = {};"#,
+            r#""{}":{}"#,
             krate.name(cx.tcx()),
-            serde_json::to_string(&implementors).unwrap()
+            serde_json::to_string(&implementors).expect("failed serde conversion"),
         );
 
         let mut mydst = dst.clone();
@@ -568,16 +622,15 @@ pub(super) fn write_shared(
         mydst.push(&format!("{}.{}.js", remote_item_type, remote_path[remote_path.len() - 1]));
 
         let (mut all_implementors, _) =
-            try_err!(collect(&mydst, krate.name(cx.tcx()).as_str(), "implementors"), &mydst);
+            try_err!(collect(&mydst, krate.name(cx.tcx()).as_str()), &mydst);
         all_implementors.push(implementors);
         // Sort the implementors by crate so the file will be generated
         // identically even with rustdoc running in parallel.
         all_implementors.sort();
 
-        let mut v = String::from("(function() {var implementors = {};\n");
-        for implementor in &all_implementors {
-            writeln!(v, "{}", *implementor).unwrap();
-        }
+        let mut v = String::from("(function() {var implementors = {\n");
+        v.push_str(&all_implementors.join(",\n"));
+        v.push_str("\n};");
         v.push_str(
             "if (window.register_implementors) {\
                  window.register_implementors(implementors);\

@@ -7,18 +7,18 @@ use std::io::prelude::*;
 ///
 /// During the same compile all closures dump the information in the same file
 /// "closure_profile_XXXXX.csv", which is created in the directory where the compiler is invoked.
-crate fn dump_closure_profile<'tcx>(tcx: TyCtxt<'tcx>, closure_instance: Instance<'tcx>) {
+pub(crate) fn dump_closure_profile<'tcx>(tcx: TyCtxt<'tcx>, closure_instance: Instance<'tcx>) {
     let Ok(mut file) = OpenOptions::new()
         .create(true)
         .append(true)
         .open(&format!("closure_profile_{}.csv", std::process::id()))
     else {
-        eprintln!("Cound't open file for writing closure profile");
+        eprintln!("Couldn't open file for writing closure profile");
         return;
     };
 
-    let closure_def_id = closure_instance.def_id();
-    let typeck_results = tcx.typeck(closure_def_id.expect_local());
+    let closure_def_id = closure_instance.def_id().expect_local();
+    let typeck_results = tcx.typeck(closure_def_id);
 
     if typeck_results.closure_size_eval.contains_key(&closure_def_id) {
         let param_env = ty::ParamEnv::reveal_all();

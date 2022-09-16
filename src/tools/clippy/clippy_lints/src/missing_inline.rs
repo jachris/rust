@@ -44,7 +44,7 @@ declare_clippy_lint! {
     /// pub struct PubBaz;
     /// impl PubBaz {
     ///    fn private() {} // ok
-    ///    pub fn not_ptrivate() {} // missing #[inline]
+    ///    pub fn not_private() {} // missing #[inline]
     /// }
     ///
     /// impl Bar for PubBaz {
@@ -97,7 +97,7 @@ impl<'tcx> LateLintPass<'tcx> for MissingInline {
                 let attrs = cx.tcx.hir().attrs(it.hir_id());
                 check_missing_inline_attrs(cx, attrs, it.span, desc);
             },
-            hir::ItemKind::Trait(ref _is_auto, ref _unsafe, ref _generics, _bounds, trait_items) => {
+            hir::ItemKind::Trait(ref _is_auto, ref _unsafe, _generics, _bounds, trait_items) => {
                 // note: we need to check if the trait is exported so we can't use
                 // `LateLintPass::check_trait_item` here.
                 for tit in trait_items {
@@ -105,7 +105,7 @@ impl<'tcx> LateLintPass<'tcx> for MissingInline {
                     match tit_.kind {
                         hir::TraitItemKind::Const(..) | hir::TraitItemKind::Type(..) => {},
                         hir::TraitItemKind::Fn(..) => {
-                            if tit.defaultness.has_value() {
+                            if cx.tcx.impl_defaultness(tit.id.def_id).has_value() {
                                 // trait method with default body needs inline in case
                                 // an impl is not provided
                                 let desc = "a default trait method";
@@ -151,9 +151,11 @@ impl<'tcx> LateLintPass<'tcx> for MissingInline {
             hir::ImplItemKind::Const(..) | hir::ImplItemKind::TyAlias(_) => return,
         };
 
-        let trait_def_id = match cx.tcx.associated_item(impl_item.def_id).container {
-            TraitContainer(cid) => Some(cid),
-            ImplContainer(cid) => cx.tcx.impl_trait_ref(cid).map(|t| t.def_id),
+        let assoc_item = cx.tcx.associated_item(impl_item.def_id);
+        let container_id = assoc_item.container_id(cx.tcx);
+        let trait_def_id = match assoc_item.container {
+            TraitContainer => Some(container_id),
+            ImplContainer => cx.tcx.impl_trait_ref(container_id).map(|t| t.def_id),
         };
 
         if let Some(trait_def_id) = trait_def_id {

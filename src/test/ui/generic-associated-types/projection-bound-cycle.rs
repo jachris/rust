@@ -2,7 +2,6 @@
 // Make sure that we make sure that we don't allow arbitrary bounds to be
 // proven when a bound and a where clause of an associated type are the same.
 
-#![feature(generic_associated_types)]
 #![feature(trivial_bounds)]
 
 trait Print {
@@ -24,7 +23,7 @@ impl Foo for Number {
     // }
     // ```
     // which it is :)
-    type Item where str: Sized = str;
+    type Item = str where str: Sized;
 }
 
 struct OnlySized<T> where T: Sized { f: T }

@@ -1,5 +1,9 @@
 //! Related to out filenames of compilation (e.g. save analysis, binaries).
 use crate::config::{CrateType, Input, OutputFilenames, OutputType};
+use crate::errors::{
+    CrateNameDoesNotMatch, CrateNameEmpty, CrateNameInvalid, FileIsNotWriteable,
+    InvalidCharacterInCrateName,
+};
 use crate::Session;
 use rustc_ast as ast;
 use rustc_span::symbol::sym;
@@ -30,11 +34,7 @@ pub fn out_filename(
 /// read-only file.  We should be consistent.
 pub fn check_file_is_writeable(file: &Path, sess: &Session) {
     if !is_writeable(file) {
-        sess.fatal(&format!(
-            "output file {} is not writeable -- check its \
-                            permissions",
-            file.display()
-        ));
+        sess.emit_fatal(FileIsNotWriteable { file });
     }
 }
 
@@ -61,12 +61,7 @@ pub fn find_crate_name(sess: &Session, attrs: &[ast::Attribute], input: &Input) 
     if let Some(ref s) = sess.opts.crate_name {
         if let Some((attr, name)) = attr_crate_name {
             if name.as_str() != s {
-                let msg = format!(
-                    "`--crate-name` and `#[crate_name]` are \
-                                   required to match, but `{}` != `{}`",
-                    s, name
-                );
-                sess.span_err(attr.span, &msg);
+                sess.emit_err(CrateNameDoesNotMatch { span: attr.span, s, name });
             }
         }
         return validate(s.clone(), None);
@@ -78,12 +73,7 @@ pub fn find_crate_name(sess: &Session, attrs: &[ast::Attribute], input: &Input) 
     if let Input::File(ref path) = *input {
         if let Some(s) = path.file_stem().and_then(|s| s.to_str()) {
             if s.starts_with('-') {
-                let msg = format!(
-                    "crate names cannot start with a `-`, but \
-                                   `{}` has a leading hyphen",
-                    s
-                );
-                sess.err(&msg);
+                sess.emit_err(CrateNameInvalid { s });
             } else {
                 return validate(s.replace('-', "_"), None);
             }
@@ -96,15 +86,9 @@ pub fn find_crate_name(sess: &Session, attrs: &[ast::Attribute], input: &Input) 
 pub fn validate_crate_name(sess: &Session, s: &str, sp: Option<Span>) {
     let mut err_count = 0;
     {
-        let mut say = |s: &str| {
-            match sp {
-                Some(sp) => sess.span_err(sp, s),
-                None => sess.err(s),
-            }
-            err_count += 1;
-        };
         if s.is_empty() {
-            say("crate name must not be empty");
+            err_count += 1;
+            sess.emit_err(CrateNameEmpty { span: sp });
         }
         for c in s.chars() {
             if c.is_alphanumeric() {
@@ -113,7 +97,8 @@ pub fn validate_crate_name(sess: &Session, s: &str, sp: Option<Span>) {
             if c == '_' {
                 continue;
             }
-            say(&format!("invalid character `{}` in crate name: `{}`", c, s));
+            err_count += 1;
+            sess.emit_err(InvalidCharacterInCrateName { span: sp, character: c, crate_name: s });
         }
     }
 
@@ -137,7 +122,7 @@ pub fn filename_for_metadata(
     let out_filename = outputs
         .single_output_file
         .clone()
-        .unwrap_or_else(|| outputs.out_directory.join(&format!("lib{}.rmeta", libname)));
+        .unwrap_or_else(|| outputs.out_directory.join(&format!("lib{libname}.rmeta")));
 
     check_file_is_writeable(&out_filename, sess);
 
@@ -153,14 +138,14 @@ pub fn filename_for_input(
     let libname = format!("{}{}", crate_name, sess.opts.cg.extra_filename);
 
     match crate_type {
-        CrateType::Rlib => outputs.out_directory.join(&format!("lib{}.rlib", libname)),
+        CrateType::Rlib => outputs.out_directory.join(&format!("lib{libname}.rlib")),
         CrateType::Cdylib | CrateType::ProcMacro | CrateType::Dylib => {
             let (prefix, suffix) = (&sess.target.dll_prefix, &sess.target.dll_suffix);
-            outputs.out_directory.join(&format!("{}{}{}", prefix, libname, suffix))
+            outputs.out_directory.join(&format!("{prefix}{libname}{suffix}"))
         }
         CrateType::Staticlib => {
             let (prefix, suffix) = (&sess.target.staticlib_prefix, &sess.target.staticlib_suffix);
-            outputs.out_directory.join(&format!("{}{}{}", prefix, libname, suffix))
+            outputs.out_directory.join(&format!("{prefix}{libname}{suffix}"))
         }
         CrateType::Executable => {
             let suffix = &sess.target.exe_suffix;
@@ -185,24 +170,18 @@ pub fn default_output_for_target(sess: &Session) -> CrateType {
 
 /// Checks if target supports crate_type as output
 pub fn invalid_output_for_target(sess: &Session, crate_type: CrateType) -> bool {
-    match crate_type {
-        CrateType::Cdylib | CrateType::Dylib | CrateType::ProcMacro => {
-            if !sess.target.dynamic_linking {
-                return true;
-            }
-            if sess.crt_static(Some(crate_type)) && !sess.target.crt_static_allows_dylibs {
-                return true;
-            }
+    if let CrateType::Cdylib | CrateType::Dylib | CrateType::ProcMacro = crate_type {
+        if !sess.target.dynamic_linking {
+            return true;
         }
-        _ => {}
-    }
-    if sess.target.only_cdylib {
-        match crate_type {
-            CrateType::ProcMacro | CrateType::Dylib => return true,
-            _ => {}
+        if sess.crt_static(Some(crate_type)) && !sess.target.crt_static_allows_dylibs {
+            return true;
         }
     }
-    if !sess.target.executables && crate_type == CrateType::Executable {
+    if let CrateType::ProcMacro | CrateType::Dylib = crate_type && sess.target.only_cdylib {
+        return true;
+    }
+    if let CrateType::Executable = crate_type && !sess.target.executables {
         return true;
     }
 

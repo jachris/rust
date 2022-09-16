@@ -1,9 +1,9 @@
-use crate::def_id::{DefId, CRATE_DEF_INDEX, LOCAL_CRATE};
 use crate::hir;
 
 use rustc_ast as ast;
 use rustc_ast::NodeId;
 use rustc_macros::HashStable_Generic;
+use rustc_span::def_id::{DefId, LocalDefId};
 use rustc_span::hygiene::MacroKind;
 use rustc_span::Symbol;
 
@@ -45,8 +45,6 @@ pub enum NonMacroAttrKind {
     /// Single-segment custom attribute registered by a derive macro
     /// but used before that derive macro was expanded (deprecated).
     DeriveHelperCompat,
-    /// Single-segment custom attribute registered with `#[register_attr]`.
-    Registered,
 }
 
 /// What kind of definition something is; e.g., `mod` vs `struct`.
@@ -78,7 +76,7 @@ pub enum DefKind {
     Const,
     /// Constant generic parameter: `struct Foo<const N: usize> { ... }`
     ConstParam,
-    Static,
+    Static(ast::Mutability),
     /// Refers to the struct or enum variant's constructor.
     ///
     /// The reason `Ctor` exists in addition to [`DefKind::Struct`] and
@@ -92,6 +90,7 @@ pub enum DefKind {
     /// [RFC 2593]: https://github.com/rust-lang/rfcs/pull/2593
     Ctor(CtorOf, CtorKind),
     /// Associated function: `impl MyStruct { fn associated() {} }`
+    /// or `trait Foo { fn associated() {} }`
     AssocFn,
     /// Associated constant: `trait MyTrait { const ASSOC: usize; }`
     AssocConst,
@@ -110,6 +109,8 @@ pub enum DefKind {
     InlineConst,
     /// Opaque type, aka `impl Trait`.
     OpaqueTy,
+    /// A return-position `impl Trait` in a trait definition
+    ImplTraitPlaceholder,
     Field,
     /// Lifetime parameter: the `'a` in `struct Foo<'a> { ... }`
     LifetimeParam,
@@ -124,11 +125,9 @@ impl DefKind {
     pub fn descr(self, def_id: DefId) -> &'static str {
         match self {
             DefKind::Fn => "function",
-            DefKind::Mod if def_id.index == CRATE_DEF_INDEX && def_id.krate != LOCAL_CRATE => {
-                "crate"
-            }
+            DefKind::Mod if def_id.is_crate_root() && !def_id.is_local() => "crate",
             DefKind::Mod => "module",
-            DefKind::Static => "static",
+            DefKind::Static(..) => "static",
             DefKind::Enum => "enum",
             DefKind::Variant => "variant",
             DefKind::Ctor(CtorOf::Variant, CtorKind::Fn) => "tuple variant",
@@ -141,6 +140,7 @@ impl DefKind {
                 panic!("impossible struct constructor")
             }
             DefKind::OpaqueTy => "opaque type",
+            DefKind::ImplTraitPlaceholder => "opaque type in trait",
             DefKind::TyAlias => "type alias",
             DefKind::TraitAlias => "trait alias",
             DefKind::AssocTy => "associated type",
@@ -202,7 +202,7 @@ impl DefKind {
             DefKind::Fn
             | DefKind::Const
             | DefKind::ConstParam
-            | DefKind::Static
+            | DefKind::Static(..)
             | DefKind::Ctor(..)
             | DefKind::AssocFn
             | DefKind::AssocConst => Some(Namespace::ValueNS),
@@ -220,7 +220,54 @@ impl DefKind {
             | DefKind::Use
             | DefKind::ForeignMod
             | DefKind::GlobalAsm
-            | DefKind::Impl => None,
+            | DefKind::Impl
+            | DefKind::ImplTraitPlaceholder => None,
+        }
+    }
+
+    #[inline]
+    pub fn is_fn_like(self) -> bool {
+        match self {
+            DefKind::Fn | DefKind::AssocFn | DefKind::Closure | DefKind::Generator => true,
+            _ => false,
+        }
+    }
+
+    /// Whether `query get_codegen_attrs` should be used with this definition.
+    pub fn has_codegen_attrs(self) -> bool {
+        match self {
+            DefKind::Fn
+            | DefKind::AssocFn
+            | DefKind::Ctor(..)
+            | DefKind::Closure
+            | DefKind::Generator
+            | DefKind::Static(_) => true,
+            DefKind::Mod
+            | DefKind::Struct
+            | DefKind::Union
+            | DefKind::Enum
+            | DefKind::Variant
+            | DefKind::Trait
+            | DefKind::TyAlias
+            | DefKind::ForeignTy
+            | DefKind::TraitAlias
+            | DefKind::AssocTy
+            | DefKind::Const
+            | DefKind::AssocConst
+            | DefKind::Macro(..)
+            | DefKind::Use
+            | DefKind::ForeignMod
+            | DefKind::OpaqueTy
+            | DefKind::ImplTraitPlaceholder
+            | DefKind::Impl
+            | DefKind::Field
+            | DefKind::TyParam
+            | DefKind::ConstParam
+            | DefKind::LifetimeParam
+            | DefKind::AnonConst
+            | DefKind::InlineConst
+            | DefKind::GlobalAsm
+            | DefKind::ExternCrate => false,
         }
     }
 }
@@ -266,6 +313,7 @@ pub enum Res<Id = hir::HirId> {
     ///
     /// **Belongs to the type namespace.**
     PrimTy(hir::PrimTy),
+
     /// The `Self` type, optionally with the [`DefId`] of the trait it belongs to and
     /// optionally with the [`DefId`] of the item introducing the `Self` type alias.
     ///
@@ -306,13 +354,15 @@ pub enum Res<Id = hir::HirId> {
     /// HACK(min_const_generics): self types also have an optional requirement to **not** mention
     /// any generic parameters to allow the following with `min_const_generics`:
     /// ```
+    /// # struct Foo;
     /// impl Foo { fn test() -> [u8; std::mem::size_of::<Self>()] { todo!() } }
     ///
     /// struct Bar([u8; baz::<Self>()]);
     /// const fn baz<T>() -> usize { 10 }
     /// ```
     /// We do however allow `Self` in repeat expression even if it is generic to not break code
-    /// which already works on stable while causing the `const_evaluatable_unchecked` future compat lint:
+    /// which already works on stable while causing the `const_evaluatable_unchecked` future compat
+    /// lint:
     /// ```
     /// fn foo<T>() {
     ///     let _bar = [1_u8; std::mem::size_of::<*mut T>()];
@@ -327,6 +377,7 @@ pub enum Res<Id = hir::HirId> {
         /// from mentioning generics (i.e. when used in an anonymous constant).
         alias_to: Option<(DefId, bool)>,
     },
+
     /// A tool attribute module; e.g., the `rustfmt` in `#[rustfmt::skip]`.
     ///
     /// **Belongs to the type namespace.**
@@ -340,6 +391,7 @@ pub enum Res<Id = hir::HirId> {
     ///
     /// *See also [`Res::SelfTy`].*
     SelfCtor(DefId),
+
     /// A local variable or function parameter.
     ///
     /// **Belongs to the value namespace.**
@@ -410,7 +462,7 @@ impl PartialRes {
 
 /// Different kinds of symbols can coexist even if they share the same textual name.
 /// Therefore, they each have a separate universe (known as a "namespace").
-#[derive(Copy, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Debug)]
+#[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub enum Namespace {
     /// The type namespace includes `struct`s, `enum`s, `union`s, `trait`s, and `mod`s
     /// (and, by extension, crates).
@@ -519,15 +571,11 @@ impl NonMacroAttrKind {
             NonMacroAttrKind::DeriveHelper | NonMacroAttrKind::DeriveHelperCompat => {
                 "derive helper attribute"
             }
-            NonMacroAttrKind::Registered => "explicitly registered attribute",
         }
     }
 
     pub fn article(self) -> &'static str {
-        match self {
-            NonMacroAttrKind::Registered => "an",
-            _ => "a",
-        }
+        "a"
     }
 
     /// Users of some attributes cannot mark them as used, so they are considered always used.
@@ -536,7 +584,7 @@ impl NonMacroAttrKind {
             NonMacroAttrKind::Tool
             | NonMacroAttrKind::DeriveHelper
             | NonMacroAttrKind::DeriveHelperCompat => true,
-            NonMacroAttrKind::Builtin(..) | NonMacroAttrKind::Registered => false,
+            NonMacroAttrKind::Builtin(..) => false,
         }
     }
 }
@@ -611,9 +659,25 @@ impl<Id> Res<Id> {
         }
     }
 
+    pub fn apply_id<R, E>(self, mut map: impl FnMut(Id) -> Result<R, E>) -> Result<Res<R>, E> {
+        Ok(match self {
+            Res::Def(kind, id) => Res::Def(kind, id),
+            Res::SelfCtor(id) => Res::SelfCtor(id),
+            Res::PrimTy(id) => Res::PrimTy(id),
+            Res::Local(id) => Res::Local(map(id)?),
+            Res::SelfTy { trait_, alias_to } => Res::SelfTy { trait_, alias_to },
+            Res::ToolMod => Res::ToolMod,
+            Res::NonMacroAttr(attr_kind) => Res::NonMacroAttr(attr_kind),
+            Res::Err => Res::Err,
+        })
+    }
+
     #[track_caller]
     pub fn expect_non_local<OtherId>(self) -> Res<OtherId> {
-        self.map_id(|_| panic!("unexpected `Res::Local`"))
+        self.map_id(
+            #[track_caller]
+            |_| panic!("unexpected `Res::Local`"),
+        )
     }
 
     pub fn macro_kind(self) -> Option<MacroKind> {
@@ -644,4 +708,45 @@ impl<Id> Res<Id> {
     pub fn expected_in_tuple_struct_pat(&self) -> bool {
         matches!(self, Res::Def(DefKind::Ctor(_, CtorKind::Fn), _) | Res::SelfCtor(..))
     }
+
+    /// Returns whether such a resolved path can occur in a unit struct/variant pattern
+    pub fn expected_in_unit_struct_pat(&self) -> bool {
+        matches!(self, Res::Def(DefKind::Ctor(_, CtorKind::Const), _) | Res::SelfCtor(..))
+    }
+}
+
+/// Resolution for a lifetime appearing in a type.
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+pub enum LifetimeRes {
+    /// Successfully linked the lifetime to a generic parameter.
+    Param {
+        /// Id of the generic parameter that introduced it.
+        param: LocalDefId,
+        /// Id of the introducing place. That can be:
+        /// - an item's id, for the item's generic parameters;
+        /// - a TraitRef's ref_id, identifying the `for<...>` binder;
+        /// - a BareFn type's id.
+        ///
+        /// This information is used for impl-trait lifetime captures, to know when to or not to
+        /// capture any given lifetime.
+        binder: NodeId,
+    },
+    /// Created a generic parameter for an anonymous lifetime.
+    Fresh {
+        /// Id of the generic parameter that introduced it.
+        ///
+        /// Creating the associated `LocalDefId` is the responsibility of lowering.
+        param: NodeId,
+        /// Id of the introducing place. See `Param`.
+        binder: NodeId,
+    },
+    /// This variant is used for anonymous lifetimes that we did not resolve during
+    /// late resolution.  Those lifetimes will be inferred by typechecking.
+    Infer,
+    /// Explicit `'static` lifetime.
+    Static,
+    /// Resolution failure.
+    Error,
+    /// HACK: This is used to recover the NodeId of an elided lifetime.
+    ElidedAnchor { start: NodeId, end: NodeId },
 }

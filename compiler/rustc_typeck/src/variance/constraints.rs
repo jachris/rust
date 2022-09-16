@@ -5,7 +5,7 @@
 
 use hir::def_id::{DefId, LocalDefId};
 use rustc_hir as hir;
-use rustc_hir::itemlikevisit::ItemLikeVisitor;
+use rustc_hir::def::DefKind;
 use rustc_middle::ty::subst::{GenericArgKind, SubstsRef};
 use rustc_middle::ty::{self, Ty, TyCtxt};
 
@@ -34,11 +34,11 @@ pub struct Constraint<'a> {
 
 /// To build constraints, we visit one item (type, trait) at a time
 /// and look at its contents. So e.g., if we have
-///
-///     struct Foo<T> {
-///         b: Bar<T>
-///     }
-///
+/// ```ignore (illustrative)
+/// struct Foo<T> {
+///     b: Bar<T>
+/// }
+/// ```
 /// then while we are visiting `Bar<T>`, the `CurrentItem` would have
 /// the `DefId` and the start of `Foo`'s inferreds.
 pub struct CurrentItem {
@@ -62,66 +62,30 @@ pub fn add_constraints_from_crate<'a, 'tcx>(
         constraints: Vec::new(),
     };
 
-    tcx.hir().visit_all_item_likes(&mut constraint_cx);
+    let crate_items = tcx.hir_crate_items(());
 
-    constraint_cx
-}
+    for def_id in crate_items.definitions() {
+        let def_kind = tcx.def_kind(def_id);
+        match def_kind {
+            DefKind::Struct | DefKind::Union | DefKind::Enum => {
+                constraint_cx.build_constraints_for_item(def_id);
 
-impl<'a, 'tcx, 'v> ItemLikeVisitor<'v> for ConstraintContext<'a, 'tcx> {
-    fn visit_item(&mut self, item: &hir::Item<'_>) {
-        match item.kind {
-            hir::ItemKind::Struct(ref struct_def, _) | hir::ItemKind::Union(ref struct_def, _) => {
-                self.visit_node_helper(item.hir_id());
-
-                if let hir::VariantData::Tuple(..) = *struct_def {
-                    self.visit_node_helper(struct_def.ctor_hir_id().unwrap());
-                }
-            }
-
-            hir::ItemKind::Enum(ref enum_def, _) => {
-                self.visit_node_helper(item.hir_id());
-
-                for variant in enum_def.variants {
-                    if let hir::VariantData::Tuple(..) = variant.data {
-                        self.visit_node_helper(variant.data.ctor_hir_id().unwrap());
+                let adt = tcx.adt_def(def_id);
+                for variant in adt.variants() {
+                    if let Some(ctor) = variant.ctor_def_id {
+                        constraint_cx.build_constraints_for_item(ctor.expect_local());
                     }
                 }
             }
-
-            hir::ItemKind::Fn(..) => {
-                self.visit_node_helper(item.hir_id());
-            }
-
+            DefKind::Fn | DefKind::AssocFn => constraint_cx.build_constraints_for_item(def_id),
             _ => {}
         }
     }
 
-    fn visit_trait_item(&mut self, trait_item: &hir::TraitItem<'_>) {
-        if let hir::TraitItemKind::Fn(..) = trait_item.kind {
-            self.visit_node_helper(trait_item.hir_id());
-        }
-    }
-
-    fn visit_impl_item(&mut self, impl_item: &hir::ImplItem<'_>) {
-        if let hir::ImplItemKind::Fn(..) = impl_item.kind {
-            self.visit_node_helper(impl_item.hir_id());
-        }
-    }
-
-    fn visit_foreign_item(&mut self, foreign_item: &hir::ForeignItem<'_>) {
-        if let hir::ForeignItemKind::Fn(..) = foreign_item.kind {
-            self.visit_node_helper(foreign_item.hir_id());
-        }
-    }
+    constraint_cx
 }
 
 impl<'a, 'tcx> ConstraintContext<'a, 'tcx> {
-    fn visit_node_helper(&mut self, id: hir::HirId) {
-        let tcx = self.terms_cx.tcx;
-        let def_id = tcx.hir().local_def_id(id);
-        self.build_constraints_for_item(def_id);
-    }
-
     fn tcx(&self) -> TyCtxt<'tcx> {
         self.terms_cx.tcx
     }
@@ -135,8 +99,7 @@ impl<'a, 'tcx> ConstraintContext<'a, 'tcx> {
             return;
         }
 
-        let id = tcx.hir().local_def_id_to_hir_id(def_id);
-        let inferred_start = self.terms_cx.inferred_starts[&id];
+        let inferred_start = self.terms_cx.inferred_starts[&def_id];
         let current_item = &CurrentItem { inferred_start };
         match tcx.type_of(def_id).kind() {
             ty::Adt(def, _) => {
@@ -283,7 +246,7 @@ impl<'a, 'tcx> ConstraintContext<'a, 'tcx> {
             }
 
             ty::Adt(def, substs) => {
-                self.add_constraints_from_substs(current, def.did, substs, variance);
+                self.add_constraints_from_substs(current, def.did(), substs, variance);
             }
 
             ty::Projection(ref data) => {
@@ -294,7 +257,7 @@ impl<'a, 'tcx> ConstraintContext<'a, 'tcx> {
                 self.add_constraints_from_invariant_substs(current, substs, variance);
             }
 
-            ty::Dynamic(data, r) => {
+            ty::Dynamic(data, r, _) => {
                 // The type `Foo<T+'a>` is contravariant w/r/t `'a`:
                 let contra = self.contravariant(variance);
                 self.add_constraints_from_region(current, r, contra);
@@ -308,11 +271,11 @@ impl<'a, 'tcx> ConstraintContext<'a, 'tcx> {
                 }
 
                 for projection in data.projection_bounds() {
-                    match projection.skip_binder().term {
-                        ty::Term::Ty(ty) => {
+                    match projection.skip_binder().term.unpack() {
+                        ty::TermKind::Ty(ty) => {
                             self.add_constraints_from_ty(current, ty, self.invariant);
                         }
-                        ty::Term::Const(c) => {
+                        ty::TermKind::Const(c) => {
                             self.add_constraints_from_const(current, c, self.invariant)
                         }
                     }
@@ -362,8 +325,7 @@ impl<'a, 'tcx> ConstraintContext<'a, 'tcx> {
         }
 
         let (local, remote) = if let Some(def_id) = def_id.as_local() {
-            let id = self.tcx().hir().local_def_id_to_hir_id(def_id);
-            (Some(self.terms_cx.inferred_starts[&id]), None)
+            (Some(self.terms_cx.inferred_starts[&def_id]), None)
         } else {
             (None, Some(self.tcx().variances_of(def_id)))
         };
@@ -401,12 +363,12 @@ impl<'a, 'tcx> ConstraintContext<'a, 'tcx> {
     fn add_constraints_from_const(
         &mut self,
         current: &CurrentItem,
-        val: ty::Const<'tcx>,
+        c: ty::Const<'tcx>,
         variance: VarianceTermPtr<'a>,
     ) {
-        debug!("add_constraints_from_const(val={:?}, variance={:?})", val, variance);
+        debug!("add_constraints_from_const(c={:?}, variance={:?})", c, variance);
 
-        match &val.val() {
+        match &c.kind() {
             ty::ConstKind::Unevaluated(uv) => {
                 self.add_constraints_from_invariant_substs(current, uv.substs, variance);
             }
@@ -449,11 +411,7 @@ impl<'a, 'tcx> ConstraintContext<'a, 'tcx> {
                 // way early-bound regions do, so we skip them here.
             }
 
-            ty::ReFree(..)
-            | ty::ReVar(..)
-            | ty::RePlaceholder(..)
-            | ty::ReEmpty(_)
-            | ty::ReErased => {
+            ty::ReFree(..) | ty::ReVar(..) | ty::RePlaceholder(..) | ty::ReErased => {
                 // We don't expect to see anything but 'static or bound
                 // regions when visiting member types or method types.
                 bug!(

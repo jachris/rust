@@ -7,7 +7,6 @@ use std::path::{Path, PathBuf};
 
 use crate::search_paths::{PathKind, SearchPath};
 use rustc_fs_util::fix_windows_verbatim_for_gcc;
-use tracing::debug;
 
 #[derive(Copy, Clone)]
 pub enum FileMatch {
@@ -85,7 +84,7 @@ pub fn get_or_default_sysroot() -> PathBuf {
                 p.pop();
                 p
             }
-            Err(e) => panic!("failed to get current_exe: {}", e),
+            Err(e) => panic!("failed to get current_exe: {e}"),
         }
     }
 

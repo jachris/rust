@@ -15,16 +15,16 @@ pub fn placeholder(
     id: ast::NodeId,
     vis: Option<ast::Visibility>,
 ) -> AstFragment {
-    fn mac_placeholder() -> ast::MacCall {
-        ast::MacCall {
+    fn mac_placeholder() -> P<ast::MacCall> {
+        P(ast::MacCall {
             path: ast::Path { span: DUMMY_SP, segments: Vec::new(), tokens: None },
             args: P(ast::MacArgs::Empty),
             prior_type_ascription: None,
-        }
+        })
     }
 
     let ident = Ident::empty();
-    let attrs = Vec::new();
+    let attrs = ast::AttrVec::new();
     let vis = vis.unwrap_or(ast::Visibility {
         span: DUMMY_SP,
         kind: ast::VisibilityKind::Inherited,
@@ -49,7 +49,7 @@ pub fn placeholder(
         AstFragmentKind::Crate => AstFragment::Crate(ast::Crate {
             attrs: Default::default(),
             items: Default::default(),
-            span,
+            spans: ast::ModSpans { inner_span: span, ..Default::default() },
             id,
             is_placeholder: true,
         }),
@@ -149,6 +149,7 @@ pub fn placeholder(
                 ident,
                 is_placeholder: true,
                 kind: ast::GenericParamKind::Lifetime,
+                colon_span: None,
             }
         }]),
         AstFragmentKind::Params => AstFragment::Params(smallvec![ast::Param {

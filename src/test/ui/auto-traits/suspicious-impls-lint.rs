@@ -1,5 +1,7 @@
 #![deny(suspicious_auto_trait_impls)]
 
+use std::marker::PhantomData;
+
 struct MayImplementSendOk<T>(T);
 unsafe impl<T: Send> Send for MayImplementSendOk<T> {} // ok
 
@@ -28,6 +30,20 @@ unsafe impl<T: Send, U: Send> Send for TwoParamsFlipped<U, T> {} // ok
 
 struct TwoParamsSame<T, U>(T, U);
 unsafe impl<T: Send> Send for TwoParamsSame<T, T> {}
+//~^ ERROR
+//~| WARNING this will change its meaning
+
+pub struct WithPhantomDataNonSend<T, U>(PhantomData<*const T>, U);
+unsafe impl<T> Send for WithPhantomDataNonSend<T, i8> {} // ok
+
+pub struct WithPhantomDataSend<T, U>(PhantomData<T>, U);
+unsafe impl<T> Send for WithPhantomDataSend<*const T, i8> {}
+//~^ ERROR
+//~| WARNING this will change its meaning
+
+pub struct WithLifetime<'a, T>(&'a (), T);
+unsafe impl<T> Send for WithLifetime<'static, T> {} // ok
+unsafe impl<T> Sync for WithLifetime<'static, Vec<T>> {}
 //~^ ERROR
 //~| WARNING this will change its meaning
 

@@ -28,6 +28,12 @@ use std::fmt;
 /// Let's say I'm just some text will ya?
 /// ```
 ///
+/// A failing to run one:
+///
+/// ```should_panic
+/// panic!("tadam");
+/// ```
+///
 /// An inlined `code`!
 pub fn foo() {}
 
@@ -146,6 +152,10 @@ pub use crate::repro as repro2;
 /// ### Top-doc Prose sub-sub-heading
 ///
 /// Text below sub-sub-heading
+///
+/// #### You know the drill.
+///
+/// More text.
 pub struct HeavilyDocumentedStruct {
     /// # Title for field
     /// ## Sub-heading for field
@@ -274,3 +284,44 @@ impl EmptyTrait3 for HasEmptyTraits {}
 
 mod macros;
 pub use macros::*;
+
+#[doc(alias = "AliasForTheStdReexport")]
+pub use ::std as TheStdReexport;
+
+pub mod details {
+    /// We check the appearance of the `<details>`/`<summary>` in here.
+    ///
+    /// ## Hello
+    ///
+    /// <details>
+    /// <summary><h4>I'm a summary</h4></summary>
+    /// <div>I'm the content of the details!</div>
+    /// </details>
+    pub struct Details;
+}
+
+pub mod doc_block_table {
+
+    pub trait DocBlockTableTrait {
+        fn func();
+    }
+
+    /// Struct doc.
+    ///
+    /// | header1                  | header2                  |
+    /// |--------------------------|--------------------------|
+    /// | Lorem Ipsum, Lorem Ipsum | Lorem Ipsum, Lorem Ipsum |
+    pub struct DocBlockTable {}
+
+    impl DocBlockTableTrait for DocBlockTable {
+        /// Trait impl func doc for struct.
+        ///
+        /// | header1                  | header2                  |
+        /// |--------------------------|--------------------------|
+        /// | Lorem Ipsum, Lorem Ipsum | Lorem Ipsum, Lorem Ipsum |
+        fn func() {
+            println!();
+        }
+    }
+
+}

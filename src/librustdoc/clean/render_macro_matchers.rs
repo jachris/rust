@@ -1,4 +1,4 @@
-use rustc_ast::token::{self, BinOpToken, DelimToken};
+use rustc_ast::token::{self, BinOpToken, Delimiter};
 use rustc_ast::tokenstream::{TokenStream, TokenTree};
 use rustc_ast_pretty::pprust::state::State as Printer;
 use rustc_ast_pretty::pprust::PrintState;
@@ -43,7 +43,7 @@ pub(super) fn render_macro_matcher(tcx: TyCtxt<'_>, matcher: &TokenTree) -> Stri
         TokenTree::Delimited(_span, _delim, tts) => print_tts(&mut printer, tts),
         // Matcher which is not a Delimited is unexpected and should've failed
         // to compile, but we render whatever it is wrapped in parens.
-        TokenTree::Token(_) => print_tt(&mut printer, matcher),
+        TokenTree::Token(..) => print_tt(&mut printer, matcher),
     }
     printer.end();
     printer.break_offset_if_not_bol(0, -4);
@@ -69,9 +69,7 @@ fn snippet_equal_to_token(tcx: TyCtxt<'_>, matcher: &TokenTree) -> Option<String
         match rustc_parse::maybe_new_parser_from_source_str(&sess, file_name, snippet.clone()) {
             Ok(parser) => parser,
             Err(diagnostics) => {
-                for mut diagnostic in diagnostics {
-                    diagnostic.cancel();
-                }
+                drop(diagnostics);
                 return None;
             }
         };
@@ -79,7 +77,7 @@ fn snippet_equal_to_token(tcx: TyCtxt<'_>, matcher: &TokenTree) -> Option<String
     // Reparse a single token tree.
     let mut reparsed_trees = match parser.parse_all_token_trees() {
         Ok(reparsed_trees) => reparsed_trees,
-        Err(mut diagnostic) => {
+        Err(diagnostic) => {
             diagnostic.cancel();
             return None;
         }
@@ -95,7 +93,7 @@ fn snippet_equal_to_token(tcx: TyCtxt<'_>, matcher: &TokenTree) -> Option<String
 
 fn print_tt(printer: &mut Printer<'_>, tt: &TokenTree) {
     match tt {
-        TokenTree::Token(token) => {
+        TokenTree::Token(token, _) => {
             let token_str = printer.token_to_string(token);
             printer.word(token_str);
             if let token::DocComment(..) = token.kind {
@@ -106,11 +104,11 @@ fn print_tt(printer: &mut Printer<'_>, tt: &TokenTree) {
             let open_delim = printer.token_kind_to_string(&token::OpenDelim(*delim));
             printer.word(open_delim);
             if !tts.is_empty() {
-                if *delim == DelimToken::Brace {
+                if *delim == Delimiter::Brace {
                     printer.space();
                 }
                 print_tts(printer, tts);
-                if *delim == DelimToken::Brace {
+                if *delim == Delimiter::Brace {
                     printer.space();
                 }
             }
@@ -140,7 +138,7 @@ fn print_tts(printer: &mut Printer<'_>, tts: &TokenStream) {
     let mut state = Start;
     for tt in tts.trees() {
         let (needs_space, next_state) = match &tt {
-            TokenTree::Token(tt) => match (state, &tt.kind) {
+            TokenTree::Token(tt, _) => match (state, &tt.kind) {
                 (Dollar, token::Ident(..)) => (false, DollarIdent),
                 (DollarIdent, token::Colon) => (false, DollarIdentColon),
                 (DollarIdentColon, token::Ident(..)) => (false, Other),
@@ -164,16 +162,16 @@ fn print_tts(printer: &mut Printer<'_>, tts: &TokenStream) {
                 (_, _) => (true, Other),
             },
             TokenTree::Delimited(_, delim, _) => match (state, delim) {
-                (Dollar, DelimToken::Paren) => (false, DollarParen),
-                (Pound | PoundBang, DelimToken::Bracket) => (false, Other),
-                (Ident, DelimToken::Paren | DelimToken::Bracket) => (false, Other),
+                (Dollar, Delimiter::Parenthesis) => (false, DollarParen),
+                (Pound | PoundBang, Delimiter::Bracket) => (false, Other),
+                (Ident, Delimiter::Parenthesis | Delimiter::Bracket) => (false, Other),
                 (_, _) => (true, Other),
             },
         };
         if state != Start && needs_space {
             printer.space();
         }
-        print_tt(printer, &tt);
+        print_tt(printer, tt);
         state = next_state;
     }
 }

@@ -2,7 +2,7 @@
 // as "inreg" like the C/C++ compilers for the platforms.
 // x86 only.
 
-// compile-flags: --target i686-unknown-linux-gnu -C no-prepopulate-passes
+// compile-flags: --target i686-unknown-linux-gnu -O -C no-prepopulate-passes
 // needs-llvm-components: x86
 
 #![crate_type = "lib"]
@@ -19,7 +19,7 @@ pub mod tests {
     #[no_mangle]
     pub extern "fastcall" fn f1(_: i32, _: i32, _: i32) {}
 
-    // CHECK: @f2(i32* inreg %_1, i32* inreg %_2, i32* %_3)
+    // CHECK: @f2({{i32\*|ptr}} inreg %_1, {{i32\*|ptr}} inreg %_2, {{i32\*|ptr}} %_3)
     #[no_mangle]
     pub extern "fastcall" fn f2(_: *const i32, _: *const i32, _: *const i32) {}
 

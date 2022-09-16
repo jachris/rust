@@ -1,10 +1,9 @@
 #![feature(const_trait_impl)]
-#![feature(const_fn_trait_bound)] // FIXME is this needed?
 
+#[const_trait]
 trait ConstDefaultFn: Sized {
     fn b(self);
 
-    #[default_method_body_is_const]
     fn a(self) {
         self.b();
     }
@@ -24,7 +23,6 @@ impl const ConstDefaultFn for ConstImpl {
 const fn test() {
     NonConstImpl.a();
     //~^ ERROR the trait bound
-    //~| ERROR cannot call non-const fn
     ConstImpl.a();
 }
 

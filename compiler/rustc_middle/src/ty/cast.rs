@@ -15,6 +15,12 @@ pub enum IntTy {
     Char,
 }
 
+impl IntTy {
+    pub fn is_signed(self) -> bool {
+        matches!(self, Self::I)
+    }
+}
+
 // Valid types for the result of a non-coercion cast
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum CastTy<'tcx> {
@@ -27,6 +33,8 @@ pub enum CastTy<'tcx> {
     FnPtr,
     /// Raw pointers.
     Ptr(ty::TypeAndMut<'tcx>),
+    /// Casting into a `dyn*` value.
+    DynStar,
 }
 
 /// Cast Kind. See [RFC 401](https://rust-lang.github.io/rfcs/0401-coercions.html)
@@ -44,6 +52,7 @@ pub enum CastKind {
     ArrayPtrCast,
     FnPtrPtrCast,
     FnPtrAddrCast,
+    DynStarCast,
 }
 
 impl<'tcx> CastTy<'tcx> {
@@ -61,6 +70,7 @@ impl<'tcx> CastTy<'tcx> {
             ty::Adt(d, _) if d.is_enum() && d.is_payloadfree() => Some(CastTy::Int(IntTy::CEnum)),
             ty::RawPtr(mt) => Some(CastTy::Ptr(mt)),
             ty::FnPtr(..) => Some(CastTy::FnPtr),
+            ty::Dynamic(_, _, ty::DynStar) => Some(CastTy::DynStar),
             _ => None,
         }
     }

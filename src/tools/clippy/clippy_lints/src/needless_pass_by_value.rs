@@ -6,14 +6,16 @@ use clippy_utils::{get_trait_def_id, is_self, paths};
 use if_chain::if_chain;
 use rustc_ast::ast::Attribute;
 use rustc_data_structures::fx::FxHashSet;
-use rustc_errors::{Applicability, DiagnosticBuilder};
+use rustc_errors::{Applicability, Diagnostic};
 use rustc_hir::intravisit::FnKind;
-use rustc_hir::{BindingAnnotation, Body, FnDecl, GenericArg, HirId, Impl, ItemKind, Node, PatKind, QPath, TyKind};
+use rustc_hir::{
+    BindingAnnotation, Body, FnDecl, GenericArg, HirId, Impl, ItemKind, Mutability, Node, PatKind, QPath, TyKind,
+};
 use rustc_hir::{HirIdMap, HirIdSet};
 use rustc_infer::infer::TyCtxtInferExt;
 use rustc_lint::{LateContext, LateLintPass};
 use rustc_middle::mir::FakeReadCause;
-use rustc_middle::ty::{self, TypeFoldable};
+use rustc_middle::ty::{self, TypeVisitable};
 use rustc_session::{declare_lint_pass, declare_tool_lint};
 use rustc_span::symbol::kw;
 use rustc_span::{sym, Span};
@@ -70,7 +72,7 @@ macro_rules! need {
 }
 
 impl<'tcx> LateLintPass<'tcx> for NeedlessPassByValue {
-    #[allow(clippy::too_many_lines)]
+    #[expect(clippy::too_many_lines)]
     fn check_fn(
         &mut self,
         cx: &LateContext<'tcx>,
@@ -85,7 +87,7 @@ impl<'tcx> LateLintPass<'tcx> for NeedlessPassByValue {
         }
 
         match kind {
-            FnKind::ItemFn(.., header, _) => {
+            FnKind::ItemFn(.., header) => {
                 let attrs = cx.tcx.hir().attrs(hir_id);
                 if header.abi != Abi::Rust || requires_exact_signature(attrs) {
                     return;
@@ -171,7 +173,7 @@ impl<'tcx> LateLintPass<'tcx> for NeedlessPassByValue {
                 (
                     preds.iter().any(|t| cx.tcx.is_diagnostic_item(sym::Borrow, t.def_id())),
                     !preds.is_empty() && {
-                        let ty_empty_region = cx.tcx.mk_imm_ref(cx.tcx.lifetimes.re_root_empty, ty);
+                        let ty_empty_region = cx.tcx.mk_imm_ref(cx.tcx.lifetimes.re_erased, ty);
                         preds.iter().all(|t| {
                             let ty_params = t.trait_ref.substs.iter().skip(1).collect::<Vec<_>>();
                             implements_trait(cx, ty_empty_region, t.def_id(), &ty_params)
@@ -188,18 +190,19 @@ impl<'tcx> LateLintPass<'tcx> for NeedlessPassByValue {
                 if !implements_borrow_trait;
                 if !all_borrowable_trait;
 
-                if let PatKind::Binding(mode, canonical_id, ..) = arg.pat.kind;
+                if let PatKind::Binding(BindingAnnotation(_, Mutability::Not), canonical_id, ..) = arg.pat.kind;
                 if !moved_vars.contains(&canonical_id);
                 then {
-                    if mode == BindingAnnotation::Mutable || mode == BindingAnnotation::RefMut {
-                        continue;
-                    }
-
                     // Dereference suggestion
-                    let sugg = |diag: &mut DiagnosticBuilder<'_>| {
+                    let sugg = |diag: &mut Diagnostic| {
                         if let ty::Adt(def, ..) = ty.kind() {
-                            if let Some(span) = cx.tcx.hir().span_if_local(def.did) {
-                                if can_type_implement_copy(cx.tcx, cx.param_env, ty).is_ok() {
+                            if let Some(span) = cx.tcx.hir().span_if_local(def.did()) {
+                                if can_type_implement_copy(
+                                    cx.tcx,
+                                    cx.param_env,
+                                    ty,
+                                    traits::ObligationCause::dummy_with_span(span),
+                                ).is_ok() {
                                     diag.span_help(span, "consider marking this type as `Copy`");
                                 }
                             }
@@ -230,12 +233,13 @@ impl<'tcx> LateLintPass<'tcx> for NeedlessPassByValue {
                                 for (span, suggestion) in clone_spans {
                                     diag.span_suggestion(
                                         span,
-                                        &snippet_opt(cx, span)
+                                        snippet_opt(cx, span)
                                             .map_or(
                                                 "change the call to".into(),
                                                 |x| Cow::from(format!("change `{}` to", x)),
-                                            ),
-                                        suggestion.into(),
+                                            )
+                                            .as_ref(),
+                                        suggestion,
                                         Applicability::Unspecified,
                                     );
                                 }
@@ -252,19 +256,20 @@ impl<'tcx> LateLintPass<'tcx> for NeedlessPassByValue {
                                 diag.span_suggestion(
                                     input.span,
                                     "consider changing the type to",
-                                    "&str".to_string(),
+                                    "&str",
                                     Applicability::Unspecified,
                                 );
 
                                 for (span, suggestion) in clone_spans {
                                     diag.span_suggestion(
                                         span,
-                                        &snippet_opt(cx, span)
+                                        snippet_opt(cx, span)
                                             .map_or(
                                                 "change the call to".into(),
                                                 |x| Cow::from(format!("change `{}` to", x))
-                                            ),
-                                        suggestion.into(),
+                                            )
+                                            .as_ref(),
+                                        suggestion,
                                         Applicability::Unspecified,
                                     );
                                 }
@@ -336,5 +341,5 @@ impl<'tcx> euv::Delegate<'tcx> for MovedVariablesCtxt {
 
     fn mutate(&mut self, _: &euv::PlaceWithHirId<'tcx>, _: HirId) {}
 
-    fn fake_read(&mut self, _: rustc_typeck::expr_use_visitor::Place<'tcx>, _: FakeReadCause, _: HirId) {}
+    fn fake_read(&mut self, _: &rustc_typeck::expr_use_visitor::PlaceWithHirId<'tcx>, _: FakeReadCause, _: HirId) {}
 }

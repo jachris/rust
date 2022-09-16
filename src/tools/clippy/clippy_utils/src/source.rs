@@ -7,7 +7,8 @@ use rustc_errors::Applicability;
 use rustc_hir::{Expr, ExprKind};
 use rustc_lint::{LateContext, LintContext};
 use rustc_span::hygiene;
-use rustc_span::{BytePos, Pos, Span, SyntaxContext};
+use rustc_span::source_map::SourceMap;
+use rustc_span::{BytePos, Pos, Span, SpanData, SyntaxContext};
 use std::borrow::Cow;
 
 /// Like `snippet_block`, but add braces if the expr is not an `ExprKind::Block`.
@@ -89,7 +90,7 @@ pub fn is_present_in_source<T: LintContext>(cx: &T, span: Span) -> bool {
     true
 }
 
-/// Returns the positon just before rarrow
+/// Returns the position just before rarrow
 ///
 /// ```rust,ignore
 /// fn into(self) -> () {}
@@ -118,7 +119,7 @@ pub fn position_before_rarrow(s: &str) -> Option<usize> {
 }
 
 /// Reindent a multiline string with possibility of ignoring the first line.
-#[allow(clippy::needless_pass_by_value)]
+#[expect(clippy::needless_pass_by_value)]
 pub fn reindent_multiline(s: Cow<'_, str>, ignore_first: bool, indent: Option<usize>) -> Cow<'_, str> {
     let s_space = reindent_multiline_inner(&s, ignore_first, indent, ' ');
     let s_tab = reindent_multiline_inner(&s_space, ignore_first, indent, '\t');
@@ -334,7 +335,7 @@ pub fn snippet_with_context<'a>(
 /// span containing `m!(0)`.
 pub fn walk_span_to_context(span: Span, outer: SyntaxContext) -> Option<Span> {
     let outer_span = hygiene::walk_chain(span, outer);
-    (outer_span.ctxt() == outer).then(|| outer_span)
+    (outer_span.ctxt() == outer).then_some(outer_span)
 }
 
 /// Removes block comments from the given `Vec` of lines.
@@ -368,6 +369,27 @@ pub fn without_block_comments(lines: Vec<&str>) -> Vec<&str> {
     }
 
     without
+}
+
+/// Trims the whitespace from the start and the end of the span.
+pub fn trim_span(sm: &SourceMap, span: Span) -> Span {
+    let data = span.data();
+    let sf: &_ = &sm.lookup_source_file(data.lo);
+    let Some(src) = sf.src.as_deref() else {
+        return span;
+    };
+    let Some(snip) = &src.get((data.lo - sf.start_pos).to_usize()..(data.hi - sf.start_pos).to_usize()) else {
+        return span;
+    };
+    let trim_start = snip.len() - snip.trim_start().len();
+    let trim_end = snip.len() - snip.trim_end().len();
+    SpanData {
+        lo: data.lo + BytePos::from_usize(trim_start),
+        hi: data.hi - BytePos::from_usize(trim_end),
+        ctxt: data.ctxt,
+        parent: data.parent,
+    }
+    .span()
 }
 
 #[cfg(test)]

@@ -16,13 +16,12 @@ use rustc_data_structures::memmap::Mmap;
 use rustc_data_structures::owning_ref::OwningRef;
 use rustc_data_structures::rustc_erase_owner;
 use rustc_data_structures::sync::MetadataRef;
+use rustc_metadata::fs::METADATA_FILENAME;
 use rustc_metadata::EncodedMetadata;
 use rustc_session::cstore::MetadataLoader;
 use rustc_session::Session;
 use rustc_target::abi::Endian;
-use rustc_target::spec::Target;
-
-use crate::METADATA_FILENAME;
+use rustc_target::spec::{RelocModel, Target};
 
 /// The default metadata loader. This is used by cg_llvm and cg_clif.
 ///
@@ -94,7 +93,7 @@ fn search_for_metadata<'a>(
         .map_err(|e| format!("failed to read {} section in '{}': {}", section, path.display(), e))
 }
 
-fn create_object_file(sess: &Session) -> Option<write::Object<'static>> {
+pub(crate) fn create_object_file(sess: &Session) -> Option<write::Object<'static>> {
     let endianness = match sess.target.options.endian {
         Endian::Little => Endianness::Little,
         Endian::Big => Endianness::Big,
@@ -130,18 +129,26 @@ fn create_object_file(sess: &Session) -> Option<write::Object<'static>> {
     };
 
     let mut file = write::Object::new(binary_format, architecture, endianness);
-    match architecture {
+    let e_flags = match architecture {
         Architecture::Mips => {
-            // copied from `mipsel-linux-gnu-gcc foo.c -c` and
-            // inspecting the resulting `e_flags` field.
-            let e_flags = elf::EF_MIPS_CPIC
-                | elf::EF_MIPS_PIC
-                | if sess.target.options.cpu.contains("r6") {
-                    elf::EF_MIPS_ARCH_32R6 | elf::EF_MIPS_NAN2008
-                } else {
-                    elf::EF_MIPS_ARCH_32R2
-                };
-            file.flags = FileFlags::Elf { e_flags };
+            let arch = match sess.target.options.cpu.as_ref() {
+                "mips1" => elf::EF_MIPS_ARCH_1,
+                "mips2" => elf::EF_MIPS_ARCH_2,
+                "mips3" => elf::EF_MIPS_ARCH_3,
+                "mips4" => elf::EF_MIPS_ARCH_4,
+                "mips5" => elf::EF_MIPS_ARCH_5,
+                s if s.contains("r6") => elf::EF_MIPS_ARCH_32R6,
+                _ => elf::EF_MIPS_ARCH_32R2,
+            };
+            // The only ABI LLVM supports for 32-bit MIPS CPUs is o32.
+            let mut e_flags = elf::EF_MIPS_CPIC | elf::EF_MIPS_ABI_O32 | arch;
+            if sess.target.options.relocation_model != RelocModel::Static {
+                e_flags |= elf::EF_MIPS_PIC;
+            }
+            if sess.target.options.cpu.contains("r6") {
+                e_flags |= elf::EF_MIPS_NAN2008;
+            }
+            e_flags
         }
         Architecture::Mips64 => {
             // copied from `mips64el-linux-gnuabi64-gcc foo.c -c`
@@ -152,17 +159,26 @@ fn create_object_file(sess: &Session) -> Option<write::Object<'static>> {
                 } else {
                     elf::EF_MIPS_ARCH_64R2
                 };
-            file.flags = FileFlags::Elf { e_flags };
+            e_flags
         }
         Architecture::Riscv64 if sess.target.options.features.contains("+d") => {
             // copied from `riscv64-linux-gnu-gcc foo.c -c`, note though
             // that the `+d` target feature represents whether the double
             // float abi is enabled.
             let e_flags = elf::EF_RISCV_RVC | elf::EF_RISCV_FLOAT_ABI_DOUBLE;
-            file.flags = FileFlags::Elf { e_flags };
+            e_flags
         }
-        _ => {}
+        _ => 0,
     };
+    // adapted from LLVM's `MCELFObjectTargetWriter::getOSABI`
+    let os_abi = match sess.target.options.os.as_ref() {
+        "hermit" => elf::ELFOSABI_STANDALONE,
+        "freebsd" => elf::ELFOSABI_FREEBSD,
+        "solaris" => elf::ELFOSABI_SOLARIS,
+        _ => elf::ELFOSABI_NONE,
+    };
+    let abi_version = 0;
+    file.flags = FileFlags::Elf { os_abi, abi_version, e_flags };
     Some(file)
 }
 
@@ -171,12 +187,12 @@ pub enum MetadataPosition {
     Last,
 }
 
-// For rlibs we "pack" rustc metadata into a dummy object file. When rustc
-// creates a dylib crate type it will pass `--whole-archive` (or the
-// platform equivalent) to include all object files from an rlib into the
-// final dylib itself. This causes linkers to iterate and try to include all
-// files located in an archive, so if metadata is stored in an archive then
-// it needs to be of a form that the linker will be able to process.
+// For rlibs we "pack" rustc metadata into a dummy object file.
+//
+// Historically it was needed because rustc linked rlibs as whole-archive in some cases.
+// In that case linkers try to include all files located in an archive, so if metadata is stored
+// in an archive then it needs to be of a form that the linker is able to process.
+// Now it's not clear whether metadata still needs to be wrapped into an object file or not.
 //
 // Note, though, that we don't actually want this metadata to show up in any
 // final output of the compiler. Instead this is purely for rustc's own

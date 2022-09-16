@@ -316,7 +316,7 @@ impl<'hir> Sig for hir::Ty<'hir> {
                 let text = format!("[{}; {}]", nested_ty.text, expr);
                 Ok(replace_text(nested_ty, text))
             }
-            hir::TyKind::OpaqueDef(item_id, _) => {
+            hir::TyKind::OpaqueDef(item_id, _, _) => {
                 let item = scx.tcx.hir().item(item_id);
                 item.make(offset, Some(item_id.hir_id()), scx)
             }
@@ -416,7 +416,7 @@ impl<'hir> Sig for hir::Item<'hir> {
 
                 Ok(sig)
             }
-            hir::ItemKind::Macro(_) => {
+            hir::ItemKind::Macro(..) => {
                 let mut text = "macro".to_owned();
                 let name = self.ident.to_string();
                 text.push_str(&name);
@@ -561,7 +561,13 @@ impl<'hir> Sig for hir::Item<'hir> {
             hir::ItemKind::ForeignMod { .. } => Err("extern mod"),
             hir::ItemKind::GlobalAsm(_) => Err("global asm"),
             hir::ItemKind::ExternCrate(_) => Err("extern crate"),
-            hir::ItemKind::OpaqueTy(..) => Err("opaque type"),
+            hir::ItemKind::OpaqueTy(ref opaque) => {
+                if opaque.in_trait {
+                    Err("opaque type in trait")
+                } else {
+                    Err("opaque type")
+                }
+            }
             // FIXME should implement this (e.g., pub use).
             hir::ItemKind::Use(..) => Err("import"),
         }
@@ -628,31 +634,6 @@ impl<'hir> Sig for hir::Generics<'hir> {
                 if let Some(default) = default {
                     param_text.push_str(" = ");
                     param_text.push_str(&id_to_string(&scx.tcx.hir(), default.hir_id));
-                }
-            }
-            if !param.bounds.is_empty() {
-                param_text.push_str(": ");
-                match param.kind {
-                    hir::GenericParamKind::Lifetime { .. } => {
-                        let bounds = param
-                            .bounds
-                            .iter()
-                            .map(|bound| match bound {
-                                hir::GenericBound::Outlives(lt) => lt.name.ident().to_string(),
-                                _ => panic!(),
-                            })
-                            .collect::<Vec<_>>()
-                            .join(" + ");
-                        param_text.push_str(&bounds);
-                        // FIXME add lifetime bounds refs.
-                    }
-                    hir::GenericParamKind::Type { .. } => {
-                        param_text.push_str(&bounds_to_string(param.bounds));
-                        // FIXME descend properly into bounds.
-                    }
-                    hir::GenericParamKind::Const { .. } => {
-                        // Const generics cannot contain bounds.
-                    }
                 }
             }
             text.push_str(&param_text);

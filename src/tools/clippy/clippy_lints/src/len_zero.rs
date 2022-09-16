@@ -248,23 +248,23 @@ enum LenOutput<'tcx> {
 fn parse_len_output<'tcx>(cx: &LateContext<'_>, sig: FnSig<'tcx>) -> Option<LenOutput<'tcx>> {
     match *sig.output().kind() {
         ty::Int(_) | ty::Uint(_) => Some(LenOutput::Integral),
-        ty::Adt(adt, subs) if cx.tcx.is_diagnostic_item(sym::Option, adt.did) => {
-            subs.type_at(0).is_integral().then(|| LenOutput::Option(adt.did))
+        ty::Adt(adt, subs) if cx.tcx.is_diagnostic_item(sym::Option, adt.did()) => {
+            subs.type_at(0).is_integral().then(|| LenOutput::Option(adt.did()))
         },
-        ty::Adt(adt, subs) if cx.tcx.is_diagnostic_item(sym::Result, adt.did) => subs
+        ty::Adt(adt, subs) if cx.tcx.is_diagnostic_item(sym::Result, adt.did()) => subs
             .type_at(0)
             .is_integral()
-            .then(|| LenOutput::Result(adt.did, subs.type_at(1))),
+            .then(|| LenOutput::Result(adt.did(), subs.type_at(1))),
         _ => None,
     }
 }
 
-impl LenOutput<'_> {
-    fn matches_is_empty_output(self, ty: Ty<'_>) -> bool {
+impl<'tcx> LenOutput<'tcx> {
+    fn matches_is_empty_output(self, ty: Ty<'tcx>) -> bool {
         match (self, ty.kind()) {
             (_, &ty::Bool) => true,
-            (Self::Option(id), &ty::Adt(adt, subs)) if id == adt.did => subs.type_at(0).is_bool(),
-            (Self::Result(id, err_ty), &ty::Adt(adt, subs)) if id == adt.did => {
+            (Self::Option(id), &ty::Adt(adt, subs)) if id == adt.did() => subs.type_at(0).is_bool(),
+            (Self::Result(id, err_ty), &ty::Adt(adt, subs)) if id == adt.did() => {
                 subs.type_at(0).is_bool() && subs.type_at(1) == err_ty
             },
             _ => false,
@@ -292,7 +292,7 @@ impl LenOutput<'_> {
 }
 
 /// Checks if the given signature matches the expectations for `is_empty`
-fn check_is_empty_sig(sig: FnSig<'_>, self_kind: ImplicitSelfKind, len_output: LenOutput<'_>) -> bool {
+fn check_is_empty_sig<'tcx>(sig: FnSig<'tcx>, self_kind: ImplicitSelfKind, len_output: LenOutput<'tcx>) -> bool {
     match &**sig.inputs_and_output {
         [arg, res] if len_output.matches_is_empty_output(*res) => {
             matches!(
@@ -306,11 +306,11 @@ fn check_is_empty_sig(sig: FnSig<'_>, self_kind: ImplicitSelfKind, len_output: L
 }
 
 /// Checks if the given type has an `is_empty` method with the appropriate signature.
-fn check_for_is_empty(
-    cx: &LateContext<'_>,
+fn check_for_is_empty<'tcx>(
+    cx: &LateContext<'tcx>,
     span: Span,
     self_kind: ImplicitSelfKind,
-    output: LenOutput<'_>,
+    output: LenOutput<'tcx>,
     impl_ty: DefId,
     item_name: Symbol,
     item_kind: &str,
@@ -370,7 +370,8 @@ fn check_for_is_empty(
 }
 
 fn check_cmp(cx: &LateContext<'_>, span: Span, method: &Expr<'_>, lit: &Expr<'_>, op: &str, compare_to: u32) {
-    if let (&ExprKind::MethodCall(method_path, args, _), &ExprKind::Lit(ref lit)) = (&method.kind, &lit.kind) {
+    if let (&ExprKind::MethodCall(method_path, receiver, args, _), &ExprKind::Lit(ref lit)) = (&method.kind, &lit.kind)
+    {
         // check if we are in an is_empty() method
         if let Some(name) = get_item_name(cx, method) {
             if name.as_str() == "is_empty" {
@@ -378,16 +379,28 @@ fn check_cmp(cx: &LateContext<'_>, span: Span, method: &Expr<'_>, lit: &Expr<'_>
             }
         }
 
-        check_len(cx, span, method_path.ident.name, args, &lit.node, op, compare_to);
+        check_len(
+            cx,
+            span,
+            method_path.ident.name,
+            receiver,
+            args,
+            &lit.node,
+            op,
+            compare_to,
+        );
     } else {
         check_empty_expr(cx, span, method, lit, op);
     }
 }
 
+// FIXME(flip1995): Figure out how to reduce the number of arguments
+#[allow(clippy::too_many_arguments)]
 fn check_len(
     cx: &LateContext<'_>,
     span: Span,
     method_name: Symbol,
+    receiver: &Expr<'_>,
     args: &[Expr<'_>],
     lit: &LitKind,
     op: &str,
@@ -399,7 +412,7 @@ fn check_len(
             return;
         }
 
-        if method_name == sym::len && args.len() == 1 && has_is_empty(cx, &args[0]) {
+        if method_name == sym::len && args.is_empty() && has_is_empty(cx, receiver) {
             let mut applicability = Applicability::MachineApplicable;
             span_lint_and_sugg(
                 cx,
@@ -410,7 +423,7 @@ fn check_len(
                 format!(
                     "{}{}.is_empty()",
                     op,
-                    snippet_with_applicability(cx, args[0].span, "_", &mut applicability)
+                    snippet_with_applicability(cx, receiver.span, "_", &mut applicability)
                 ),
                 applicability,
             );
@@ -488,7 +501,7 @@ fn has_is_empty(cx: &LateContext<'_>, expr: &Expr<'_>) -> bool {
                 .any(|item| is_is_empty(cx, item))
         }),
         ty::Projection(ref proj) => has_is_empty_impl(cx, proj.item_def_id),
-        ty::Adt(id, _) => has_is_empty_impl(cx, id.did),
+        ty::Adt(id, _) => has_is_empty_impl(cx, id.did()),
         ty::Array(..) | ty::Slice(..) | ty::Str => true,
         _ => false,
     }

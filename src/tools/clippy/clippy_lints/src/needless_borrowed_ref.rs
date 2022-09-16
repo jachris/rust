@@ -27,16 +27,17 @@ declare_clippy_lint! {
     /// ```
     ///
     /// ### Example
-    /// Bad:
     /// ```rust
     /// let mut v = Vec::<String>::new();
-    /// let _ = v.iter_mut().filter(|&ref a| a.is_empty());
+    /// # #[allow(unused)]
+    /// v.iter_mut().filter(|&ref a| a.is_empty());
     /// ```
     ///
-    /// Good:
+    /// Use instead:
     /// ```rust
     /// let mut v = Vec::<String>::new();
-    /// let _ = v.iter_mut().filter(|a| a.is_empty());
+    /// # #[allow(unused)]
+    /// v.iter_mut().filter(|a| a.is_empty());
     /// ```
     #[clippy::version = "pre 1.29.0"]
     pub NEEDLESS_BORROWED_REFERENCE,
@@ -58,7 +59,7 @@ impl<'tcx> LateLintPass<'tcx> for NeedlessBorrowedRef {
             if let PatKind::Ref(sub_pat, Mutability::Not) = pat.kind;
 
             // Check sub_pat got a `ref` keyword (excluding `ref mut`).
-            if let PatKind::Binding(BindingAnnotation::Ref, .., spanned_name, _) = sub_pat.kind;
+            if let PatKind::Binding(BindingAnnotation::REF, .., spanned_name, _) = sub_pat.kind;
             let parent_id = cx.tcx.hir().get_parent_node(pat.hir_id);
             if let Some(parent_node) = cx.tcx.hir().find(parent_id);
             then {

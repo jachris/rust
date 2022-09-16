@@ -1,7 +1,7 @@
 use clippy_utils::diagnostics::{span_lint_and_help, span_lint_and_sugg, span_lint_and_then};
 use clippy_utils::source::{snippet, snippet_with_applicability};
 use clippy_utils::ty::is_non_aggregate_primitive_type;
-use clippy_utils::{is_default_equivalent, is_lang_ctor, match_def_path, meets_msrv, msrvs, paths};
+use clippy_utils::{is_default_equivalent, is_lang_ctor, meets_msrv, msrvs};
 use if_chain::if_chain;
 use rustc_errors::Applicability;
 use rustc_hir::LangItem::OptionNone;
@@ -163,8 +163,7 @@ fn check_replace_with_uninit(cx: &LateContext<'_>, src: &Expr<'_>, dest: &Expr<'
     }
 
     if_chain! {
-        if let ExprKind::Call(repl_func, repl_args) = src.kind;
-        if repl_args.is_empty();
+        if let ExprKind::Call(repl_func, []) = src.kind;
         if let ExprKind::Path(ref repl_func_qpath) = repl_func.kind;
         if let Some(repl_def_id) = cx.qpath_res(repl_func_qpath, repl_func.hir_id).opt_def_id();
         then {
@@ -246,15 +245,14 @@ impl<'tcx> LateLintPass<'tcx> for MemReplace {
     fn check_expr(&mut self, cx: &LateContext<'tcx>, expr: &'tcx Expr<'_>) {
         if_chain! {
             // Check that `expr` is a call to `mem::replace()`
-            if let ExprKind::Call(func, func_args) = expr.kind;
+            if let ExprKind::Call(func, [dest, src]) = expr.kind;
             if let ExprKind::Path(ref func_qpath) = func.kind;
             if let Some(def_id) = cx.qpath_res(func_qpath, func.hir_id).opt_def_id();
-            if match_def_path(cx, def_id, &paths::MEM_REPLACE);
-            if let [dest, src] = func_args;
+            if cx.tcx.is_diagnostic_item(sym::mem_replace, def_id);
             then {
                 check_replace_option_with_none(cx, src, dest, expr.span);
                 check_replace_with_uninit(cx, src, dest, expr.span);
-                if meets_msrv(self.msrv.as_ref(), &msrvs::MEM_TAKE) {
+                if meets_msrv(self.msrv, msrvs::MEM_TAKE) {
                     check_replace_with_default(cx, src, dest, expr.span);
                 }
             }

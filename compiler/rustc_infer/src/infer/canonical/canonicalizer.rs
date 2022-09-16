@@ -11,7 +11,7 @@ use crate::infer::canonical::{
 };
 use crate::infer::InferCtxt;
 use rustc_middle::ty::flags::FlagComputation;
-use rustc_middle::ty::fold::{TypeFoldable, TypeFolder};
+use rustc_middle::ty::fold::{TypeFoldable, TypeFolder, TypeSuperFoldable};
 use rustc_middle::ty::subst::GenericArg;
 use rustc_middle::ty::{self, BoundVar, InferConst, List, Ty, TyCtxt, TypeFlags};
 use std::sync::atomic::Ordering;
@@ -87,9 +87,9 @@ impl<'cx, 'tcx> InferCtxt<'cx, 'tcx> {
     ///
     /// with a mapping M that maps `'?0` to `'static`. But if we found that there
     /// exists only one possible impl of `Trait`, and it looks like
-    ///
-    ///     impl<T> Trait<'static> for T { .. }
-    ///
+    /// ```ignore (illustrative)
+    /// impl<T> Trait<'static> for T { .. }
+    /// ```
     /// then we would prepare a query result R that (among other
     /// things) includes a mapping to `'?0 := 'static`. When
     /// canonicalizing this query result R, we would leave this
@@ -180,11 +180,7 @@ impl CanonicalizeMode for CanonicalizeQueryResponse {
         r: ty::Region<'tcx>,
     ) -> ty::Region<'tcx> {
         match *r {
-            ty::ReFree(_)
-            | ty::ReErased
-            | ty::ReStatic
-            | ty::ReEmpty(ty::UniverseIndex::ROOT)
-            | ty::ReEarlyBound(..) => r,
+            ty::ReFree(_) | ty::ReErased | ty::ReStatic | ty::ReEarlyBound(..) => r,
 
             ty::RePlaceholder(placeholder) => canonicalizer.canonical_var_for_region(
                 CanonicalVarInfo { kind: CanonicalVarKind::PlaceholderRegion(placeholder) },
@@ -197,10 +193,6 @@ impl CanonicalizeMode for CanonicalizeQueryResponse {
                     CanonicalVarInfo { kind: CanonicalVarKind::Region(universe) },
                     r,
                 )
-            }
-
-            ty::ReEmpty(ui) => {
-                bug!("canonicalizing 'empty in universe {:?}", ui) // FIXME
             }
 
             _ => {
@@ -372,7 +364,7 @@ impl<'cx, 'tcx> TypeFolder<'tcx> for Canonicalizer<'cx, 'tcx> {
                 debug!(
                     "canonical: region var found with vid {:?}, \
                      opportunistically resolved to {:?}",
-                    vid, r
+                    vid, resolved_vid
                 );
                 let r = self.tcx.reuse_or_mk_region(r, ty::ReVar(resolved_vid));
                 self.canonicalize_mode.canonicalize_free_region(self, r)
@@ -381,7 +373,6 @@ impl<'cx, 'tcx> TypeFolder<'tcx> for Canonicalizer<'cx, 'tcx> {
             ty::ReStatic
             | ty::ReEarlyBound(..)
             | ty::ReFree(_)
-            | ty::ReEmpty(_)
             | ty::RePlaceholder(..)
             | ty::ReErased => self.canonicalize_mode.canonicalize_free_region(self, r),
         }
@@ -476,7 +467,7 @@ impl<'cx, 'tcx> TypeFolder<'tcx> for Canonicalizer<'cx, 'tcx> {
     }
 
     fn fold_const(&mut self, ct: ty::Const<'tcx>) -> ty::Const<'tcx> {
-        match ct.val() {
+        match ct.kind() {
             ty::ConstKind::Infer(InferConst::Var(vid)) => {
                 debug!("canonical: const var found with vid {:?}", vid);
                 match self.infcx.probe_const_var(vid) {
@@ -511,7 +502,9 @@ impl<'cx, 'tcx> TypeFolder<'tcx> for Canonicalizer<'cx, 'tcx> {
             }
             ty::ConstKind::Placeholder(placeholder) => {
                 return self.canonicalize_const_var(
-                    CanonicalVarInfo { kind: CanonicalVarKind::PlaceholderConst(placeholder) },
+                    CanonicalVarInfo {
+                        kind: CanonicalVarKind::PlaceholderConst(placeholder, ct.ty()),
+                    },
                     ct,
                 );
             }
@@ -695,11 +688,14 @@ impl<'cx, 'tcx> Canonicalizer<'cx, 'tcx> {
                             ..placeholder
                         })
                     }
-                    CanonicalVarKind::PlaceholderConst(placeholder) => {
-                        CanonicalVarKind::PlaceholderConst(ty::Placeholder {
-                            universe: reverse_universe_map[&placeholder.universe],
-                            ..placeholder
-                        })
+                    CanonicalVarKind::PlaceholderConst(placeholder, t) => {
+                        CanonicalVarKind::PlaceholderConst(
+                            ty::Placeholder {
+                                universe: reverse_universe_map[&placeholder.universe],
+                                ..placeholder
+                            },
+                            t,
+                        )
                     }
                 },
             })
@@ -778,7 +774,7 @@ impl<'cx, 'tcx> Canonicalizer<'cx, 'tcx> {
         } else {
             let var = self.canonical_var(info, const_var.into());
             self.tcx().mk_const(ty::ConstS {
-                val: ty::ConstKind::Bound(self.binder_index, var),
+                kind: ty::ConstKind::Bound(self.binder_index, var),
                 ty: self.fold_ty(const_var.ty()),
             })
         }

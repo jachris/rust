@@ -102,9 +102,9 @@ impl<'tcx> LateLintPass<'tcx> for UnnecessaryWraps {
 
         // Get the wrapper and inner types, if can't, abort.
         let (return_type_label, lang_item, inner_type) = if let ty::Adt(adt_def, subst) = return_ty(cx, hir_id).kind() {
-            if cx.tcx.is_diagnostic_item(sym::Option, adt_def.did) {
+            if cx.tcx.is_diagnostic_item(sym::Option, adt_def.did()) {
                 ("Option", OptionSome, subst.type_at(0))
-            } else if cx.tcx.is_diagnostic_item(sym::Result, adt_def.did) {
+            } else if cx.tcx.is_diagnostic_item(sym::Result, adt_def.did()) {
                 ("Result", ResultOk, subst.type_at(0))
             } else {
                 return;
@@ -115,7 +115,7 @@ impl<'tcx> LateLintPass<'tcx> for UnnecessaryWraps {
 
         // Check if all return expression respect the following condition and collect them.
         let mut suggs = Vec::new();
-        let can_sugg = find_all_ret_expressions(cx, &body.value, |ret_expr| {
+        let can_sugg = find_all_ret_expressions(cx, body.value, |ret_expr| {
             if_chain! {
                 if !ret_expr.span.from_expansion();
                 // Check if a function call.
@@ -130,7 +130,7 @@ impl<'tcx> LateLintPass<'tcx> for UnnecessaryWraps {
                         (
                             ret_expr.span,
                             if inner_type.is_unit() {
-                                "".to_string()
+                                String::new()
                             } else {
                                 snippet(cx, arg.span.source_callsite(), "..").to_string()
                             }

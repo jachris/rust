@@ -48,7 +48,7 @@ fn expand<'cx>(
     MacEager::expr(
         cx.expr(
             sp,
-            ExprKind::MacCall(MacCall {
+            ExprKind::MacCall(P(MacCall {
                 path: Path {
                     span: sp,
                     segments: cx
@@ -64,13 +64,13 @@ fn expand<'cx>(
                     tts,
                 )),
                 prior_type_ascription: None,
-            }),
+            })),
         ),
     )
 }
 
 pub fn use_panic_2021(mut span: Span) -> bool {
-    // To determine the editon, we check the first span up the expansion
+    // To determine the edition, we check the first span up the expansion
     // stack that does not have #[allow_internal_unstable(edition_panic)].
     // (To avoid using the edition of e.g. the assert!() or debug_assert!() definition.)
     loop {

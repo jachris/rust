@@ -187,6 +187,7 @@
 //! [rust-discord]: https://discord.gg/rust-lang
 //! [array]: prim@array
 //! [slice]: prim@slice
+
 #![cfg_attr(not(feature = "restricted-std"), stable(feature = "rust1", since = "1.0.0"))]
 #![cfg_attr(feature = "restricted-std", unstable(feature = "restricted_std", issue = "none"))]
 #![doc(
@@ -201,152 +202,171 @@
     no_global_oom_handling,
     not(no_global_oom_handling)
 ))]
+// To run libstd tests without x.py without ending up with two copies of libstd, Miri needs to be
+// able to "empty" this crate. See <https://github.com/rust-lang/miri-test-libstd/issues/4>.
+// rustc itself never sets the feature, so this line has no affect there.
+#![cfg(any(not(feature = "miri-test-libstd"), test, doctest))]
+// miri-test-libstd also prefers to make std use the sysroot versions of the dependencies.
+#![cfg_attr(feature = "miri-test-libstd", feature(rustc_private))]
 // Don't link to std. We are std.
 #![no_std]
+// Tell the compiler to link to either panic_abort or panic_unwind
+#![needs_panic_runtime]
+//
+// Lints:
 #![warn(deprecated_in_future)]
 #![warn(missing_docs)]
 #![warn(missing_debug_implementations)]
 #![allow(explicit_outlives_requirements)]
 #![allow(unused_lifetimes)]
-// Tell the compiler to link to either panic_abort or panic_unwind
-#![needs_panic_runtime]
+#![deny(rustc::existing_doc_keyword)]
+// Ensure that std can be linked against panic_abort despite compiled with `-C panic=unwind`
+#![deny(ffi_unwind_calls)]
 // std may use features in a platform-specific way
 #![allow(unused_features)]
-#![feature(rustc_allow_const_fn_unstable)]
-#![cfg_attr(test, feature(internal_output_capture, print_internals, update_panic_count))]
+//
+// Features:
+#![cfg_attr(test, feature(internal_output_capture, print_internals, update_panic_count, rt))]
 #![cfg_attr(
     all(target_vendor = "fortanix", target_env = "sgx"),
     feature(slice_index_methods, coerce_unsized, sgx_platform)
 )]
-#![deny(rustc::existing_doc_keyword)]
-// std is implemented with unstable features, many of which are internal
-// compiler details that will never be stable
-// NB: the following list is sorted to minimize merge conflicts.
-#![feature(absolute_path)]
+//
+// Language features:
 #![feature(alloc_error_handler)]
-#![feature(alloc_layout_extra)]
-#![feature(allocator_api)]
 #![feature(allocator_internals)]
 #![feature(allow_internal_unsafe)]
 #![feature(allow_internal_unstable)]
-#![feature(arbitrary_self_types)]
-#![feature(array_error_internals)]
-#![feature(assert_matches)]
-#![feature(associated_type_bounds)]
-#![feature(async_iterator)]
-#![feature(atomic_mut_ptr)]
-#![feature(auto_traits)]
-#![feature(bench_black_box)]
-#![feature(bool_to_option)]
 #![feature(box_syntax)]
 #![feature(c_unwind)]
-#![feature(c_variadic)]
-#![feature(cfg_accessible)]
-#![feature(cfg_eval)]
-#![cfg_attr(bootstrap, feature(cfg_target_has_atomic))]
 #![feature(cfg_target_thread_local)]
-#![feature(char_error_internals)]
-#![feature(char_internals)]
-#![feature(concat_bytes)]
 #![feature(concat_idents)]
-#![feature(const_fn_floating_point_arithmetic)]
-#![feature(const_fn_fn_ptr_basics)]
-#![feature(const_fn_trait_bound)]
-#![feature(const_format_args)]
-#![feature(const_io_structs)]
-#![feature(const_ip)]
-#![feature(const_ipv4)]
-#![feature(const_ipv6)]
-#![feature(const_option)]
 #![feature(const_mut_refs)]
-#![feature(const_socketaddr)]
 #![feature(const_trait_impl)]
-#![feature(container_error_extra)]
-#![feature(core_intrinsics)]
-#![feature(core_panic)]
-#![feature(custom_test_frameworks)]
 #![feature(decl_macro)]
+#![feature(deprecated_suggestion)]
 #![feature(doc_cfg)]
 #![feature(doc_cfg_hide)]
-#![feature(rustdoc_internals)]
 #![feature(doc_masked)]
 #![feature(doc_notable_trait)]
 #![feature(dropck_eyepatch)]
-#![feature(duration_checked_float)]
-#![feature(duration_constants)]
-#![feature(edition_panic)]
-#![feature(exact_size_is_empty)]
 #![feature(exhaustive_patterns)]
-#![feature(extend_one)]
-#![feature(fn_traits)]
-#![feature(float_minimum_maximum)]
-#![feature(format_args_nl)]
-#![feature(gen_future)]
-#![feature(generator_trait)]
-#![feature(get_mut_unchecked)]
-#![feature(hashmap_internals)]
-#![feature(int_error_internals)]
-#![feature(integer_atomics)]
-#![feature(int_log)]
-#![feature(into_future)]
 #![feature(intra_doc_pointers)]
+#![cfg_attr(bootstrap, feature(label_break_value))]
 #![feature(lang_items)]
+#![feature(let_chains)]
+#![feature(let_else)]
 #![feature(linkage)]
-#![feature(log_syntax)]
-#![feature(map_try_insert)]
-#![feature(maybe_uninit_slice)]
-#![feature(maybe_uninit_uninit_array)]
-#![feature(maybe_uninit_write_slice)]
+#![feature(link_cfg)]
 #![feature(min_specialization)]
-#![feature(mixed_integer_ops)]
 #![feature(must_not_suspend)]
 #![feature(needs_panic_runtime)]
 #![feature(negative_impls)]
 #![feature(never_type)]
-#![feature(new_uninit)]
-#![feature(nll)]
+#![feature(platform_intrinsics)]
+#![feature(prelude_import)]
+#![feature(rustc_attrs)]
+#![feature(rustdoc_internals)]
+#![feature(staged_api)]
+#![feature(thread_local)]
+#![feature(try_blocks)]
+#![feature(utf8_chunks)]
+//
+// Library features (core):
+#![feature(array_error_internals)]
+#![feature(atomic_mut_ptr)]
+#![feature(char_error_internals)]
+#![feature(char_internals)]
+#![feature(core_intrinsics)]
+#![feature(cstr_from_bytes_until_nul)]
+#![feature(cstr_internals)]
+#![feature(duration_checked_float)]
+#![feature(duration_constants)]
+#![cfg_attr(not(bootstrap), feature(error_generic_member_access))]
+#![cfg_attr(not(bootstrap), feature(error_in_core))]
+#![cfg_attr(not(bootstrap), feature(error_iter))]
+#![feature(exact_size_is_empty)]
+#![feature(exclusive_wrapper)]
+#![feature(extend_one)]
+#![feature(float_minimum_maximum)]
+#![feature(float_next_up_down)]
+#![feature(hasher_prefixfree_extras)]
+#![feature(hashmap_internals)]
+#![feature(int_error_internals)]
+#![feature(is_some_with)]
+#![feature(maybe_uninit_slice)]
+#![feature(maybe_uninit_write_slice)]
+#![feature(mixed_integer_ops)]
 #![feature(nonnull_slice_from_raw_parts)]
-#![feature(once_cell)]
+#![feature(panic_can_unwind)]
 #![feature(panic_info_message)]
 #![feature(panic_internals)]
-#![feature(panic_can_unwind)]
-#![feature(panic_unwind)]
-#![feature(platform_intrinsics)]
+#![feature(pointer_byte_offsets)]
+#![feature(pointer_is_aligned)]
 #![feature(portable_simd)]
-#![feature(prelude_import)]
+#![feature(prelude_2024)]
+#![feature(provide_any)]
 #![feature(ptr_as_uninit)]
-#![feature(ptr_internals)]
-#![feature(rustc_attrs)]
-#![feature(rustc_private)]
-#![feature(saturating_int_impl)]
-#![feature(slice_concat_ext)]
+#![feature(raw_os_nonzero)]
 #![feature(slice_internals)]
 #![feature(slice_ptr_get)]
-#![feature(slice_ptr_len)]
-#![feature(staged_api)]
 #![feature(std_internals)]
-#![feature(stdsimd)]
-#![feature(stmt_expr_attributes)]
 #![feature(str_internals)]
-#![feature(test)]
-#![feature(thread_local)]
-#![feature(thread_local_internals)]
-#![feature(toowned_clone_into)]
-#![feature(total_cmp)]
-#![feature(trace_macros)]
-#![feature(try_blocks)]
+#![feature(strict_provenance)]
+#![feature(maybe_uninit_uninit_array)]
+#![feature(const_maybe_uninit_uninit_array)]
+//
+// Library features (alloc):
+#![feature(alloc_layout_extra)]
+#![feature(allocator_api)]
+#![feature(get_mut_unchecked)]
+#![feature(map_try_insert)]
+#![feature(new_uninit)]
+#![feature(thin_box)]
 #![feature(try_reserve_kind)]
-#![feature(unboxed_closures)]
-#![feature(unwrap_infallible)]
 #![feature(vec_into_raw_parts)]
-// NB: the above list is sorted to minimize merge conflicts.
+#![feature(slice_concat_trait)]
+//
+// Library features (unwind):
+#![feature(panic_unwind)]
+//
+// Only for re-exporting:
+#![feature(assert_matches)]
+#![feature(async_iterator)]
+#![feature(c_variadic)]
+#![feature(cfg_accessible)]
+#![feature(cfg_eval)]
+#![feature(concat_bytes)]
+#![feature(const_format_args)]
+#![feature(core_panic)]
+#![feature(custom_test_frameworks)]
+#![feature(edition_panic)]
+#![feature(format_args_nl)]
+#![feature(log_syntax)]
+#![feature(once_cell)]
+#![feature(saturating_int_impl)]
+#![feature(stdsimd)]
+#![feature(test)]
+#![feature(trace_macros)]
+//
+// Only used in tests/benchmarks:
+#![feature(bench_black_box)]
+//
+// Only for const-ness:
+#![feature(const_io_structs)]
+#![feature(const_ip)]
+#![feature(const_ipv4)]
+#![feature(const_ipv6)]
+#![feature(const_socketaddr)]
+#![feature(thread_local_internals)]
+//
 #![default_lib_allocator]
 
 // Explicitly import the prelude. The compiler uses this same unstable attribute
 // to import the prelude implicitly when building crates that depend on std.
 #[prelude_import]
 #[allow(unused)]
-use prelude::v1::*;
+use prelude::rust_2021::*;
 
 // Access to Bencher, etc.
 #[cfg(test)]
@@ -381,6 +401,11 @@ extern crate std as realstd;
 // The standard macros that are not built-in to the compiler.
 #[macro_use]
 mod macros;
+
+// The runtime entry point and a few unstable public functions used by the
+// compiler
+#[macro_use]
+pub mod rt;
 
 // The Rust prelude
 pub mod prelude;
@@ -514,10 +539,8 @@ pub mod lazy;
 #[allow(missing_debug_implementations, dead_code, unsafe_op_in_unsafe_fn, unused_unsafe)]
 #[allow(rustdoc::bare_urls)]
 #[unstable(feature = "portable_simd", issue = "86656")]
-#[cfg(not(all(miri, doctest)))] // Miri does not support all SIMD intrinsics
 mod std_float;
 
-#[cfg(not(all(miri, doctest)))] // Miri does not support all SIMD intrinsics
 #[doc = include_str!("../../portable-simd/crates/core_simd/src/core_simd_docs.md")]
 #[unstable(feature = "portable_simd", issue = "86656")]
 pub mod simd {
@@ -566,11 +589,6 @@ pub mod arch {
 #[stable(feature = "simd_x86", since = "1.27.0")]
 pub use std_detect::is_x86_feature_detected;
 
-// The runtime entry point and a few unstable public functions used by the
-// compiler
-#[macro_use]
-pub mod rt;
-
 // Platform-abstraction modules
 mod sys;
 mod sys_common;
@@ -579,6 +597,7 @@ pub mod alloc;
 
 // Private support modules
 mod panicking;
+mod personality;
 
 #[path = "../../backtrace/src/lib.rs"]
 #[allow(dead_code, unused_attributes)]
@@ -588,7 +607,7 @@ mod backtrace_rs;
 #[stable(feature = "rust1", since = "1.0.0")]
 #[allow(deprecated, deprecated_in_future)]
 pub use core::{
-    assert_eq, assert_ne, debug_assert, debug_assert_eq, debug_assert_ne, matches, r#try, todo,
+    assert_eq, assert_ne, debug_assert, debug_assert_eq, debug_assert_ne, matches, todo, r#try,
     unimplemented, unreachable, write, writeln,
 };
 

@@ -1,11 +1,12 @@
+use crate::errors::{FailedWritingFile, RustcErrorFatal, RustcErrorUnexpectedAnnotation};
 use crate::interface::{Compiler, Result};
 use crate::passes::{self, BoxedResolver, QueryContext};
 
 use rustc_ast as ast;
 use rustc_codegen_ssa::traits::CodegenBackend;
+use rustc_codegen_ssa::CodegenResults;
 use rustc_data_structures::svh::Svh;
 use rustc_data_structures::sync::{Lrc, OnceCell, WorkerLocal};
-use rustc_errors::ErrorReported;
 use rustc_hir::def_id::LOCAL_CRATE;
 use rustc_incremental::DepGraphFuture;
 use rustc_lint::LintStore;
@@ -72,13 +73,13 @@ pub struct Queries<'tcx> {
     queries: OnceCell<TcxQueries<'tcx>>,
 
     arena: WorkerLocal<Arena<'tcx>>,
-    hir_arena: WorkerLocal<rustc_ast_lowering::Arena<'tcx>>,
+    hir_arena: WorkerLocal<rustc_hir::Arena<'tcx>>,
 
     dep_graph_future: Query<Option<DepGraphFuture>>,
     parse: Query<ast::Crate>,
     crate_name: Query<String>,
     register_plugins: Query<(ast::Crate, Lrc<LintStore>)>,
-    expansion: Query<(Rc<ast::Crate>, Rc<RefCell<BoxedResolver>>, Lrc<LintStore>)>,
+    expansion: Query<(Lrc<ast::Crate>, Rc<RefCell<BoxedResolver>>, Lrc<LintStore>)>,
     dep_graph: Query<DepGraph>,
     prepare_outputs: Query<OutputFilenames>,
     global_ctxt: Query<QueryContext<'tcx>>,
@@ -92,7 +93,7 @@ impl<'tcx> Queries<'tcx> {
             gcx: OnceCell::new(),
             queries: OnceCell::new(),
             arena: WorkerLocal::new(|_| Arena::default()),
-            hir_arena: WorkerLocal::new(|_| rustc_ast_lowering::Arena::default()),
+            hir_arena: WorkerLocal::new(|_| rustc_hir::Arena::default()),
             dep_graph_future: Default::default(),
             parse: Default::default(),
             crate_name: Default::default(),
@@ -121,10 +122,8 @@ impl<'tcx> Queries<'tcx> {
 
     pub fn parse(&self) -> Result<&Query<ast::Crate>> {
         self.parse.compute(|| {
-            passes::parse(self.session(), &self.compiler.input).map_err(|mut parse_error| {
-                parse_error.emit();
-                ErrorReported
-            })
+            passes::parse(self.session(), &self.compiler.input)
+                .map_err(|mut parse_error| parse_error.emit())
         })
     }
 
@@ -166,8 +165,8 @@ impl<'tcx> Queries<'tcx> {
 
     pub fn expansion(
         &self,
-    ) -> Result<&Query<(Rc<ast::Crate>, Rc<RefCell<BoxedResolver>>, Lrc<LintStore>)>> {
-        tracing::trace!("expansion");
+    ) -> Result<&Query<(Lrc<ast::Crate>, Rc<RefCell<BoxedResolver>>, Lrc<LintStore>)>> {
+        trace!("expansion");
         self.expansion.compute(|| {
             let crate_name = self.crate_name()?.peek().clone();
             let (krate, lint_store) = self.register_plugins()?.take();
@@ -182,7 +181,7 @@ impl<'tcx> Queries<'tcx> {
             let krate = resolver.access(|resolver| {
                 passes::configure_and_expand(sess, &lint_store, krate, &crate_name, resolver)
             })?;
-            Ok((Rc::new(krate), Rc::new(RefCell::new(resolver)), lint_store))
+            Ok((Lrc::new(krate), Rc::new(RefCell::new(resolver)), lint_store))
         })
     }
 
@@ -260,10 +259,7 @@ impl<'tcx> Queries<'tcx> {
     /// an error.
     fn check_for_rustc_errors_attr(tcx: TyCtxt<'_>) {
         let Some((def_id, _)) = tcx.entry_fn(()) else { return };
-
-        let attrs = &*tcx.get_attrs(def_id);
-        let attrs = attrs.iter().filter(|attr| attr.has_name(sym::rustc_error));
-        for attr in attrs {
+        for attr in tcx.get_attrs(def_id, sym::rustc_error) {
             match attr.meta_item_list() {
                 // Check if there is a `#[rustc_error(delay_span_bug_from_inside_query)]`.
                 Some(list)
@@ -279,18 +275,14 @@ impl<'tcx> Queries<'tcx> {
 
                 // Bare `#[rustc_error]`.
                 None => {
-                    tcx.sess.span_fatal(
-                        tcx.def_span(def_id),
-                        "fatal error triggered by #[rustc_error]",
-                    );
+                    tcx.sess.emit_fatal(RustcErrorFatal { span: tcx.def_span(def_id) });
                 }
 
                 // Some other attribute.
                 Some(_) => {
-                    tcx.sess.span_warn(
-                        tcx.def_span(def_id),
-                        "unexpected annotation used with `#[rustc_error(...)]!",
-                    );
+                    tcx.sess.emit_warning(RustcErrorUnexpectedAnnotation {
+                        span: tcx.def_span(def_id),
+                    });
                 }
             }
         }
@@ -362,13 +354,11 @@ impl Linker {
             return Ok(());
         }
 
-        if sess.opts.debugging_opts.no_link {
-            let mut encoder = rustc_serialize::opaque::Encoder::new(Vec::new());
-            rustc_serialize::Encodable::encode(&codegen_results, &mut encoder).unwrap();
+        if sess.opts.unstable_opts.no_link {
+            let encoded = CodegenResults::serialize_rlink(&codegen_results);
             let rlink_file = self.prepare_outputs.with_extension(config::RLINK_EXT);
-            std::fs::write(&rlink_file, encoder.into_inner()).map_err(|err| {
-                sess.fatal(&format!("failed to write file {}: {}", rlink_file.display(), err));
-            })?;
+            std::fs::write(&rlink_file, encoded)
+                .map_err(|error| sess.emit_fatal(FailedWritingFile { path: &rlink_file, error }))?;
             return Ok(());
         }
 

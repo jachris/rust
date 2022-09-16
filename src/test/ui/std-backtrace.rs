@@ -5,8 +5,7 @@
 // ignore-sgx no processes
 // ignore-msvc see #62897 and `backtrace-debuginfo.rs` test
 // compile-flags:-g
-
-#![feature(backtrace)]
+// compile-flags:-Cstrip=none
 
 use std::env;
 use std::process::Command;

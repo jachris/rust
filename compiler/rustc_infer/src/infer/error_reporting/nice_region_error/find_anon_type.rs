@@ -14,32 +14,27 @@ use rustc_middle::ty::{self, Region, TyCtxt};
 /// br - the bound region corresponding to the above region which is of type `BrAnon(_)`
 ///
 /// # Example
-/// ```
+/// ```compile_fail,E0623
 /// fn foo(x: &mut Vec<&u8>, y: &u8)
 ///    { x.push(y); }
 /// ```
 /// The function returns the nested type corresponding to the anonymous region
 /// for e.g., `&u8` and `Vec<&u8>`.
-pub(crate) fn find_anon_type<'tcx>(
+pub fn find_anon_type<'tcx>(
     tcx: TyCtxt<'tcx>,
     region: Region<'tcx>,
     br: &ty::BoundRegionKind,
 ) -> Option<(&'tcx hir::Ty<'tcx>, &'tcx hir::FnSig<'tcx>)> {
-    if let Some(anon_reg) = tcx.is_suitable_region(region) {
-        let hir_id = tcx.hir().local_def_id_to_hir_id(anon_reg.def_id);
-        let Some(fn_sig) = tcx.hir().get(hir_id).fn_sig() else {
-            return None
-        };
+    let anon_reg = tcx.is_suitable_region(region)?;
+    let hir_id = tcx.hir().local_def_id_to_hir_id(anon_reg.def_id);
+    let fn_sig = tcx.hir().get(hir_id).fn_sig()?;
 
-        fn_sig
-            .decl
-            .inputs
-            .iter()
-            .find_map(|arg| find_component_for_bound_region(tcx, arg, br))
-            .map(|ty| (ty, fn_sig))
-    } else {
-        None
-    }
+    fn_sig
+        .decl
+        .inputs
+        .iter()
+        .find_map(|arg| find_component_for_bound_region(tcx, arg, br))
+        .map(|ty| (ty, fn_sig))
 }
 
 // This method creates a FindNestedTypeVisitor which returns the type corresponding
@@ -96,7 +91,7 @@ impl<'tcx> Visitor<'tcx> for FindNestedTypeVisitor<'tcx> {
             hir::TyKind::TraitObject(bounds, ..) => {
                 for bound in bounds {
                     self.current_index.shift_in(1);
-                    self.visit_poly_trait_ref(bound, hir::TraitBoundModifier::None);
+                    self.visit_poly_trait_ref(bound);
                     self.current_index.shift_out(1);
                 }
             }
@@ -105,27 +100,10 @@ impl<'tcx> Visitor<'tcx> for FindNestedTypeVisitor<'tcx> {
                 // the lifetime of the TyRptr
                 let hir_id = lifetime.hir_id;
                 match (self.tcx.named_region(hir_id), self.bound_region) {
-                    // Find the index of the anonymous region that was part of the
-                    // error. We will then search the function parameters for a bound
-                    // region at the right depth with the same index
-                    (
-                        Some(rl::Region::LateBoundAnon(debruijn_index, _, anon_index)),
-                        ty::BrAnon(br_index),
-                    ) => {
-                        debug!(
-                            "LateBoundAnon depth = {:?} anon_index = {:?} br_index={:?}",
-                            debruijn_index, anon_index, br_index
-                        );
-                        if debruijn_index == self.current_index && anon_index == br_index {
-                            self.found_type = Some(arg);
-                            return; // we can stop visiting now
-                        }
-                    }
-
                     // Find the index of the named region that was part of the
                     // error. We will then search the function parameters for a bound
                     // region at the right depth with the same index
-                    (Some(rl::Region::EarlyBound(_, id, _)), ty::BrNamed(def_id, _)) => {
+                    (Some(rl::Region::EarlyBound(id)), ty::BrNamed(def_id, _)) => {
                         debug!("EarlyBound id={:?} def_id={:?}", id, def_id);
                         if id == def_id {
                             self.found_type = Some(arg);
@@ -137,7 +115,7 @@ impl<'tcx> Visitor<'tcx> for FindNestedTypeVisitor<'tcx> {
                     // error. We will then search the function parameters for a bound
                     // region at the right depth with the same index
                     (
-                        Some(rl::Region::LateBound(debruijn_index, _, id, _)),
+                        Some(rl::Region::LateBound(debruijn_index, _, id)),
                         ty::BrNamed(def_id, _),
                     ) => {
                         debug!(
@@ -155,9 +133,8 @@ impl<'tcx> Visitor<'tcx> for FindNestedTypeVisitor<'tcx> {
                         Some(
                             rl::Region::Static
                             | rl::Region::Free(_, _)
-                            | rl::Region::EarlyBound(_, _, _)
-                            | rl::Region::LateBound(_, _, _, _)
-                            | rl::Region::LateBoundAnon(_, _, _),
+                            | rl::Region::EarlyBound(_)
+                            | rl::Region::LateBound(_, _, _),
                         )
                         | None,
                         _,
@@ -211,17 +188,7 @@ impl<'tcx> Visitor<'tcx> for TyPathVisitor<'tcx> {
     fn visit_lifetime(&mut self, lifetime: &hir::Lifetime) {
         match (self.tcx.named_region(lifetime.hir_id), self.bound_region) {
             // the lifetime of the TyPath!
-            (
-                Some(rl::Region::LateBoundAnon(debruijn_index, _, anon_index)),
-                ty::BrAnon(br_index),
-            ) => {
-                if debruijn_index == self.current_index && anon_index == br_index {
-                    self.found_it = true;
-                    return;
-                }
-            }
-
-            (Some(rl::Region::EarlyBound(_, id, _)), ty::BrNamed(def_id, _)) => {
+            (Some(rl::Region::EarlyBound(id)), ty::BrNamed(def_id, _)) => {
                 debug!("EarlyBound id={:?} def_id={:?}", id, def_id);
                 if id == def_id {
                     self.found_it = true;
@@ -229,7 +196,7 @@ impl<'tcx> Visitor<'tcx> for TyPathVisitor<'tcx> {
                 }
             }
 
-            (Some(rl::Region::LateBound(debruijn_index, _, id, _)), ty::BrNamed(def_id, _)) => {
+            (Some(rl::Region::LateBound(debruijn_index, _, id)), ty::BrNamed(def_id, _)) => {
                 debug!("FindNestedTypeVisitor::visit_ty: LateBound depth = {:?}", debruijn_index,);
                 debug!("id={:?}", id);
                 debug!("def_id={:?}", def_id);
@@ -242,9 +209,8 @@ impl<'tcx> Visitor<'tcx> for TyPathVisitor<'tcx> {
             (
                 Some(
                     rl::Region::Static
-                    | rl::Region::EarlyBound(_, _, _)
-                    | rl::Region::LateBound(_, _, _, _)
-                    | rl::Region::LateBoundAnon(_, _, _)
+                    | rl::Region::EarlyBound(_)
+                    | rl::Region::LateBound(_, _, _)
                     | rl::Region::Free(_, _),
                 )
                 | None,
